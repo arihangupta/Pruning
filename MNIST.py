@@ -1,19 +1,24 @@
 import medmnist
 from medmnist import DermaMNIST, PathMNIST
 import numpy as np
+import os
 
 # Choose the highest resolution available (224 for MedMNIST+)
 IMG_SIZE = 224
 
+# Use absolute path for root directory
+ROOT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
+os.makedirs(ROOT_DIR, exist_ok=True)  # Create directory if it doesn't exist
+
 # Download DermaMNIST (train/val/test) at 224x224
-derma_train = DermaMNIST(split="train", download=True, size=IMG_SIZE, root="./datasets")
-derma_val = DermaMNIST(split="val", download=True, size=IMG_SIZE, root="./datasets")
-derma_test = DermaMNIST(split="test", download=True, size=IMG_SIZE, root="./datasets")
+derma_train = DermaMNIST(split="train", download=True, size=IMG_SIZE, root=ROOT_DIR)
+derma_val = DermaMNIST(split="val", download=True, size=IMG_SIZE, root=ROOT_DIR)
+derma_test = DermaMNIST(split="test", download=True, size=IMG_SIZE, root=ROOT_DIR)
 
 # Download PathMNIST (train/val/test) at 224x224
-path_train = PathMNIST(split="train", download=True, size=IMG_SIZE, root="./datasets")
-path_val = PathMNIST(split="val", download=True, size=IMG_SIZE, root="./datasets")
-path_test = PathMNIST(split="test", download=True, size=IMG_SIZE, root="./datasets")
+path_train = PathMNIST(split="train", download=True, size=IMG_SIZE, root=ROOT_DIR)
+path_val = PathMNIST(split="val", download=True, size=IMG_SIZE, root=ROOT_DIR)
+path_test = PathMNIST(split="test", download=True, size=IMG_SIZE, root=ROOT_DIR)
 
 # Print dataset sizes
 print("DermaMNIST Train:", len(derma_train))
