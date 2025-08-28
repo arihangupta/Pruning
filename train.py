@@ -1,152 +1,122 @@
 import os
+import time
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers, models
 import torch
-from dinov2.models.vision_transformer import vit_small
-from medmnist import DermaMNIST
-from torchvision import transforms
-from sklearn.metrics import confusion_matrix
-import pandas as pd
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from torchvision import models
 
 # ================
 # Config
 # ================
-ROOT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
+DATA_PATH = "/home/arihangupta/Pruning/dinov2/Pruning/datasets/dermamnist_224.npz"
 SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/saved_models"
 EPOCHS = 10
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
-IMG_SIZE = 224  # DinoV2 expects 224x224
-
-# Reproducibility
-tf.keras.utils.set_random_seed(42)
-np.random.seed(42)
-torch.manual_seed(42)
+IMG_SIZE = 224
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ================
-# DinoV2 Setup
-# ================
-dinov2 = vit_small(patch_size=14, img_size=224, init_values=1.0)
-dinov2.load_state_dict(torch.hub.load_state_dict_from_url(
-    "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth",
-    map_location="cpu"
-))
-dinov2.eval()
-if torch.cuda.is_available():
-    dinov2 = dinov2.cuda()
-
-# Preprocess transform for DinoV2
-transform = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-
-# Function to extract DinoV2 features
-def extract_dinov2_features(dataset, num_samples=None):
-    features, labels = [], []
-    for i, (img, label) in enumerate(dataset):
-        if num_samples and i >= num_samples:
-            break
-        img = transform(img).unsqueeze(0)  # Add batch dim
-        if torch.cuda.is_available():
-            img = img.cuda()
-        with torch.no_grad():
-            out = dinov2(img)  # forward pass
-            feat = out["x_norm_clstoken"].cpu().numpy()  # [1, 384]
-        features.append(feat.flatten())
-        labels.append(int(label))
-    return np.array(features), np.array(labels)
-
-# ================
 # Data
 # ================
-derma_train = DermaMNIST(split="train", download=False, size=IMG_SIZE, root=ROOT_DIR)
-derma_val = DermaMNIST(split="val", download=False, size=IMG_SIZE, root=ROOT_DIR)
-derma_test = DermaMNIST(split="test", download=False, size=IMG_SIZE, root=ROOT_DIR)
+data = np.load(DATA_PATH)
+X_train, y_train = data["train_images"], data["train_labels"].flatten()
+X_val, y_val     = data["val_images"], data["val_labels"].flatten()
+X_test, y_test   = data["test_images"], data["test_labels"].flatten()
 
-print("🚀 Extracting DinoV2 features for DermaMNIST...")
-X_train, y_train = extract_dinov2_features(derma_train)
-X_val, y_val = extract_dinov2_features(derma_val)
-X_test, y_test = extract_dinov2_features(derma_test)
+# Normalize and convert to 3 channels
+def preprocess(arr):
+    arr = arr.astype("float32") / 255.0
+    if arr.ndim == 3 or arr.shape[-1] == 1:
+        arr = np.repeat(arr[..., np.newaxis], 3, axis=-1)
+    arr = np.transpose(arr, (0, 3, 1, 2))  # NHWC -> NCHW
+    return arr
+
+X_train, X_val, X_test = preprocess(X_train), preprocess(X_val), preprocess(X_test)
+
+train_ds = TensorDataset(torch.tensor(X_train), torch.tensor(y_train))
+val_ds   = TensorDataset(torch.tensor(X_val), torch.tensor(y_val))
+test_ds  = TensorDataset(torch.tensor(X_test), torch.tensor(y_test))
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
 num_classes = len(np.unique(y_train))
-
-# tf.data pipelines
-def make_dataset(features, labels, batch_size=BATCH_SIZE, shuffle=True):
-    ds = tf.data.Dataset.from_tensor_slices((features, labels))
-    if shuffle:
-        ds = ds.shuffle(buffer_size=len(features))
-    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    return ds
-
-train_ds = make_dataset(X_train, y_train, shuffle=True)
-val_ds = make_dataset(X_val, y_val, shuffle=False)
-test_ds = make_dataset(X_test, y_test, shuffle=False)
 
 # ================
 # Model
 # ================
-def build_classifier(input_shape, num_classes, learning_rate=LEARNING_RATE):
-    model = models.Sequential([
-        layers.Input(shape=input_shape),
-        layers.Dense(128, activation="relu"),
-        layers.Dropout(0.5),
-        layers.Dense(num_classes, activation="softmax")
-    ])
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"]
-    )
-    return model
+model = models.resnet50(pretrained=True)
+model.fc = nn.Linear(model.fc.in_features, num_classes)
+model = model.to(DEVICE)
 
-class TrainingProgress(tf.keras.callbacks.Callback):
-    def __init__(self, test_ds, y_test, save_dir):
-        super().__init__()
-        self.test_ds = test_ds
-        self.y_test = y_test
-        self.save_dir = save_dir
-        self.class_names = [str(i) for i in range(num_classes)]
-
-    def on_epoch_end(self, epoch, logs=None):
-        print(f"✅ Epoch {epoch+1}: "
-              f"loss={logs['loss']:.4f}, "
-              f"val_loss={logs['val_loss']:.4f}, "
-              f"acc={logs['accuracy']:.4f}, "
-              f"val_acc={logs['val_accuracy']:.4f}")
-
-        y_pred = self.model.predict(self.test_ds, verbose=0)
-        y_pred_classes = np.argmax(y_pred, axis=1)
-        cm = confusion_matrix(self.y_test, y_pred_classes)
-
-        cm_df = pd.DataFrame(cm, index=self.class_names, columns=self.class_names)
-        cm_path = os.path.join(self.save_dir, f"confusion_matrix_epoch_{epoch+1}.csv")
-        cm_df.to_csv(cm_path)
-        print(f"📊 Confusion matrix saved to {cm_path}")
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 # ================
-# Train
+# Training & Evaluation
 # ================
-print("\n🚀 Training classifier on DermaMNIST with DinoV2 features...")
-input_shape = (X_train.shape[1],)  # should be (384,)
-model = build_classifier(input_shape, num_classes)
+def train_model(model, train_loader, val_loader, epochs):
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
 
-model.fit(
-    train_ds,
-    validation_data=val_ds,
-    epochs=EPOCHS,
-    callbacks=[TrainingProgress(test_ds, y_test, SAVE_DIR)],
-    verbose=0
-)
+        for images, labels in train_loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
 
-_, test_acc = model.evaluate(test_ds, verbose=0)
-print(f"\n📦 Final Test Accuracy: {test_acc:.4f}")
+            running_loss += loss.item() * images.size(0)
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
 
-model_path = os.path.join(SAVE_DIR, "dermamnist_dinov2.h5")
-model.save(model_path)
-print(f"📝 Model saved to {model_path}")
+        val_loss, val_acc = evaluate_model(model, val_loader)
+        print(f"Epoch {epoch+1}/{epochs} - "
+              f"Train Loss: {running_loss/total:.4f}, Train Acc: {correct/total:.4f}, "
+              f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+
+def evaluate_model(model, loader):
+    model.eval()
+    loss_total = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss_total += loss.item() * images.size(0)
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+    return loss_total / total, correct / total
+
+# ================
+# Run Training
+# ================
+print("\n🚀 Training ResNet50 on Dermamnist (224x224)...")
+train_model(model, train_loader, val_loader, EPOCHS)
+
+# ================
+# Evaluate on Test Set
+# ================
+test_loss, test_acc = evaluate_model(model, test_loader)
+print(f"\n✅ Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.4f}")
+
+# ================
+# Save Model
+# ================
+model_path = os.path.join(SAVE_DIR, "resnet50_dermamnist_224.pth")
+torch.save(model.state_dict(), model_path)
+print(f"\n📝 Model saved to {model_path}")
