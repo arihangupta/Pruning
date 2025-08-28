@@ -17,16 +17,19 @@ BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
 IMG_SIZE = 224
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+LOG_INTERVAL = 20  # print batch progress every 20 batches
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ================
 # Data
 # ================
+print("📦 Loading dataset...")
 data = np.load(DATA_PATH)
 X_train, y_train = data["train_images"], data["train_labels"].flatten()
 X_val, y_val     = data["val_images"], data["val_labels"].flatten()
 X_test, y_test   = data["test_images"], data["test_labels"].flatten()
+print(f"✅ Data loaded: train={X_train.shape}, val={X_val.shape}, test={X_test.shape}")
 
 # Normalize and convert to 3 channels, NCHW
 def preprocess(arr):
@@ -36,9 +39,11 @@ def preprocess(arr):
     arr = np.transpose(arr, (0, 3, 1, 2))  # NHWC -> NCHW
     return arr
 
+print("🔄 Preprocessing dataset...")
 X_train = preprocess(X_train)
 X_val   = preprocess(X_val)
 X_test  = preprocess(X_test)
+print("✅ Preprocessing done.")
 
 # Convert to tensors
 train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
@@ -53,13 +58,16 @@ val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
 num_classes = len(np.unique(y_train))
+print(f"🔢 Number of classes: {num_classes}")
 
 # ================
 # Model
 # ================
+print("🚀 Building ResNet50 model...")
 model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
 model.fc = nn.Linear(model.fc.in_features, num_classes)
 model = model.to(DEVICE)
+print("✅ Model built and moved to device:", DEVICE)
 
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -89,8 +97,9 @@ def train_model(model, train_loader, val_loader, epochs):
         running_loss = 0.0
         correct = 0
         total = 0
+        start_time = time.time()
 
-        for images, labels in train_loader:
+        for batch_idx, (images, labels) in enumerate(train_loader, 1):
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
             outputs = model(images)
@@ -103,26 +112,32 @@ def train_model(model, train_loader, val_loader, epochs):
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
 
+            if batch_idx % LOG_INTERVAL == 0 or batch_idx == len(train_loader):
+                print(f"  Batch {batch_idx}/{len(train_loader)} - "
+                      f"Loss: {running_loss/total:.4f}, Acc: {correct/total:.4f}")
+
         val_loss, val_acc = evaluate_model(model, val_loader)
-        print(f"Epoch {epoch+1}/{epochs} - "
+        epoch_time = time.time() - start_time
+        print(f"📈 Epoch {epoch+1}/{epochs} completed in {epoch_time:.1f}s - "
               f"Train Loss: {running_loss/total:.4f}, Train Acc: {correct/total:.4f}, "
               f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
 
 # ================
 # Run Training
 # ================
-print("\n🚀 Training ResNet50 on Dermamnist (224x224)...")
+print("\n🎯 Starting training...")
 train_model(model, train_loader, val_loader, EPOCHS)
 
 # ================
 # Evaluate on Test Set
 # ================
+print("\n🧪 Evaluating on test set...")
 test_loss, test_acc = evaluate_model(model, test_loader)
-print(f"\n✅ Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.4f}")
+print(f"✅ Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.4f}")
 
 # ================
 # Save Model
 # ================
 model_path = os.path.join(SAVE_DIR, "resnet50_dermamnist_224.pth")
 torch.save(model.state_dict(), model_path)
-print(f"\n📝 Model saved to {model_path}")
+print(f"\n💾 Model saved to {model_path}")
