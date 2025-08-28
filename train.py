@@ -17,7 +17,7 @@ SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/saved_models"
 EPOCHS = 10
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
-IMG_SIZE = 224  # Matches DermaMNIST 224x224 resolution
+IMG_SIZE = 224  # DinoV2 expects 224x224
 
 # Reproducibility
 tf.keras.utils.set_random_seed(42)
@@ -29,10 +29,11 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # ================
 # DinoV2 Setup
 # ================
-# Load pre-trained DinoV2 model (small variant)
 dinov2 = vit_small(patch_size=14, img_size=224, init_values=1.0)
 dinov2.load_state_dict(torch.hub.load_state_dict_from_url(
-    "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth"))
+    "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth",
+    map_location="cpu"
+))
 dinov2.eval()
 if torch.cuda.is_available():
     dinov2 = dinov2.cuda()
@@ -40,6 +41,7 @@ if torch.cuda.is_available():
 # Preprocess transform for DinoV2
 transform = transforms.Compose([
     transforms.ToPILImage(),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
@@ -54,26 +56,24 @@ def extract_dinov2_features(dataset, num_samples=None):
         if torch.cuda.is_available():
             img = img.cuda()
         with torch.no_grad():
-            feat = dinov2(img).cpu().numpy()
+            out = dinov2(img)  # forward pass
+            feat = out["x_norm_clstoken"].cpu().numpy()  # [1, 384]
         features.append(feat.flatten())
-        labels.append(label)
+        labels.append(int(label))
     return np.array(features), np.array(labels)
 
 # ================
 # Data
 # ================
-# Load DermaMNIST
 derma_train = DermaMNIST(split="train", download=False, size=IMG_SIZE, root=ROOT_DIR)
 derma_val = DermaMNIST(split="val", download=False, size=IMG_SIZE, root=ROOT_DIR)
 derma_test = DermaMNIST(split="test", download=False, size=IMG_SIZE, root=ROOT_DIR)
 
-# Extract features
 print("🚀 Extracting DinoV2 features for DermaMNIST...")
 X_train, y_train = extract_dinov2_features(derma_train)
 X_val, y_val = extract_dinov2_features(derma_val)
 X_test, y_test = extract_dinov2_features(derma_test)
 
-# Number of classes
 num_classes = len(np.unique(y_train))
 
 # tf.data pipelines
@@ -105,29 +105,25 @@ def build_classifier(input_shape, num_classes, learning_rate=LEARNING_RATE):
     )
     return model
 
-# Callback for confusion matrix and epoch progress
 class TrainingProgress(tf.keras.callbacks.Callback):
     def __init__(self, test_ds, y_test, save_dir):
         super().__init__()
         self.test_ds = test_ds
         self.y_test = y_test
         self.save_dir = save_dir
-        self.class_names = [str(i) for i in range(num_classes)]  # DermaMNIST class indices
+        self.class_names = [str(i) for i in range(num_classes)]
 
     def on_epoch_end(self, epoch, logs=None):
-        # Print epoch metrics
         print(f"✅ Epoch {epoch+1}: "
               f"loss={logs['loss']:.4f}, "
               f"val_loss={logs['val_loss']:.4f}, "
               f"acc={logs['accuracy']:.4f}, "
               f"val_acc={logs['val_accuracy']:.4f}")
 
-        # Compute confusion matrix
         y_pred = self.model.predict(self.test_ds, verbose=0)
         y_pred_classes = np.argmax(y_pred, axis=1)
         cm = confusion_matrix(self.y_test, y_pred_classes)
-        
-        # Save confusion matrix as CSV
+
         cm_df = pd.DataFrame(cm, index=self.class_names, columns=self.class_names)
         cm_path = os.path.join(self.save_dir, f"confusion_matrix_epoch_{epoch+1}.csv")
         cm_df.to_csv(cm_path)
@@ -137,10 +133,9 @@ class TrainingProgress(tf.keras.callbacks.Callback):
 # Train
 # ================
 print("\n🚀 Training classifier on DermaMNIST with DinoV2 features...")
-input_shape = (X_train.shape[1],)  # DinoV2 feature dimension (384 for vit_small)
-model = build_classifier(input_shape, num_classes, learning_rate=LEARNING_RATE)
+input_shape = (X_train.shape[1],)  # should be (384,)
+model = build_classifier(input_shape, num_classes)
 
-# Train with confusion matrix callback
 model.fit(
     train_ds,
     validation_data=val_ds,
@@ -149,11 +144,9 @@ model.fit(
     verbose=0
 )
 
-# Evaluate final model
 _, test_acc = model.evaluate(test_ds, verbose=0)
 print(f"\n📦 Final Test Accuracy: {test_acc:.4f}")
 
-# Save model
 model_path = os.path.join(SAVE_DIR, "dermamnist_dinov2.h5")
 model.save(model_path)
 print(f"📝 Model saved to {model_path}")
