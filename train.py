@@ -28,7 +28,7 @@ X_train, y_train = data["train_images"], data["train_labels"].flatten()
 X_val, y_val     = data["val_images"], data["val_labels"].flatten()
 X_test, y_test   = data["test_images"], data["test_labels"].flatten()
 
-# Normalize and convert to 3 channels
+# Normalize and convert to 3 channels, NCHW
 def preprocess(arr):
     arr = arr.astype("float32") / 255.0
     if arr.ndim == 3 or arr.shape[-1] == 1:
@@ -36,11 +36,17 @@ def preprocess(arr):
     arr = np.transpose(arr, (0, 3, 1, 2))  # NHWC -> NCHW
     return arr
 
-X_train, X_val, X_test = preprocess(X_train), preprocess(X_val), preprocess(X_test)
+X_train = preprocess(X_train)
+X_val   = preprocess(X_val)
+X_test  = preprocess(X_test)
 
-train_ds = TensorDataset(torch.tensor(X_train), torch.tensor(y_train))
-val_ds   = TensorDataset(torch.tensor(X_val), torch.tensor(y_val))
-test_ds  = TensorDataset(torch.tensor(X_test), torch.tensor(y_test))
+# Convert to tensors
+train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
+                         torch.tensor(y_train, dtype=torch.long))
+val_ds   = TensorDataset(torch.tensor(X_val, dtype=torch.float32),
+                         torch.tensor(y_val, dtype=torch.long))
+test_ds  = TensorDataset(torch.tensor(X_test, dtype=torch.float32),
+                         torch.tensor(y_test, dtype=torch.long))
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
 val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
@@ -51,7 +57,7 @@ num_classes = len(np.unique(y_train))
 # ================
 # Model
 # ================
-model = models.resnet50(pretrained=True)
+model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
 model.fc = nn.Linear(model.fc.in_features, num_classes)
 model = model.to(DEVICE)
 
@@ -61,6 +67,22 @@ optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 # ================
 # Training & Evaluation
 # ================
+def evaluate_model(model, loader):
+    model.eval()
+    loss_total = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss_total += loss.item() * images.size(0)
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+    return loss_total / total, correct / total
+
 def train_model(model, train_loader, val_loader, epochs):
     for epoch in range(epochs):
         model.train()
@@ -85,22 +107,6 @@ def train_model(model, train_loader, val_loader, epochs):
         print(f"Epoch {epoch+1}/{epochs} - "
               f"Train Loss: {running_loss/total:.4f}, Train Acc: {correct/total:.4f}, "
               f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-
-def evaluate_model(model, loader):
-    model.eval()
-    loss_total = 0.0
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for images, labels in loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss_total += loss.item() * images.size(0)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-    return loss_total / total, correct / total
 
 # ================
 # Run Training
