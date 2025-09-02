@@ -200,131 +200,93 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
 # -------------------------
 # Build pruned model and copy weights (surgery)
 # -------------------------
-def build_pruned_resnet_and_copy_weights(old_model: nn.Module, keep_indices_per_stage: Dict[str, np.ndarray], num_classes: int):
-    # orig planes
-    STAGE_NAMES = ["layer1", "layer2", "layer3", "layer4"]
-    orig_stage_planes = []
-    for s in STAGE_NAMES:
-        first_block = next(getattr(old_model, s).children())
-        orig_stage_planes.append(first_block.conv1.out_channels)
-    new_stage_planes = [len(keep_indices_per_stage[s]) for s in STAGE_NAMES]
-    layers_cfg = [len(list(getattr(old_model, s).children())) for s in STAGE_NAMES]
+def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
+    """
+    Build a new pruned ResNet-50 and copy weights from base_model
+    according to keep_indices dict {stage: kept_channels}.
+    """
+    new_model = build_pruned_resnet(keep_indices, num_classes=num_classes).to(DEVICE)
+    new_state = new_model.state_dict()
+    old_modules = dict(base_model.named_modules())
+    new_modules = dict(new_model.named_modules())
 
-    new_model = CustomResNet(block=Bottleneck, layers=layers_cfg, stage_planes=new_stage_planes, num_classes=num_classes)
-    new_model = new_model.to(DEVICE)
-    new_model.eval()
+    prev_expanded_idxs = None  # expanded indices from previous stage
 
-    def expanded_indices(plane_indices, expansion=4):
-        out = []
-        for p in plane_indices:
-            for r in range(expansion):
-                out.append(int(p*expansion + r))
-        return out
+    for stage_name, kept in keep_indices.items():
+        old_layer = getattr(base_model, stage_name)
+        new_layer = getattr(new_model, stage_name)
 
-    # copy stem conv1 & bn1
-    with torch.no_grad():
-        new_model.conv1.weight.copy_(old_model.conv1.weight)
-        new_model.bn1.weight.copy_(old_model.bn1.weight)
-        new_model.bn1.bias.copy_(old_model.bn1.bias)
-        new_model.bn1.running_mean.copy_(old_model.bn1.running_mean)
-        new_model.bn1.running_var.copy_(old_model.bn1.running_var)
+        for old_block, new_block in zip(old_layer, new_layer):
+            # conv1
+            keep_idx = kept
+            old_conv1_w = old_block.conv1.weight.data
+            new_block.conv1.weight.data.copy_(old_conv1_w[keep_idx, prev_expanded_idxs, ...]
+                                              if prev_expanded_idxs is not None
+                                              else old_conv1_w[keep_idx])
+            if old_block.conv1.bias is not None:
+                new_block.conv1.bias.data.copy_(old_block.conv1.bias.data[keep_idx])
 
-    prev_expanded_idxs = None
+            # bn1
+            new_block.bn1.weight.data.copy_(old_block.bn1.weight.data[keep_idx])
+            new_block.bn1.bias.data.copy_(old_block.bn1.bias.data[keep_idx])
+            new_block.bn1.running_mean.data.copy_(old_block.bn1.running_mean.data[keep_idx])
+            new_block.bn1.running_var.data.copy_(old_block.bn1.running_var.data[keep_idx])
 
-    for s_idx, s in enumerate(STAGE_NAMES):
-        old_stage = getattr(old_model, s)
-        new_stage = getattr(new_model, s)
-        keep = list(keep_indices_per_stage[s])
-        expansion = Bottleneck.expansion
-
-        for b_idx, (old_blk, new_blk) in enumerate(zip(old_stage.children(), new_stage.children())):
-            # conv1 copying
-            old_conv1_w = old_blk.conv1.weight.data  # (out_planes, in_ch,1,1)
-            new_conv1_w = new_blk.conv1.weight.data
-            if prev_expanded_idxs is None:
-                # copy channels from old indices into new positions
-                for j, old_p in enumerate(keep):
-                    new_conv1_w[j].copy_(old_conv1_w[old_p])
-            else:
-                for j, old_p in enumerate(keep):
-                    new_conv1_w[j].copy_(old_conv1_w[old_p][prev_expanded_idxs, ...])
-
-            # bn1 copy for kept channels
-            for attr in ["weight", "bias", "running_mean", "running_var"]:
-                old_val = getattr(old_blk.bn1, attr).data
-                new_val = getattr(new_blk.bn1, attr).data
-                new_val.copy_(old_val[keep])
-
-            # conv2: keep rows and cols corresponding to keep
-            old_conv2_w = old_blk.conv2.weight.data
-            new_conv2_w = new_blk.conv2.weight.data
-            for j_out, old_p_out in enumerate(keep):
-                for j_in, old_p_in in enumerate(keep):
-                    new_conv2_w[j_out, j_in].copy_(old_conv2_w[old_p_out, old_p_in])
+            # conv2
+            old_conv2_w = old_block.conv2.weight.data
+            new_block.conv2.weight.data.copy_(old_conv2_w[keep_idx][:, keep_idx, ...])
+            if old_block.conv2.bias is not None:
+                new_block.conv2.bias.data.copy_(old_block.conv2.bias.data[keep_idx])
 
             # bn2
-            for attr in ["weight", "bias", "running_mean", "running_var"]:
-                old_val = getattr(old_blk.bn2, attr).data
-                new_val = getattr(new_blk.bn2, attr).data
-                new_val.copy_(old_val[keep])
+            new_block.bn2.weight.data.copy_(old_block.bn2.weight.data[keep_idx])
+            new_block.bn2.bias.data.copy_(old_block.bn2.bias.data[keep_idx])
+            new_block.bn2.running_mean.data.copy_(old_block.bn2.running_mean.data[keep_idx])
+            new_block.bn2.running_var.data.copy_(old_block.bn2.running_var.data[keep_idx])
 
-            # conv3: expanded outputs
-            old_conv3_w = old_blk.conv3.weight.data
-            new_conv3_w = new_blk.conv3.weight.data
-            for j_new, old_plane_idx in enumerate(keep):
-                for r in range(expansion):
-                    new_idx = j_new * expansion + r
-                    old_idx = old_plane_idx * expansion + r
-                    if prev_expanded_idxs is None:
-                        new_conv3_w[new_idx].copy_(old_conv3_w[old_idx])
-                    else:
-                        new_conv3_w[new_idx].copy_(old_conv3_w[old_idx][prev_expanded_idxs, ...])
+            # conv3 (EXPANDED)
+            old_conv3_w = old_block.conv3.weight.data
+            new_conv3_w = new_block.conv3.weight.data
+
+            new_idx = torch.arange(len(new_conv3_w))
+            old_idx = keep_idx  # pruned channel indices
+
+            # ✅ FIX: handle prev_expanded_idxs for input channels
+            if prev_expanded_idxs is None:
+                new_conv3_w[new_idx].copy_(old_conv3_w[old_idx])
+            else:
+                new_conv3_w[new_idx].copy_(old_conv3_w[old_idx][:, prev_expanded_idxs, ...])
+
+            if old_block.conv3.bias is not None:
+                new_block.conv3.bias.data.copy_(old_block.conv3.bias.data[old_idx])
 
             # bn3
-            for attr in ["weight", "bias", "running_mean", "running_var"]:
-                old_val = getattr(old_blk.bn3, attr).data
-                new_val = getattr(new_blk.bn3, attr).data
-                old_idxs = []
-                for old_plane_idx in keep:
-                    for r in range(expansion):
-                        old_idxs.append(old_plane_idx * expansion + r)
-                new_val.copy_(old_val[old_idxs])
+            new_block.bn3.weight.data.copy_(old_block.bn3.weight.data[old_idx])
+            new_block.bn3.bias.data.copy_(old_block.bn3.bias.data[old_idx])
+            new_block.bn3.running_mean.data.copy_(old_block.bn3.running_mean.data[old_idx])
+            new_block.bn3.running_var.data.copy_(old_block.bn3.running_var.data[old_idx])
 
-            # downsample if present
-            if hasattr(old_blk, "downsample") and old_blk.downsample is not None:
-                old_ds = old_blk.downsample
-                new_ds = new_blk.downsample
-                old_ds_conv_w = old_ds[0].weight.data
-                new_ds_conv_w = new_ds[0].weight.data
-                old_out_idxs = []
-                for old_plane_idx in keep:
-                    for r in range(expansion):
-                        old_out_idxs.append(old_plane_idx * expansion + r)
+            # downsample if exists
+            if old_block.downsample is not None:
+                # conv
+                ds_old_conv_w = old_block.downsample[0].weight.data
+                ds_new_conv_w = new_block.downsample[0].weight.data
                 if prev_expanded_idxs is None:
-                    for j_new, out_idx in enumerate(old_out_idxs):
-                        new_ds_conv_w[j_new].copy_(old_ds_conv_w[out_idx])
+                    ds_new_conv_w.copy_(ds_old_conv_w[old_idx])
                 else:
-                    for j_new, out_idx in enumerate(old_out_idxs):
-                        new_ds_conv_w[j_new].copy_(old_ds_conv_w[out_idx][prev_expanded_idxs, ...])
-                # bn in downsample
-                for attr in ["weight", "bias", "running_mean", "running_var"]:
-                    old_val = getattr(old_ds[1], attr).data
-                    new_val = getattr(new_ds[1], attr).data
-                    new_val.copy_(old_val[old_out_idxs])
+                    ds_new_conv_w.copy_(ds_old_conv_w[old_idx][:, prev_expanded_idxs, ...])
+                # bn
+                new_block.downsample[1].weight.data.copy_(old_block.downsample[1].weight.data[old_idx])
+                new_block.downsample[1].bias.data.copy_(old_block.downsample[1].bias.data[old_idx])
+                new_block.downsample[1].running_mean.data.copy_(old_block.downsample[1].running_mean.data[old_idx])
+                new_block.downsample[1].running_var.data.copy_(old_block.downsample[1].running_var.data[old_idx])
 
-            prev_expanded_idxs = expanded_indices(keep, expansion=expansion)
+            # update prev_expanded_idxs for next block
+            prev_expanded_idxs = old_idx.repeat_interleave(4)
 
-    # copy fc weights (select columns corresponding to final kept expanded indices)
-    final_keep = keep_indices_per_stage["layer4"]
-    final_expanded = []
-    for p in final_keep:
-        for r in range(Bottleneck.expansion):
-            final_expanded.append(p * Bottleneck.expansion + r)
-    old_fc_w = old_model.fc.weight.data  # shape (num_classes, old_in)
-    new_fc_w = new_model.fc.weight.data
-    for out_i in range(old_fc_w.shape[0]):
-        new_fc_w[out_i].copy_(old_fc_w[out_i, final_expanded])
-    new_model.fc.bias.data.copy_(old_model.fc.bias.data)
+    # fc
+    new_model.fc.weight.data.copy_(base_model.fc.weight.data[:, prev_expanded_idxs])
+    new_model.fc.bias.data.copy_(base_model.fc.bias.data)
 
     return new_model
 
