@@ -200,6 +200,25 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
 # -------------------------
 # Build pruned model and copy weights (surgery)
 # -------------------------
+def build_pruned_resnet(keep_indices, num_classes):
+    """
+    Build a pruned ResNet-50 with stage channel counts based on keep_indices.
+    keep_indices: dict {stage_name: list of kept channel indices}
+    num_classes: number of output classes
+    """
+    # Default ResNet-50 stage planes (output channels for conv1 in each stage's first block)
+    base_planes = [64, 128, 256, 512]
+    # Adjust planes based on number of kept channels
+    stage_planes = [
+        len(keep_indices['layer1']),
+        len(keep_indices['layer2']),
+        len(keep_indices['layer3']),
+        len(keep_indices['layer4'])
+    ]
+    # ResNet-50 layers configuration
+    layers = [3, 4, 6, 3]
+    return CustomResNet(block=Bottleneck, layers=layers, stage_planes=stage_planes, num_classes=num_classes)
+
 def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
     """
     Build a new pruned ResNet-50 and copy weights from base_model
