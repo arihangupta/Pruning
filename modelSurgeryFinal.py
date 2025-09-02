@@ -232,7 +232,7 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
         old_layer = getattr(base_model, stage_name)
         new_layer = getattr(new_model, stage_name)
 
-        for old_block, new_block in zip(old_layer, new_layer):
+        for block_idx, (old_block, new_block) in enumerate(zip(old_layer, new_layer)):
             # conv1
             keep_idx = kept
             old_conv1_w = old_block.conv1.weight.data
@@ -290,8 +290,9 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
                 # conv
                 ds_old_conv_w = old_block.downsample[0].weight.data
                 ds_new_conv_w = new_block.downsample[0].weight.data
-                if prev_expanded_idxs is None:
-                    ds_new_conv_w.copy_(ds_old_conv_w[old_idx][:, keep_idx, ...])
+                # For the first block of layer1, input comes from conv1 (64 channels, unpruned)
+                if stage_name == "layer1" and block_idx == 0:
+                    ds_new_conv_w.copy_(ds_old_conv_w[old_idx])  # No pruning on input channels
                 else:
                     ds_new_conv_w.copy_(ds_old_conv_w[old_idx][:, prev_expanded_idxs, ...])
                 # bn
