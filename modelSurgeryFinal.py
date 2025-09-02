@@ -218,96 +218,122 @@ def build_pruned_resnet(keep_indices, num_classes):
 
 def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
     """
-    Build a new pruned ResNet-50 and copy weights from base_model
+    Build a pruned ResNet-50 and copy weights from base_model
     according to keep_indices dict {stage: kept_channels}.
+    Handles first blocks, subsequent blocks, and downsample layers safely.
     """
     new_model = build_pruned_resnet(keep_indices, num_classes=num_classes).to(DEVICE)
-    new_state = new_model.state_dict()
-    old_modules = dict(base_model.named_modules())
-    new_modules = dict(new_model.named_modules())
+    old_layers = {name: layer for name, layer in base_model.named_modules()}
+    new_layers = {name: layer for name, layer in new_model.named_modules()}
 
-    prev_expanded_idxs = None  # expanded indices from previous stage/block
+    prev_expanded_idxs = None  # Input channels from previous block's conv3 (expanded)
 
-    for stage_name, kept in keep_indices.items():
+    expansion = 4  # Bottleneck expansion factor
+
+    STAGES = ["layer1", "layer2", "layer3", "layer4"]
+
+    for stage_name in STAGES:
         old_layer = getattr(base_model, stage_name)
         new_layer = getattr(new_model, stage_name)
+        kept = keep_indices[stage_name]
 
         for block_idx, (old_block, new_block) in enumerate(zip(old_layer, new_layer)):
-            # conv1
-            keep_idx = kept
-            old_conv1_w = old_block.conv1.weight.data
+
+            # -------------------------
+            # conv1 (3x3)
+            # -------------------------
             if stage_name == "layer1" and block_idx == 0:
-                # First block of layer1: input from conv1 (64 channels, unpruned)
-                new_block.conv1.weight.data.copy_(old_conv1_w[keep_idx])
+                # First block of layer1: input channels from base conv1 (64)
+                new_block.conv1.weight.data.copy_(old_block.conv1.weight.data[kept])
             else:
-                # Subsequent blocks: input from previous block's conv3 (pruned, expanded)
-                new_block.conv1.weight.data.copy_(old_conv1_w[keep_idx, prev_expanded_idxs, ...])
+                # Input channels come from previous block's conv3 (expanded)
+                old_w = old_block.conv1.weight.data
+                # Ensure prev_expanded_idxs length matches in_channels
+                if prev_expanded_idxs is None:
+                    prev_expanded_idxs_safe = torch.arange(old_w.shape[1])
+                else:
+                    prev_expanded_idxs_safe = prev_expanded_idxs
+                new_block.conv1.weight.data.copy_(old_w[kept][:, prev_expanded_idxs_safe, :, :])
+            # conv1 bias
             if old_block.conv1.bias is not None:
-                new_block.conv1.bias.data.copy_(old_block.conv1.bias.data[keep_idx])
+                new_block.conv1.bias.data.copy_(old_block.conv1.bias.data[kept])
 
+            # -------------------------
             # bn1
-            new_block.bn1.weight.data.copy_(old_block.bn1.weight.data[keep_idx])
-            new_block.bn1.bias.data.copy_(old_block.bn1.bias.data[keep_idx])
-            new_block.bn1.running_mean.data.copy_(old_block.bn1.running_mean.data[keep_idx])
-            new_block.bn1.running_var.data.copy_(old_block.bn1.running_var.data[keep_idx])
+            # -------------------------
+            new_block.bn1.weight.data.copy_(old_block.bn1.weight.data[kept])
+            new_block.bn1.bias.data.copy_(old_block.bn1.bias.data[kept])
+            new_block.bn1.running_mean.data.copy_(old_block.bn1.running_mean.data[kept])
+            new_block.bn1.running_var.data.copy_(old_block.bn1.running_var.data[kept])
 
-            # conv2
-            old_conv2_w = old_block.conv2.weight.data
-            new_block.conv2.weight.data.copy_(old_conv2_w[keep_idx][:, keep_idx, ...])
+            # -------------------------
+            # conv2 (3x3)
+            # -------------------------
+            old_w = old_block.conv2.weight.data
+            new_block.conv2.weight.data.copy_(old_w[kept][:, kept, :, :])
             if old_block.conv2.bias is not None:
-                new_block.conv2.bias.data.copy_(old_block.conv2.bias.data[keep_idx])
+                new_block.conv2.bias.data.copy_(old_block.conv2.bias.data[kept])
 
+            # -------------------------
             # bn2
-            new_block.bn2.weight.data.copy_(old_block.bn2.weight.data[keep_idx])
-            new_block.bn2.bias.data.copy_(old_block.bn2.bias.data[keep_idx])
-            new_block.bn2.running_mean.data.copy_(old_block.bn2.running_mean.data[keep_idx])
-            new_block.bn2.running_var.data.copy_(old_block.bn2.running_var.data[keep_idx])
+            # -------------------------
+            new_block.bn2.weight.data.copy_(old_block.bn2.weight.data[kept])
+            new_block.bn2.bias.data.copy_(old_block.bn2.bias.data[kept])
+            new_block.bn2.running_mean.data.copy_(old_block.bn2.running_mean.data[kept])
+            new_block.bn2.running_var.data.copy_(old_block.bn2.running_var.data[kept])
 
-            # conv3 (EXPANDED)
-            old_conv3_w = old_block.conv3.weight.data
-            new_conv3_w = new_block.conv3.weight.data
-
-            # Compute output channel indices for conv3 (expansion factor = 4)
-            expansion = 4  # Bottleneck expansion factor
-            expanded_idx = np.repeat(keep_idx, expansion)  # Repeat each index 4 times
-            new_idx = torch.arange(len(new_conv3_w))  # All output channels in pruned model
-            old_idx = torch.tensor(expanded_idx, dtype=torch.long)  # Corresponding output channels in original model
-
-            # Handle input channels
-            new_conv3_w[new_idx].copy_(old_conv3_w[old_idx][:, keep_idx, ...])
-
+            # -------------------------
+            # conv3 (1x1, expansion)
+            # -------------------------
+            old_w = old_block.conv3.weight.data
+            # Expand output channels
+            expanded_idx = np.repeat(kept, expansion)
+            old_idx = torch.tensor(expanded_idx, dtype=torch.long)
+            new_w = new_block.conv3.weight.data
+            # Input channels: same as conv2 kept channels
+            new_w.copy_(old_w[old_idx][:, kept, :, :])
             if old_block.conv3.bias is not None:
                 new_block.conv3.bias.data.copy_(old_block.conv3.bias.data[old_idx])
 
+            # -------------------------
             # bn3
+            # -------------------------
             new_block.bn3.weight.data.copy_(old_block.bn3.weight.data[old_idx])
             new_block.bn3.bias.data.copy_(old_block.bn3.bias.data[old_idx])
             new_block.bn3.running_mean.data.copy_(old_block.bn3.running_mean.data[old_idx])
             new_block.bn3.running_var.data.copy_(old_block.bn3.running_var.data[old_idx])
 
-            # downsample if exists
+            # -------------------------
+            # downsample (if exists)
+            # -------------------------
             if old_block.downsample is not None:
                 # conv
-                ds_old_conv_w = old_block.downsample[0].weight.data
-                ds_new_conv_w = new_block.downsample[0].weight.data
+                ds_old = old_block.downsample[0].weight.data
+                ds_new = new_block.downsample[0].weight.data
                 if stage_name == "layer1" and block_idx == 0:
-                    ds_new_conv_w.copy_(ds_old_conv_w[old_idx])  # No pruning on input channels
+                    ds_new.copy_(ds_old[old_idx])  # first layer1 block
                 else:
-                    ds_new_conv_w.copy_(ds_old_conv_w[old_idx][:, prev_expanded_idxs, ...])
+                    ds_new.copy_(ds_old[old_idx][:, prev_expanded_idxs_safe, :, :])
                 # bn
                 new_block.downsample[1].weight.data.copy_(old_block.downsample[1].weight.data[old_idx])
                 new_block.downsample[1].bias.data.copy_(old_block.downsample[1].bias.data[old_idx])
                 new_block.downsample[1].running_mean.data.copy_(old_block.downsample[1].running_mean.data[old_idx])
                 new_block.downsample[1].running_var.data.copy_(old_block.downsample[1].running_var.data[old_idx])
 
-            # Update prev_expanded_idxs for next block/stage
+            # -------------------------
+            # update prev_expanded_idxs for next block
+            # -------------------------
             prev_expanded_idxs = old_idx
 
-    # fc
-    new_model.fc.weight.data.copy_(base_model.fc.weight.data[:, prev_expanded_idxs])
+    # -------------------------
+    # fc layer
+    # -------------------------
+    fc_old_w = base_model.fc.weight.data
+    new_model.fc.weight.data.copy_(fc_old_w[:, prev_expanded_idxs])
     new_model.fc.bias.data.copy_(base_model.fc.bias.data)
 
     return new_model
+
 
 # -------------------------
 # Metrics: params, zeros, flops, timing, RAM, model size
