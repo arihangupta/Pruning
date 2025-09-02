@@ -154,7 +154,7 @@ def build_resnet50_for_load(num_classes):
 
 def load_baseline_ckpt(path=BASELINE_CKPT):
     model = build_resnet50_for_load(NUM_CLASSES)
-    state = torch.load(path, map_location="cpu")
+    state = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     model = model.to(DEVICE)
     model.eval()
@@ -206,16 +206,13 @@ def build_pruned_resnet(keep_indices, num_classes):
     keep_indices: dict {stage_name: list of kept channel indices}
     num_classes: number of output classes
     """
-    # Default ResNet-50 stage planes (output channels for conv1 in each stage's first block)
     base_planes = [64, 128, 256, 512]
-    # Adjust planes based on number of kept channels
     stage_planes = [
         len(keep_indices['layer1']),
         len(keep_indices['layer2']),
         len(keep_indices['layer3']),
         len(keep_indices['layer4'])
     ]
-    # ResNet-50 layers configuration
     layers = [3, 4, 6, 3]
     return CustomResNet(block=Bottleneck, layers=layers, stage_planes=stage_planes, num_classes=num_classes)
 
@@ -267,12 +264,15 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
             old_conv3_w = old_block.conv3.weight.data
             new_conv3_w = new_block.conv3.weight.data
 
-            new_idx = torch.arange(len(new_conv3_w))
-            old_idx = keep_idx  # pruned channel indices
+            # Compute output channel indices for conv3 (expansion factor = 4)
+            expansion = 4  # Bottleneck expansion factor
+            expanded_idx = np.repeat(keep_idx, expansion)  # Repeat each index 4 times
+            new_idx = torch.arange(len(new_conv3_w))  # All output channels in pruned model
+            old_idx = torch.tensor(expanded_idx, dtype=torch.long)  # Corresponding output channels in original model
 
-            # ✅ FIX: handle prev_expanded_idxs for input channels
+            # Handle input channels
             if prev_expanded_idxs is None:
-                new_conv3_w[new_idx].copy_(old_conv3_w[old_idx])
+                new_conv3_w[new_idx].copy_(old_conv3_w[old_idx][:, keep_idx, ...])
             else:
                 new_conv3_w[new_idx].copy_(old_conv3_w[old_idx][:, prev_expanded_idxs, ...])
 
@@ -291,7 +291,7 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
                 ds_old_conv_w = old_block.downsample[0].weight.data
                 ds_new_conv_w = new_block.downsample[0].weight.data
                 if prev_expanded_idxs is None:
-                    ds_new_conv_w.copy_(ds_old_conv_w[old_idx])
+                    ds_new_conv_w.copy_(ds_old_conv_w[old_idx][:, keep_idx, ...])
                 else:
                     ds_new_conv_w.copy_(ds_old_conv_w[old_idx][:, prev_expanded_idxs, ...])
                 # bn
@@ -300,8 +300,8 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
                 new_block.downsample[1].running_mean.data.copy_(old_block.downsample[1].running_mean.data[old_idx])
                 new_block.downsample[1].running_var.data.copy_(old_block.downsample[1].running_var.data[old_idx])
 
-            # update prev_expanded_idxs for next block
-            prev_expanded_idxs = old_idx.repeat_interleave(4)
+            # Update prev_expanded_idxs for next block/stage
+            prev_expanded_idxs = old_idx
 
     # fc
     new_model.fc.weight.data.copy_(base_model.fc.weight.data[:, prev_expanded_idxs])
@@ -551,7 +551,7 @@ for method in ["l1", "bn_gamma"]:
         rows.append({
             "Variant": method, "Stage": "after_finetune", "Ratio": ratio,
             "Acc": acc_post, "AUC": auc_post, "Loss": loss_post,
-            "Params": params_post, "Zeros": zeros_post, "TotalParams": total_post, "PctZeros": (zeros_post/total_post)*100 if total_post>0 else 0,
+            "Params": params_post, "Zeros": zeros_post, "TotalParams": total_post, "PctZeros": (zeros_post/total_post)*100 if total_pre>0 else 0,
             "ModelSizeMB": size_after_mb, "FLOPs_per_image": flops_post, "FLOPs_M_per_image": flops_post_m,
             "InferenceTime_per_batch32_s": avg_time_post, "PeakRAM_MB": peak_ram_post,
             "PowerProxy_MFLOPs": power_post_m, "ModelPath": after_path
