@@ -551,7 +551,7 @@ for method in ["l1", "bn_gamma"]:
         rows.append({
             "Variant": method, "Stage": "after_finetune", "Ratio": ratio,
             "Acc": acc_post, "AUC": auc_post, "Loss": loss_post,
-            "Params": params_post, "Zeros": zeros_post, "TotalParams": total_post, "PctZeros": (zeros_post/total_post)*100 if total_pre>0 else 0,
+            "Params": params_post, "Zeros": zeros_post, "TotalParams": total_post, "PctZeros": (zeros_post/total_post)*100 if total_post>0 else 0,
             "ModelSizeMB": size_after_mb, "FLOPs_per_image": flops_post, "FLOPs_M_per_image": flops_post_m,
             "InferenceTime_per_batch32_s": avg_time_post, "PeakRAM_MB": peak_ram_post,
             "PowerProxy_MFLOPs": power_post_m, "ModelPath": after_path
