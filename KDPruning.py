@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
-Dermamnist ResNet50 pruning + knowledge distillation.
-
-Steps:
-1. Load baseline ResNet50.
-2. Apply structured pruning (L1 or BN-based) at 50% and 70%.
-3. Use pruned model as a student.
-4. Distill knowledge from baseline to student to recover performance.
-5. Save metrics and models.
+Dermamnist ResNet50 pruning + knowledge distillation with efficiency metrics.
+Tracks FLOPs, Params, Model Size, Inference time, Peak RAM, Power proxy, Loss, Acc, AUC.
 """
 
 import os, time, math, random, copy, csv
@@ -20,6 +14,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torchvision import models
 from torchvision.models.resnet import Bottleneck
 from sklearn.metrics import roc_auc_score
+import torch.nn.functional as F
 
 # -------------------------
 # CONFIG
@@ -30,14 +25,12 @@ BASELINE_CKPT = "/home/arihangupta/Pruning/dinov2/Pruning/saved_models/dermamnis
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 BATCH_SIZE = 32
-FINETUNE_EPOCHS = 5   # increase for distillation
+FINETUNE_EPOCHS = 5
 LEARNING_RATE = 1e-4
-IMG_SIZE = 224
 PRUNE_RATIOS = [0.5, 0.7]
 LOG_INTERVAL = 20
 DISTILL_ALPHA = 0.7
 DISTILL_TEMP = 4.0
-
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # -------------------------
@@ -172,7 +165,6 @@ def build_pruned_resnet(stage_keeps, num_classes=NUM_CLASSES):
 # -------------------------
 # DISTILLATION LOSS
 # -------------------------
-import torch.nn.functional as F
 def distillation_loss(student_logits, teacher_logits, labels, T=DISTILL_TEMP, alpha=DISTILL_ALPHA):
     soft_loss = F.kl_div(
         F.log_softmax(student_logits / T, dim=1),
@@ -181,31 +173,6 @@ def distillation_loss(student_logits, teacher_logits, labels, T=DISTILL_TEMP, al
     ) * (T*T)
     hard_loss = F.cross_entropy(student_logits, labels)
     return alpha * soft_loss + (1-alpha) * hard_loss
-
-# -------------------------
-# TRAIN STUDENT WITH KD
-# -------------------------
-def train_student_kd(student, teacher, loader, val_loader, epochs=FINETUNE_EPOCHS):
-    student.train()
-    optimizer = optim.Adam(student.parameters(), lr=LEARNING_RATE)
-    for ep in range(epochs):
-        running_loss = 0; total=0; correct=0
-        for bidx, (imgs, labels) in enumerate(loader,1):
-            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-            with torch.no_grad():
-                teacher_logits = teacher(imgs)
-            student_logits = student(imgs)
-            loss = distillation_loss(student_logits, teacher_logits, labels)
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
-            running_loss += float(loss.item())*imgs.size(0)
-            _, preds = student_logits.max(1)
-            total += labels.size(0); correct += int(preds.eq(labels).sum().item())
-            if bidx % LOG_INTERVAL == 0:
-                print(f"KD Epoch {ep+1} batch {bidx} - loss {running_loss/total:.4f}, acc {correct/total:.4f}")
-        # validation
-        loss_val, acc_val, auc_val = evaluate_model_basic(student, val_loader)
-        print(f"Epoch {ep+1} val: Loss {loss_val:.4f}, Acc {acc_val:.4f}, AUC {auc_val:.4f}")
-    return student
 
 # -------------------------
 # EVALUATION
@@ -234,9 +201,62 @@ def evaluate_model_basic(model, loader):
     return loss_avg, acc, auc
 
 # -------------------------
-# MAIN LOOP: PRUNE + KD
+# TRAIN STUDENT WITH KD
+# -------------------------
+def train_student_kd(student, teacher, loader, val_loader, epochs=FINETUNE_EPOCHS):
+    student.train()
+    optimizer = optim.Adam(student.parameters(), lr=LEARNING_RATE)
+    for ep in range(epochs):
+        running_loss = 0; total=0; correct=0
+        for bidx, (imgs, labels) in enumerate(loader,1):
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            with torch.no_grad():
+                teacher_logits = teacher(imgs)
+            student_logits = student(imgs)
+            loss = distillation_loss(student_logits, teacher_logits, labels)
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            running_loss += float(loss.item())*imgs.size(0)
+            _, preds = student_logits.max(1)
+            total += labels.size(0); correct += int(preds.eq(labels).sum().item())
+            if bidx % LOG_INTERVAL == 0:
+                print(f"KD Epoch {ep+1} batch {bidx} - loss {running_loss/total:.4f}, acc {correct/total:.4f}")
+        loss_val, acc_val, auc_val = evaluate_model_basic(student, val_loader)
+        print(f"Epoch {ep+1} val: Loss {loss_val:.4f}, Acc {acc_val:.4f}, AUC {auc_val:.4f}")
+    return student
+
+# -------------------------
+# PROFILING UTILITIES
+# -------------------------
+def profile_model(model, input_size=(1,3,224,224)):
+    try:
+        from fvcore.nn import FlopCountAnalysis
+        dummy = torch.randn(input_size).to(DEVICE)
+        flops = FlopCountAnalysis(model, dummy).total()
+    except:
+        flops = 0
+    params = sum(p.numel() for p in model.parameters())
+    model_size_mb = sum(p.numel()*4 for p in model.parameters())/1e6
+    return flops, params, model_size_mb
+
+def benchmark_model(model, loader):
+    model.eval()
+    start = time.time()
+    peak_ram = 0
+    for imgs, _ in loader:
+        imgs = imgs.to(DEVICE)
+        torch.cuda.reset_peak_memory_stats(DEVICE)
+        with torch.no_grad():
+            _ = model(imgs)
+        peak_ram = max(peak_ram, torch.cuda.max_memory_allocated(DEVICE)/1e6)
+    elapsed = time.time() - start
+    time_per_batch32 = elapsed / len(loader)
+    return time_per_batch32, peak_ram
+
+# -------------------------
+# MAIN LOOP: PRUNE + KD + METRICS
 # -------------------------
 methods = ["l1", "bn_gamma"]
+results = []
 
 for method in methods:
     for ratio in PRUNE_RATIOS:
@@ -252,10 +272,34 @@ for method in methods:
         # build student
         student = build_pruned_resnet(stage_keeps)
         # finetune with KD
-        student = train_student_kd(student, baseline, train_loader, val_loader, epochs=FINETUNE_EPOCHS)
+        student = train_student_kd(student, baseline, train_loader, val_loader)
         # evaluate on test
         test_loss, test_acc, test_auc = evaluate_model_basic(student, test_loader)
-        print(f"Pruned + KD Test -> Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, AUC: {test_auc:.4f}")
-        # save
+        # compute efficiency metrics
+        flops, params, model_size_mb = profile_model(student)
+        runtime, peak_ram = benchmark_model(student, test_loader)
+        power_proxy = flops / (peak_ram*1e6) if peak_ram>0 else 0
+        print(f"Metrics -> FLOPs:{flops}, Params:{params}, ModelSize:{model_size_mb:.2f}MB, Time/batch:{runtime:.4f}s, PeakRAM:{peak_ram:.2f}MB, Power proxy:{power_proxy:.2f}MFLOPs")
+        # save model
         save_path = os.path.join(SAVE_DIR, f"dermamnist_resnet50_{method}_r{int(ratio*100)}_kd.pth")
         torch.save(student.state_dict(), save_path)
+        # save results
+        results.append({
+            "method": method,
+            "prune_ratio": ratio,
+            "loss": test_loss,
+            "acc": test_acc,
+            "auc": test_auc,
+            "flops": flops,
+            "params": params,
+            "model_size_MB": model_size_mb,
+            "inference_time_s": runtime,
+            "peak_RAM_MB": peak_ram,
+            "power_proxy_MFLOPs": power_proxy,
+            "model_path": save_path
+        })
+
+# Save results to CSV
+results_df = pd.DataFrame(results)
+results_df.to_csv(os.path.join(SAVE_DIR, "pruned_kd_metrics.csv"), index=False)
+print("All metrics saved to CSV.")
