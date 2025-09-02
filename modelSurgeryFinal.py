@@ -226,7 +226,7 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
     old_modules = dict(base_model.named_modules())
     new_modules = dict(new_model.named_modules())
 
-    prev_expanded_idxs = None  # expanded indices from previous stage
+    prev_expanded_idxs = None  # expanded indices from previous stage/block
 
     for stage_name, kept in keep_indices.items():
         old_layer = getattr(base_model, stage_name)
@@ -236,9 +236,12 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
             # conv1
             keep_idx = kept
             old_conv1_w = old_block.conv1.weight.data
-            new_block.conv1.weight.data.copy_(old_conv1_w[keep_idx, prev_expanded_idxs, ...]
-                                              if prev_expanded_idxs is not None
-                                              else old_conv1_w[keep_idx])
+            if stage_name == "layer1" and block_idx == 0:
+                # First block of layer1: input from conv1 (64 channels, unpruned)
+                new_block.conv1.weight.data.copy_(old_conv1_w[keep_idx])
+            else:
+                # Subsequent blocks: input from previous block's conv3 (pruned, expanded)
+                new_block.conv1.weight.data.copy_(old_conv1_w[keep_idx, prev_expanded_idxs, ...])
             if old_block.conv1.bias is not None:
                 new_block.conv1.bias.data.copy_(old_block.conv1.bias.data[keep_idx])
 
@@ -271,10 +274,7 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
             old_idx = torch.tensor(expanded_idx, dtype=torch.long)  # Corresponding output channels in original model
 
             # Handle input channels
-            if prev_expanded_idxs is None:
-                new_conv3_w[new_idx].copy_(old_conv3_w[old_idx][:, keep_idx, ...])
-            else:
-                new_conv3_w[new_idx].copy_(old_conv3_w[old_idx][:, prev_expanded_idxs, ...])
+            new_conv3_w[new_idx].copy_(old_conv3_w[old_idx][:, keep_idx, ...])
 
             if old_block.conv3.bias is not None:
                 new_block.conv3.bias.data.copy_(old_block.conv3.bias.data[old_idx])
@@ -290,7 +290,6 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
                 # conv
                 ds_old_conv_w = old_block.downsample[0].weight.data
                 ds_new_conv_w = new_block.downsample[0].weight.data
-                # For the first block of layer1, input comes from conv1 (64 channels, unpruned)
                 if stage_name == "layer1" and block_idx == 0:
                     ds_new_conv_w.copy_(ds_old_conv_w[old_idx])  # No pruning on input channels
                 else:
