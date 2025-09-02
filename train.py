@@ -12,7 +12,7 @@ from torchvision import models
 # ================
 DATA_PATH = "/home/arihangupta/Pruning/dinov2/Pruning/datasets/dermamnist_224.npz"
 SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/saved_models"
-EPOCHS = 50
+EPOCHS = 10
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
 IMG_SIZE = 224
