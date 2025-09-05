@@ -190,7 +190,7 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
     """
     stage = getattr(model, stage_name)
     first_block = next(stage.children())
-    orig_planes = first_block.conv1.out_channels
+    orig_planes = first_block.conv1.out_channels  # Original input channels to the stage
     block_importances = []
 
     if method == "wanda++" and train_loader is not None:
@@ -202,21 +202,29 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
                 imgs, _ = next(iter(train_loader))
                 imgs = imgs.to(DEVICE)
                 print(f"Debug: Initial BN3 running_mean shape for {stage_name}: {next(iter(stage.children())).bn3.running_mean.shape}")
+                print(f"Debug: Initial conv1 in_channels for {stage_name}: {first_block.conv1.in_channels}")
 
                 # Forward pass to update model state with pruned structure
                 _ = model(imgs)  # Warm up to propagate pruned structure
                 
-                # Resize BN running stats to match pruned output channels
+                # Resize BN running stats to match pruned input channels
+                pruned_in_channels = keep_k  # Use the target kept channels as the new input count
+                print(f"Debug: Adjusting BN3 for {stage_name}, pruned_in_channels={pruned_in_channels}")
                 for block in stage.children():
-                    orig_out_channels = block.conv3.out_channels
-                    print(f"Debug: Adjusting BN3 for {stage_name}, orig_out_channels={orig_out_channels}")
-                    if hasattr(block.bn3, 'running_mean') and block.bn3.running_mean.shape[0] != orig_out_channels:
-                        print(f"Debug: Resizing BN3 from {block.bn3.running_mean.shape[0]} to {orig_out_channels}")
-                        block.bn3.running_mean.data = torch.zeros(orig_out_channels, device=DEVICE) if orig_out_channels < block.bn3.running_mean.shape[0] else block.bn3.running_mean.data[:orig_out_channels]
-                        block.bn3.running_var.data = torch.ones(orig_out_channels, device=DEVICE) if orig_out_channels < block.bn3.running_var.shape[0] else block.bn3.running_var.data[:orig_out_channels]
-                        block.bn3.weight.data = torch.ones(orig_out_channels, device=DEVICE) if orig_out_channels < block.bn3.weight.shape[0] else block.bn3.weight.data[:orig_out_channels]
-                        block.bn3.bias.data = torch.zeros(orig_out_channels, device=DEVICE) if orig_out_channels < block.bn3.bias.shape[0] else block.bn3.bias.data[:orig_out_channels]
+                    if hasattr(block.bn1, 'running_mean') and block.bn1.running_mean.shape[0] != pruned_in_channels:
+                        print(f"Debug: Resizing BN1 from {block.bn1.running_mean.shape[0]} to {pruned_in_channels}")
+                        block.bn1.running_mean.data = torch.zeros(pruned_in_channels, device=DEVICE) if pruned_in_channels < block.bn1.running_mean.shape[0] else block.bn1.running_mean.data[:pruned_in_channels]
+                        block.bn1.running_var.data = torch.ones(pruned_in_channels, device=DEVICE) if pruned_in_channels < block.bn1.running_var.shape[0] else block.bn1.running_var.data[:pruned_in_channels]
+                        block.bn1.weight.data = torch.ones(pruned_in_channels, device=DEVICE) if pruned_in_channels < block.bn1.weight.shape[0] else block.bn1.weight.data[:pruned_in_channels]
+                        block.bn1.bias.data = torch.zeros(pruned_in_channels, device=DEVICE) if pruned_in_channels < block.bn1.bias.shape[0] else block.bn1.bias.data[:pruned_in_channels]
+                    if hasattr(block.bn3, 'running_mean') and block.bn3.running_mean.shape[0] != pruned_in_channels * 4:  # Adjust for expansion
+                        print(f"Debug: Resizing BN3 from {block.bn3.running_mean.shape[0]} to {pruned_in_channels * 4}")
+                        block.bn3.running_mean.data = torch.zeros(pruned_in_channels * 4, device=DEVICE) if pruned_in_channels * 4 < block.bn3.running_mean.shape[0] else block.bn3.running_mean.data[:pruned_in_channels * 4]
+                        block.bn3.running_var.data = torch.ones(pruned_in_channels * 4, device=DEVICE) if pruned_in_channels * 4 < block.bn3.running_var.shape[0] else block.bn3.running_var.data[:pruned_in_channels * 4]
+                        block.bn3.weight.data = torch.ones(pruned_in_channels * 4, device=DEVICE) if pruned_in_channels * 4 < block.bn3.weight.shape[0] else block.bn3.weight.data[:pruned_in_channels * 4]
+                        block.bn3.bias.data = torch.zeros(pruned_in_channels * 4, device=DEVICE) if pruned_in_channels * 4 < block.bn3.bias.shape[0] else block.bn3.bias.data[:pruned_in_channels * 4]
                 
+                print(f"Debug: Post-resize BN1 running_mean shape for {stage_name}: {next(iter(stage.children())).bn1.running_mean.shape}")
                 print(f"Debug: Post-resize BN3 running_mean shape for {stage_name}: {next(iter(stage.children())).bn3.running_mean.shape}")
 
                 # Forward pass to get intermediate activations
