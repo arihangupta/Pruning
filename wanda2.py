@@ -530,8 +530,7 @@ print("Baseline done:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_
 
 for method in METHODS:
     for target_ratio in TARGET_RATIOS:
-        print(f"
-=== PGTO: method={method}, target_ratio={target_ratio} ===")
+        print(f"=== PGTO: method={method}, target_ratio={target_ratio} ===")
         keep_indices = {s: np.arange(stage_orig_channels(baseline, s)) for s in STAGES}
 
         calib_loader = train_loader
@@ -569,7 +568,7 @@ for method in METHODS:
             pruned_model.train()
             running_loss=0; total=0; correct=0
             for bidx,(imgs,labels) in enumerate(train_loader,1):
-                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+                imgs, labels = imgs.to(DEVIE), labels.to(DEVICE)
                 opt.zero_grad(); out = pruned_model(imgs)
                 loss = criterion(out, labels); loss.backward(); opt.step()
                 running_loss += float(loss.item())*imgs.size(0)
