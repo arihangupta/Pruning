@@ -328,49 +328,49 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
             # conv1
             if stage_name == "layer1" and block_idx == 0:
                 new_block.conv1.weight.data.copy_(old_block.conv1.weight.data[kept])
-                prev_expanded_idxs_safe = torch.arange(old_block.conv1.weight.shape[1])
+                prev_expanded_idxs_safe = torch.arange(min(kept.size(0), old_block.conv1.weight.shape[1]))
             else:
                 old_w = old_block.conv1.weight.data
-                prev_expanded_idxs_safe = torch.arange(old_w.shape[1]) if prev_expanded_idxs is None else prev_expanded_idxs
+                prev_expanded_idxs_safe = torch.arange(min(kept.size(0), old_w.shape[1])) if prev_expanded_idxs is None else prev_expanded_idxs
                 new_block.conv1.weight.data.copy_(old_w[kept][:, prev_expanded_idxs_safe, :, :])
             if old_block.conv1.bias is not None:
                 new_block.conv1.bias.data.copy_(old_block.conv1.bias.data[kept])
             # bn1
-            new_block.bn1.weight.data.copy_(old_block.bn1.weight.data[kept])
-            new_block.bn1.bias.data.copy_(old_block.bn1.bias.data[kept])
-            new_block.bn1.running_mean.data.copy_(old_block.bn1.running_mean.data[kept])
-            new_block.bn1.running_var.data.copy_(old_block.bn1.running_var.data[kept])
+            new_block.bn1.weight.data.copy_(old_block.bn1.weight.data[:kept.size(0)])
+            new_block.bn1.bias.data.copy_(old_block.bn1.bias.data[:kept.size(0)])
+            new_block.bn1.running_mean.data.copy_(old_block.bn1.running_mean.data[:kept.size(0)])
+            new_block.bn1.running_var.data.copy_(old_block.bn1.running_var.data[:kept.size(0)])
             # conv2
             old_w = old_block.conv2.weight.data
-            new_block.conv2.weight.data.copy_(old_w[kept][:, kept, :, :])
+            new_block.conv2.weight.data.copy_(old_w[kept][:, :kept.size(0), :, :])
             if old_block.conv2.bias is not None:
                 new_block.conv2.bias.data.copy_(old_block.conv2.bias.data[kept])
             # bn2
-            new_block.bn2.weight.data.copy_(old_block.bn2.weight.data[kept])
-            new_block.bn2.bias.data.copy_(old_block.bn2.bias.data[kept])
-            new_block.bn2.running_mean.data.copy_(old_block.bn2.running_mean.data[kept])
-            new_block.bn2.running_var.data.copy_(old_block.bn2.running_var.data[kept])
+            new_block.bn2.weight.data.copy_(old_block.bn2.weight.data[:kept.size(0)])
+            new_block.bn2.bias.data.copy_(old_block.bn2.bias.data[:kept.size(0)])
+            new_block.bn2.running_mean.data.copy_(old_block.bn2.running_mean.data[:kept.size(0)])
+            new_block.bn2.running_var.data.copy_(old_block.bn2.running_var.data[:kept.size(0)])
             # conv3
             old_w = old_block.conv3.weight.data
             expanded_idx = np.repeat(kept, expansion)
             old_idx = torch.tensor(expanded_idx, dtype=torch.long)
-            new_block.conv3.weight.data.copy_(old_w[old_idx][:, kept, :, :])
+            new_block.conv3.weight.data.copy_(old_w[old_idx][:, :kept.size(0), :, :])
             if old_block.conv3.bias is not None:
                 new_block.conv3.bias.data.copy_(old_block.conv3.bias.data[old_idx])
             # bn3
-            new_block.bn3.weight.data.copy_(old_block.bn3.weight.data[old_idx])
-            new_block.bn3.bias.data.copy_(old_block.bn3.bias.data[old_idx])
-            new_block.bn3.running_mean.data.copy_(old_block.bn3.running_mean.data[old_idx])
-            new_block.bn3.running_var.data.copy_(old_block.bn3.running_var.data[old_idx])
+            new_block.bn3.weight.data.copy_(old_block.bn3.weight.data[:kept.size(0) * expansion])
+            new_block.bn3.bias.data.copy_(old_block.bn3.bias.data[:kept.size(0) * expansion])
+            new_block.bn3.running_mean.data.copy_(old_block.bn3.running_mean.data[:kept.size(0) * expansion])
+            new_block.bn3.running_var.data.copy_(old_block.bn3.running_var.data[:kept.size(0) * expansion])
             # downsample
             if old_block.downsample is not None:
                 ds_old = old_block.downsample[0].weight.data
                 ds_new = new_block.downsample[0].weight.data
                 ds_new.copy_(ds_old[old_idx][:, prev_expanded_idxs_safe, :, :])
-                new_block.downsample[1].weight.data.copy_(old_block.downsample[1].weight.data[old_idx])
-                new_block.downsample[1].bias.data.copy_(old_block.downsample[1].bias.data[old_idx])
-                new_block.downsample[1].running_mean.data.copy_(old_block.downsample[1].running_mean.data[old_idx])
-                new_block.downsample[1].running_var.data.copy_(old_block.downsample[1].running_var.data[old_idx])
+                new_block.downsample[1].weight.data.copy_(old_block.downsample[1].weight.data[:kept.size(0) * expansion])
+                new_block.downsample[1].bias.data.copy_(old_block.downsample[1].bias.data[:kept.size(0) * expansion])
+                new_block.downsample[1].running_mean.data.copy_(old_block.downsample[1].running_mean.data[:kept.size(0) * expansion])
+                new_block.downsample[1].running_var.data.copy_(old_block.downsample[1].running_var.data[:kept.size(0) * expansion])
             prev_expanded_idxs = old_idx
 
     # fc
