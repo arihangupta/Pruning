@@ -383,6 +383,14 @@ for method in METHODS:
         print(f"\n=== PGTO: method={method}, target_ratio={target_ratio} ===")
         keep_indices = {s: np.arange(stage_orig_channels(baseline, s)) for s in STAGES}
 
+        # -------------------------
+        # Helpers
+        # -------------------------
+        def stage_orig_channels(model, stage_name):
+            layer = getattr(model, stage_name)
+            first_block = next(layer.children())
+            return first_block.conv1.out_channels
+        
         for s in STAGES:
             orig_channels = stage_orig_channels(baseline, s)
             keep_k = max(1, int(math.floor(orig_channels * (1.0 - target_ratio))))
@@ -423,10 +431,4 @@ csv_path = os.path.join(SAVE_DIR, "pgto_summary_metrics.csv")
 df.to_csv(csv_path, index=False)
 print(f"\nAll metrics saved to {csv_path}")
 
-# -------------------------
-# Helpers
-# -------------------------
-def stage_orig_channels(model, stage_name):
-    layer = getattr(model, stage_name)
-    first_block = next(layer.children())
-    return first_block.conv1.out_channels
+
