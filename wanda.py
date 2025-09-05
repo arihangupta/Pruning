@@ -383,10 +383,8 @@ for method in METHODS:
         print(f"\n=== PGTO: method={method}, target_ratio={target_ratio} ===")
         keep_indices = {s: np.arange(stage_orig_channels(baseline, s)) for s in STAGES}
 
-        # -------------------------
-        # Helpers
-        # -------------------------
         def stage_orig_channels(model, stage_name):
+            """Return the number of output channels of the first block in a stage."""
             layer = getattr(model, stage_name)
             first_block = next(layer.children())
             return first_block.conv1.out_channels
