@@ -38,7 +38,7 @@ SEED = 42
 BATCH_SIZE = 32
 IMG_SIZE = 224
 
-METHODS = ["l1", "bn_gamma", "regional_gradients"]
+METHODS = ["regional_gradients", "l1", "bn_gamma"]
 TARGET_RATIOS = [0.5, 0.6, 0.7]
 CAL_EPOCHS = 1
 CAL_MAX_BATCHES = 150   # used for calibration training loops
@@ -568,7 +568,7 @@ for method in METHODS:
             pruned_model.train()
             running_loss=0; total=0; correct=0
             for bidx,(imgs,labels) in enumerate(train_loader,1):
-                imgs, labels = imgs.to(DEVIE), labels.to(DEVICE)
+                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
                 opt.zero_grad(); out = pruned_model(imgs)
                 loss = criterion(out, labels); loss.backward(); opt.step()
                 running_loss += float(loss.item())*imgs.size(0)
