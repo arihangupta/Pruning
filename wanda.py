@@ -201,6 +201,19 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
             try:
                 imgs, _ = next(iter(train_loader))
                 imgs = imgs.to(DEVICE)
+                # Forward pass to update BN stats with pruned structure
+                _ = model(imgs)  # Warm up with pruned model
+                
+                # Resize BN running stats to match pruned channels
+                for block in stage.children():
+                    orig_out_channels = block.conv3.out_channels
+                    if hasattr(block.bn3, 'running_mean') and block.bn3.running_mean.shape[0] != orig_out_channels:
+                        new_size = orig_out_channels
+                        block.bn3.running_mean.data = block.bn3.running_mean.data[:new_size]
+                        block.bn3.running_var.data = block.bn3.running_var.data[:new_size]
+                        block.bn3.weight.data = block.bn3.weight.data[:new_size]
+                        block.bn3.bias.data = block.bn3.bias.data[:new_size]
+                
                 # Forward pass to get intermediate activations
                 def hook_fn(module, input, output):
                     return input[0]  # Store input activations
@@ -255,8 +268,8 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
                 print(f"Warning: Wanda++ computation failed for {stage_name}, falling back to l1. Error: {e}")
                 method = "l1"  # Fallback if calibration fails
 
-    # Fallback methods (original l1 or bn_gamma)
-    if method == "l1" or method != "wanda++":
+    # Fallback methods based on the resolved method
+    if method == "l1":
         for block in stage.children():
             conv3 = block.conv3.weight.detach().abs().cpu().numpy()
             exp = block.conv3.out_channels // block.conv3.in_channels
