@@ -23,10 +23,10 @@ from sklearn.metrics import roc_auc_score
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 IMG_SIZE = 224
 CAL_EPOCHS = 1
-CAL_MAX_BATCHES = 150
+CAL_MAX_BATCHES = 50
 CAL_LR = 3e-4
 FINAL_FINETUNE_EPOCHS = 2
 FINAL_LR = 1e-4
@@ -136,16 +136,33 @@ criterion = nn.CrossEntropyLoss()
 # -------------------------
 # Wanda++ Importance
 # -------------------------
-def collect_activations(model, loader, stage_name, max_batches=CAL_MAX_BATCHES):
-    model.eval(); acts = []; hooks = []
-    def hook_fn(m, inp, out): acts.append(out.detach().cpu())
-    for block in getattr(model, stage_name).children(): hooks.append(block.register_forward_hook(hook_fn))
+def collect_activations(model, loader, stage_name, max_batches=50):
+    model.eval()
+    acts_sum = None
+    count = 0
+    hooks = []
+
+    def hook_fn(m, inp, out):
+        nonlocal acts_sum, count
+        batch_act = out.detach().cpu().flatten(1).norm(2, dim=1)
+        if acts_sum is None:
+            acts_sum = batch_act.sum(0)
+        else:
+            acts_sum += batch_act.sum(0)
+        count += batch_act.shape[0]
+
+    for block in getattr(model, stage_name).children():
+        hooks.append(block.register_forward_hook(hook_fn))
+
     for i, (imgs, _) in enumerate(loader):
         imgs = imgs.to(DEVICE)
         _ = model(imgs)
-        if i+1 >= max_batches: break
+        if i+1 >= max_batches:
+            break
+
     for h in hooks: h.remove()
-    return torch.cat(acts, dim=0)
+    return (acts_sum / count)  # averaged L2 per channel
+
 
 def wanda_importance(model, baseline, loader, stage_name):
     acts = collect_activations(model, loader, stage_name)
