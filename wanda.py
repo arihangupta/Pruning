@@ -199,19 +199,15 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
             model.eval()
             act_list = []
             grad_list = []
-            # forward hook on conv1 inputs for each block in stage
-            # We'll register hooks on the first block's conv1 input (that's representative), but average across blocks to be robust.
-            # We'll collect activations from conv1 inputs of each block using forward hooks and accumulate gradients via backward hook on stage output.
-            # Define hooks:
+            # forward hook on conv1 inputs for each block
             conv1_inputs = []
 
             def make_forward_hook(storage):
                 def hook(module, input, output):
-                    # input[0] is the tensor into conv1, shape [B, C, H, W] (this is the input into conv1)
-                    storage.append(input[0].detach())
+                    storage.append(input[0].detach())  # Store input tensor [B, C, H, W]
                 return hook
 
-            # Register forward hooks on conv1 of each block of the stage
+            # Register forward hooks on conv1 of each block
             fhooks = []
             storages = []
             for block in stage.children():
@@ -220,130 +216,88 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
                 h = block.conv1.register_forward_hook(make_forward_hook(s))
                 fhooks.append(h)
 
-            # We will also register a hook to capture the stage output so we can compute regional loss
+            # Register hook to capture stage output for regional loss
             stage_outputs = []
             def stage_forward_hook(module, input, output):
-                # output is the stage's output tensor; store it for loss computation
-                stage_outputs.append(output)
+                stage_outputs.append(output.detach())  # Store stage output [B, C, H, W]
             shook = stage.register_forward_hook(stage_forward_hook)
 
             batches = 0
             for imgs, labels in train_loader:
-                imgs = imgs.to(device); labels = labels.to(device)
-                # zero grads
+                imgs = imgs.to(device)
                 model.zero_grad()
                 out = model(imgs)
-                # Use L2 norm of stage output as regional loss (same idea as original)
-                if len(stage_outputs) == 0:
-                    # Should not happen, but just in case
-                    regional_loss = out.norm()
-                else:
-                    regional_loss = stage_outputs[-1].norm()
-                regional_loss.backward(retain_graph=False)
+                if len(stage_outputs) > 0:
+                    regional_loss = stage_outputs[-1].norm(p=2)  # L2 norm of stage output
+                    regional_loss.backward()
                 batches += 1
-                stage_outputs.clear()
                 if batches >= max_batches:
                     break
 
-            # remove hooks
+            # Remove hooks
             for h in fhooks: h.remove()
             shook.remove()
 
-            # Aggregate activations and grads across storages
-            # storages is a list of lists (one per block), each with tensors [B, C, H, W] across batches.
-            # We'll compute per-channel L2 norm across all collected tensors.
-            # Flatten by concatenation along batch dimension
+            # Aggregate activations
             act_concat = []
             for s in storages:
                 if len(s) > 0:
                     act_concat.append(torch.cat(s, dim=0))
             if len(act_concat) == 0:
                 raise RuntimeError("No activations captured for wanda++; falling back.")
-            act_all = torch.cat(act_concat, dim=0)  # shape [N, C, H, W]
+            act_all = torch.cat(act_concat, dim=0)  # Shape [N, C, H, W], C should match orig_planes
+            act_norms = act_all.norm(p=2, dim=(0, 2, 3)).cpu().numpy()  # Per-channel L2 norm
 
-            # For grads: extract conv3.weight.grad from each block and average over blocks
+            # Aggregate gradients
             grad_mags = []
             for block in stage.children():
-                g = block.conv3.weight.grad  # shape [out_ch, in_ch, k, k]
-                if g is None:
-                    continue
-                # compute mean absolute gradient per input plane grouping (account for expansion)
-                g_abs = g.abs().detach().to("cpu")
-                out_ch = g_abs.shape[0]
-                in_ch = g_abs.shape[1]
-                exp = out_ch // in_ch if in_ch > 0 else 1
-                # collapse output channels into groups of size exp to map to input planes
-                g_per_plane = []
-                for p in range(in_ch):
-                    start = p * exp
-                    end = start + exp
-                    g_slice = g_abs[start:end, p:p+1, :, :]  # shape [exp, 1, k, k]
-                    g_per_plane.append(g_slice.mean().item())
-                grad_mags.append(np.array(g_per_plane))
-            if len(grad_mags) == 0:
-                # fallback to zeros if no grads captured
-                grad_mags = np.zeros((1, orig_planes))
-            grad_magnitudes = np.mean(np.stack(grad_mags, axis=0), axis=0)  # shape [orig_planes]
+                g = block.conv3.weight.grad
+                if g is not None:
+                    g_abs = g.abs().detach().to("cpu")
+                    out_ch, in_ch = g_abs.shape[0], g_abs.shape[1]
+                    exp = out_ch // in_ch if in_ch > 0 else 1
+                    g_per_plane = []
+                    for p in range(in_ch):
+                        start, end = p * exp, (p + 1) * exp
+                        g_slice = g_abs[start:end].mean(dim=(1, 2, 3))  # Average over kernel dims
+                        g_per_plane.append(g_slice.mean().item())
+                    grad_mags.append(np.array(g_per_plane))
+            grad_magnitudes = np.mean(np.stack(grad_mags, axis=0), axis=0) if grad_mags else np.zeros(orig_planes)
 
-            # Activation norms per channel
-            act_norms = act_all.norm(p=2, dim=(0,2,3)).cpu().numpy()  # length = C
-
-            # Weight magnitudes: average conv3 weights aggregated per input-plane-group
+            # Weight magnitudes
             weight_mags = []
             for block in stage.children():
                 conv3_w = block.conv3.weight.detach().abs().cpu().numpy()
-                out_ch = conv3_w.shape[0]
-                in_ch = conv3_w.shape[1]
-                if in_ch == 0:
-                    continue
-                exp = out_ch // in_ch if in_ch>0 else 1
+                out_ch, in_ch = conv3_w.shape[0], conv3_w.shape[1]
+                exp = out_ch // in_ch if in_ch > 0 else 1
                 per_plane = []
                 for p in range(in_ch):
-                    start = p*exp
-                    end = start + exp
-                    per_plane.append(conv3_w[start:end, :, :, :].sum())
+                    start, end = p * exp, (p + 1) * exp
+                    per_plane.append(conv3_w[start:end].sum())
                 weight_mags.append(np.array(per_plane))
-            if len(weight_mags) == 0:
-                weight_mags = np.ones((1, orig_planes))
-            weight_mags = np.mean(np.stack(weight_mags, axis=0), axis=0)
+            weight_mags = np.mean(np.stack(weight_mags, axis=0), axis=0) if weight_mags else np.ones(orig_planes)
 
-            # final importance: (alpha * grad + act_norm) * weight_mags
+            # Compute importance
             importance = (alpha * grad_magnitudes + act_norms) * weight_mags
             importance = np.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
-            # choose top-k
-            k = keep_k
-            if k >= len(importance):
-                keep = np.arange(len(importance))
-            else:
-                keep = np.argsort(importance)[-k:]
-            keep = np.sort(keep)
-            keep_t = torch.from_numpy(keep).long().to(device)
-            return keep_t.cpu().long()
+            keep = np.argsort(importance)[-keep_k:] if keep_k < len(importance) else np.arange(len(importance))
+            return torch.from_numpy(np.sort(keep)).long()
+
         except Exception as e:
             print(f"Warning: Wanda++ computation failed for {stage_name}, falling back to l1. Error: {e}")
             method = "l1"
 
-    # Fallback methods
+    # Fallback methods (unchanged)
     if method == "l1":
         block_importances = []
         for block in stage.children():
             conv3 = block.conv3.weight.detach().abs().cpu().numpy()
-            out_ch = conv3.shape[0]
-            in_ch = conv3.shape[1]
-            exp = out_ch // in_ch if in_ch>0 else 1
-            per_plane = []
-            for p in range(in_ch):
-                start = p*exp
-                end = start + exp
-                per_plane.append(conv3[start:end, :, :, :].sum())
+            out_ch, in_ch = conv3.shape[0], conv3.shape[1]
+            exp = out_ch // in_ch if in_ch > 0 else 1
+            per_plane = [conv3[start:end].sum() for p in range(in_ch) for start, end in [(p * exp, (p + 1) * exp)]]
             block_importances.append(np.array(per_plane))
         importance = np.mean(np.stack(block_importances, axis=0), axis=0)
-        # choose top-k
-        k = keep_k
-        if k >= len(importance):
-            keep = np.arange(len(importance))
-        else:
-            keep = np.argsort(importance)[-k:]
+        keep = np.argsort(importance)[-keep_k:] if keep_k < len(importance) else np.arange(len(importance))
         return torch.from_numpy(np.sort(keep)).long()
 
     elif method == "bn_gamma":
@@ -351,29 +305,14 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
         for block in stage.children():
             gammas = block.bn3.weight.detach().abs().cpu().numpy()
             out_ch = gammas.shape[0]
-            # map groups of expansion to input planes
-            # we assume expansion = out_ch / in_ch
-            # fallback: if not divisible, take mean groups
-            # find candidate in_ch by checking block.conv3.in_channels
             in_ch = block.conv3.weight.shape[1]
-            if in_ch == 0:
-                continue
-            exp = out_ch // in_ch if in_ch>0 else 1
-            per_plane = []
-            for p in range(in_ch):
-                start = p*exp
-                end = start + exp
-                per_plane.append(np.mean(gammas[start:end]))
+            exp = out_ch // in_ch if in_ch > 0 else 1
+            per_plane = [np.mean(gammas[start:end]) for p in range(in_ch) for start, end in [(p * exp, (p + 1) * exp)]]
             block_importances.append(np.array(per_plane))
         importance = np.mean(np.stack(block_importances, axis=0), axis=0)
-        k = keep_k
-        if k >= len(importance):
-            keep = np.arange(len(importance))
-        else:
-            keep = np.argsort(importance)[-k:]
+        keep = np.argsort(importance)[-keep_k:] if keep_k < len(importance) else np.arange(len(importance))
         return torch.from_numpy(np.sort(keep)).long()
 
-    # Should not reach here
     raise RuntimeError("Unknown method in compute_stage_importance_and_keeps")
 
 # -------------------------
