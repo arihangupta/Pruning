@@ -53,7 +53,7 @@ IMG_SIZE = 224
 
 # Wanda++-style knobs
 TARGET_RATIOS = [0.5, 0.7]     # final prune targets per stage (50%, 70%)
-METHODS = ["l1", "bn_gamma", "wanda++"]   # importance criterion
+METHODS = ["wanda++", "l1", "bn_gamma"]   # importance criterion
 CAL_EPOCHS = 1                 # short local calibration after each stage
 CAL_MAX_BATCHES = 150          # cap steps for calibration
 CAL_LR = 3e-4
@@ -201,19 +201,24 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
             try:
                 imgs, _ = next(iter(train_loader))
                 imgs = imgs.to(DEVICE)
-                # Forward pass to update BN stats with pruned structure
-                _ = model(imgs)  # Warm up with pruned model
+                print(f"Debug: Initial BN3 running_mean shape for {stage_name}: {next(iter(stage.children())).bn3.running_mean.shape}")
+
+                # Forward pass to update model state with pruned structure
+                _ = model(imgs)  # Warm up to propagate pruned structure
                 
-                # Resize BN running stats to match pruned channels
+                # Resize BN running stats to match pruned output channels
                 for block in stage.children():
                     orig_out_channels = block.conv3.out_channels
+                    print(f"Debug: Adjusting BN3 for {stage_name}, orig_out_channels={orig_out_channels}")
                     if hasattr(block.bn3, 'running_mean') and block.bn3.running_mean.shape[0] != orig_out_channels:
-                        new_size = orig_out_channels
-                        block.bn3.running_mean.data = block.bn3.running_mean.data[:new_size]
-                        block.bn3.running_var.data = block.bn3.running_var.data[:new_size]
-                        block.bn3.weight.data = block.bn3.weight.data[:new_size]
-                        block.bn3.bias.data = block.bn3.bias.data[:new_size]
+                        print(f"Debug: Resizing BN3 from {block.bn3.running_mean.shape[0]} to {orig_out_channels}")
+                        block.bn3.running_mean.data = torch.zeros(orig_out_channels, device=DEVICE) if orig_out_channels < block.bn3.running_mean.shape[0] else block.bn3.running_mean.data[:orig_out_channels]
+                        block.bn3.running_var.data = torch.ones(orig_out_channels, device=DEVICE) if orig_out_channels < block.bn3.running_var.shape[0] else block.bn3.running_var.data[:orig_out_channels]
+                        block.bn3.weight.data = torch.ones(orig_out_channels, device=DEVICE) if orig_out_channels < block.bn3.weight.shape[0] else block.bn3.weight.data[:orig_out_channels]
+                        block.bn3.bias.data = torch.zeros(orig_out_channels, device=DEVICE) if orig_out_channels < block.bn3.bias.shape[0] else block.bn3.bias.data[:orig_out_channels]
                 
+                print(f"Debug: Post-resize BN3 running_mean shape for {stage_name}: {next(iter(stage.children())).bn3.running_mean.shape}")
+
                 # Forward pass to get intermediate activations
                 def hook_fn(module, input, output):
                     return input[0]  # Store input activations
