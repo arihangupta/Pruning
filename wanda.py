@@ -198,78 +198,64 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
     Correctly handles Bottleneck: conv1/conv2/conv3, downsample, fc.
     """
     new_model = build_pruned_resnet(keep_indices, num_classes=num_classes).to(DEVICE)
-    expansion = 4
     STAGES = ["layer1", "layer2", "layer3", "layer4"]
+    expansion = 4  # Bottleneck expansion
 
-    prev_stage_keep = None  # input channels from previous stage
+    # Start with stem output as previous output indices
+    prev_out_idx = torch.arange(base_model.conv1.out_channels, dtype=torch.long)
 
     for stage_name in STAGES:
         old_stage = getattr(base_model, stage_name)
         new_stage = getattr(new_model, stage_name)
-        stage_keep = keep_indices[stage_name]
+        stage_keep = torch.tensor(keep_indices[stage_name], dtype=torch.long)
 
         for block_idx, (old_block, new_block) in enumerate(zip(old_stage, new_stage)):
-            # input channels for this block
-            if prev_stage_keep is None:
-                # very first block in the first stage: take all input channels from conv1
-                prev_keep = np.arange(old_block.conv1.in_channels)
-            else:
-                prev_keep = prev_stage_keep
+            in_idx = prev_out_idx
+            out_idx = stage_keep
 
-            # convert to torch long tensors safely
-            out_idx = torch.tensor(stage_keep, dtype=torch.long)
-            in_idx  = torch.tensor(prev_keep, dtype=torch.long)
-
-            # --- conv1 ---
+            # conv1 / bn1
             new_block.conv1.weight.data.copy_(old_block.conv1.weight.data[out_idx][:, in_idx, :, :])
-            if old_block.conv1.bias is not None:
-                new_block.conv1.bias.data.copy_(old_block.conv1.bias.data[out_idx])
             new_block.bn1.weight.data.copy_(old_block.bn1.weight.data[out_idx])
             new_block.bn1.bias.data.copy_(old_block.bn1.bias.data[out_idx])
             new_block.bn1.running_mean.data.copy_(old_block.bn1.running_mean.data[out_idx])
             new_block.bn1.running_var.data.copy_(old_block.bn1.running_var.data[out_idx])
 
-            # --- conv2 ---
+            # conv2 / bn2
             new_block.conv2.weight.data.copy_(old_block.conv2.weight.data[out_idx][:, out_idx, :, :])
-            if old_block.conv2.bias is not None:
-                new_block.conv2.bias.data.copy_(old_block.conv2.bias.data[out_idx])
             new_block.bn2.weight.data.copy_(old_block.bn2.weight.data[out_idx])
             new_block.bn2.bias.data.copy_(old_block.bn2.bias.data[out_idx])
             new_block.bn2.running_mean.data.copy_(old_block.bn2.running_mean.data[out_idx])
             new_block.bn2.running_var.data.copy_(old_block.bn2.running_var.data[out_idx])
 
-            # --- conv3 ---
-            expanded_idx = np.repeat(stage_keep, expansion)
-            out_idx3 = torch.tensor(expanded_idx, dtype=torch.long)
-            in_idx3 = out_idx  # input channels from conv2
-            new_block.conv3.weight.data.copy_(old_block.conv3.weight.data[out_idx3][:, in_idx3, :, :])
-            if old_block.conv3.bias is not None:
-                new_block.conv3.bias.data.copy_(old_block.conv3.bias.data[out_idx3])
-            new_block.bn3.weight.data.copy_(old_block.bn3.weight.data[out_idx3])
-            new_block.bn3.bias.data.copy_(old_block.bn3.bias.data[out_idx3])
-            new_block.bn3.running_mean.data.copy_(old_block.bn3.running_mean.data[out_idx3])
-            new_block.bn3.running_var.data.copy_(old_block.bn3.running_var.data[out_idx3])
+            # conv3 / bn3 (expanded)
+            exp_out_idx = torch.arange(len(new_block.conv3.weight), dtype=torch.long)
+            new_block.conv3.weight.data.copy_(old_block.conv3.weight.data[exp_out_idx][:, out_idx, :, :])
+            new_block.bn3.weight.data.copy_(old_block.bn3.weight.data[exp_out_idx])
+            new_block.bn3.bias.data.copy_(old_block.bn3.bias.data[exp_out_idx])
+            new_block.bn3.running_mean.data.copy_(old_block.bn3.running_mean.data[exp_out_idx])
+            new_block.bn3.running_var.data.copy_(old_block.bn3.running_var.data[exp_out_idx])
 
-            # --- downsample ---
+            # downsample if exists
             if old_block.downsample is not None:
-                ds_conv_w = old_block.downsample[0].weight.data
-                new_block.downsample[0].weight.data.copy_(ds_conv_w[out_idx3][:, in_idx, :, :])
-                new_block.downsample[1].weight.data.copy_(old_block.downsample[1].weight.data[out_idx3])
-                new_block.downsample[1].bias.data.copy_(old_block.downsample[1].bias.data[out_idx3])
-                new_block.downsample[1].running_mean.data.copy_(old_block.downsample[1].running_mean.data[out_idx3])
-                new_block.downsample[1].running_var.data.copy_(old_block.downsample[1].running_var.data[out_idx3])
+                new_block.downsample[0].weight.data.copy_(old_block.downsample[0].weight.data[exp_out_idx][:, in_idx, :, :])
+                new_block.downsample[1].weight.data.copy_(old_block.downsample[1].weight.data[exp_out_idx])
+                new_block.downsample[1].bias.data.copy_(old_block.downsample[1].bias.data[exp_out_idx])
+                new_block.downsample[1].running_mean.data.copy_(old_block.downsample[1].running_mean.data[exp_out_idx])
+                new_block.downsample[1].running_var.data.copy_(old_block.downsample[1].running_var.data[exp_out_idx])
 
-            # update prev_keep for next block
-            prev_keep = stage_keep
+            # update prev_out_idx for next block
+            prev_out_idx = out_idx.repeat(expansion)  # expand for next block input
 
-        # update prev_stage_keep for next stage
+        # stage done; prev_out_idx ready for next stage
         prev_stage_keep = stage_keep
 
-    # --- fc layer ---
-    new_model.fc.weight.data.copy_(base_model.fc.weight.data[:, prev_stage_keep])
+    # fc layer
+    fc_in_idx = prev_stage_keep.repeat(expansion)
+    new_model.fc.weight.data.copy_(base_model.fc.weight.data[:, fc_in_idx])
     new_model.fc.bias.data.copy_(base_model.fc.bias.data)
 
     return new_model
+
 
 
 
