@@ -370,41 +370,59 @@ def calibrate_stage(model, stage_name, loader, epochs=1, max_batches=100, lr=3e-
 # -------------------------
 rows = []
 
+# -------------------------
+# Helper to get original stage widths from baseline
+# -------------------------
+def stage_orig_channels(model, stage_name):
+    """Return the number of output channels of the first block in a stage."""
+    layer = getattr(model, stage_name)
+    first_block = next(layer.children())
+    return first_block.conv1.out_channels
+
+# -------------------------
 # Baseline metrics
+# -------------------------
 print("\n=== EVALUATE BASELINE ===")
+baseline.eval()
 row = collect_metrics_row("baseline", "baseline", 0.0, baseline, test_loader, BASELINE_CKPT)
 rows.append(row)
 print("Baseline metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image","InferenceTime_per_batch32_s"]})
 
 STAGES = ["layer1","layer2","layer3","layer4"]
 
+# -------------------------
+# PGTO loop
+# -------------------------
 for method in METHODS:
     for target_ratio in TARGET_RATIOS:
         print(f"\n=== PGTO: method={method}, target_ratio={target_ratio} ===")
+        # Initialize keep_indices with all channels
         keep_indices = {s: np.arange(stage_orig_channels(baseline, s)) for s in STAGES}
 
-        def stage_orig_channels(model, stage_name):
-            """Return the number of output channels of the first block in a stage."""
-            layer = getattr(model, stage_name)
-            first_block = next(layer.children())
-            return first_block.conv1.out_channels
-        
         for s in STAGES:
             orig_channels = stage_orig_channels(baseline, s)
             keep_k = max(1, int(math.floor(orig_channels * (1.0 - target_ratio))))
+            # Compute fresh keep indices for this stage
             keep_indices[s] = compute_stage_importance_and_keeps(baseline, s, keep_k, method=method)
             print(f"  Stage {s}: keeping {len(keep_indices[s])}/{orig_channels} channels ({100*len(keep_indices[s])/orig_channels:.1f}%)")
 
+            # Build pruned model
             pruned_model = build_pruned_resnet_and_copy_weights(baseline, keep_indices, NUM_CLASSES).to(DEVICE)
+            
+            # Calibrate only this stage
             calibrate_stage(pruned_model, s, train_loader, CAL_EPOCHS, CAL_MAX_BATCHES, CAL_LR)
 
+            # Save checkpoint & metrics after stage calibration
             stage_ckpt = os.path.join(SAVE_DIR, f"dermamnist_resnet50_pgto_{method}_r{int(target_ratio*100)}_{s}_calibrated.pth")
             torch.save(pruned_model.state_dict(), stage_ckpt)
+            pruned_model.eval()
             row = collect_metrics_row(method, f"{s}_after_stage_calibration", target_ratio, pruned_model, test_loader, stage_ckpt)
             rows.append(row)
             print("    Stage metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
 
+        # -------------------------
         # Final short global finetune
+        # -------------------------
         print("  Final global finetune...")
         pruned_model = build_pruned_resnet_and_copy_weights(baseline, keep_indices, NUM_CLASSES).to(DEVICE)
         optimizer = optim.Adam(pruned_model.parameters(), lr=FINAL_LR)
@@ -417,16 +435,22 @@ for method in METHODS:
                 loss = criterion(outputs, labels)
                 loss.backward()
                 optimizer.step()
+
+        # Save final checkpoint & metrics
         final_ckpt = os.path.join(SAVE_DIR, f"dermamnist_resnet50_pgto_{method}_r{int(target_ratio*100)}_final.pth")
         torch.save(pruned_model.state_dict(), final_ckpt)
-        row = collect_metrics_row(method, "final_finetune", target_ratio, pruned_model, test_loader, final_ckpt)
+        pruned_model.eval()
+        row = collect_metrics_row(method, "after_global_finetune", target_ratio, pruned_model, test_loader, final_ckpt)
         rows.append(row)
         print("    Final finetune metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
 
+# -------------------------
 # Save CSV summary
+# -------------------------
 df = pd.DataFrame(rows)
 csv_path = os.path.join(SAVE_DIR, "pgto_summary_metrics.csv")
 df.to_csv(csv_path, index=False)
 print(f"\nAll metrics saved to {csv_path}")
+
 
 
