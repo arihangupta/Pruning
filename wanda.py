@@ -210,12 +210,13 @@ def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
 
         for block_idx, (old_block, new_block) in enumerate(zip(old_stage, new_stage)):
             # input channels for this block
-            if stage_name == "layer1" and block_idx == 0:
-                prev_keep = torch.arange(old_block.conv1.in_channels)  # full input
+            if prev_stage_keep is None:
+                # very first block in the first stage: take all input channels from conv1
+                prev_keep = np.arange(old_block.conv1.in_channels)
             else:
                 prev_keep = prev_stage_keep
 
-            # convert to torch long tensors
+            # convert to torch long tensors safely
             out_idx = torch.tensor(stage_keep, dtype=torch.long)
             in_idx  = torch.tensor(prev_keep, dtype=torch.long)
 
