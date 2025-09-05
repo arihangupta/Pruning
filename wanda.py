@@ -194,47 +194,73 @@ def build_pruned_resnet(keep_indices, num_classes):
     return CustomResNet(block=Bottleneck, layers=layers, stage_planes=stage_planes, num_classes=num_classes)
 
 def build_pruned_resnet_and_copy_weights(base_model, keep_indices, num_classes):
+    """
+    Build a CustomResNet with given keep_indices (per stage) and copy weights from base_model.
+    Handles Bottleneck correctly: conv3 input channels = conv2 output channels, downsample, etc.
+    """
     new_model = build_pruned_resnet(keep_indices, num_classes=num_classes).to(DEVICE)
     expansion = 4
-    STAGES = ["layer1","layer2","layer3","layer4"]
-    prev_expanded_idxs = None
+    STAGES = ["layer1", "layer2", "layer3", "layer4"]
+    
+    prev_stage_keep = None  # keeps track of input channels from previous stage
 
     for stage_name in STAGES:
-        old_layer = getattr(base_model, stage_name)
-        new_layer = getattr(new_model, stage_name)
-        kept = keep_indices[stage_name]
-        for block_idx, (old_block, new_block) in enumerate(zip(old_layer, new_layer)):
-            # conv1
-            if stage_name=="layer1" and block_idx==0:
-                new_block.conv1.weight.data.copy_(old_block.conv1.weight.data[kept])
-                prev_expanded_idxs_safe = torch.arange(old_block.conv1.weight.shape[1])
+        old_stage = getattr(base_model, stage_name)
+        new_stage = getattr(new_model, stage_name)
+        stage_keep = keep_indices[stage_name]
+
+        for block_idx, (old_block, new_block) in enumerate(zip(old_stage, new_stage)):
+            # Determine input channels for this block
+            if stage_name == "layer1" and block_idx == 0:
+                prev_keep = torch.arange(old_block.conv1.in_channels)  # full input channels
             else:
-                old_w = old_block.conv1.weight.data
-                prev_expanded_idxs_safe = torch.arange(old_w.shape[1]) if prev_expanded_idxs is None else prev_expanded_idxs
-                new_block.conv1.weight.data.copy_(old_w[kept][:, prev_expanded_idxs_safe,:,:])
-            if old_block.conv1.bias is not None:
-                new_block.conv1.bias.data.copy_(old_block.conv1.bias.data[kept])
-            # bn1
-            new_block.bn1.weight.data.copy_(old_block.bn1.weight.data[kept])
-            new_block.bn1.bias.data.copy_(old_block.bn1.bias.data[kept])
-            new_block.bn1.running_mean.data.copy_(old_block.bn1.running_mean.data[kept])
-            new_block.bn1.running_var.data.copy_(old_block.bn1.running_var.data[kept])
-            # conv2
-            old_w = old_block.conv2.weight.data
-            new_block.conv2.weight.data.copy_(old_w[kept][:, kept,:,:])
-            # conv3
-            old_w = old_block.conv3.weight.data
-            new_block.conv3.weight.data.copy_(old_w[kept][:, kept,:,:])
-            # downsample if exists
+                prev_keep = prev_stage_keep
+
+            # --- conv1 ---
+            new_block.conv1.weight.data.copy_(old_block.conv1.weight.data[stage_keep][:, prev_keep, :, :])
+            new_block.bn1.weight.data.copy_(old_block.bn1.weight.data[stage_keep])
+            new_block.bn1.bias.data.copy_(old_block.bn1.bias.data[stage_keep])
+            new_block.bn1.running_mean.data.copy_(old_block.bn1.running_mean.data[stage_keep])
+            new_block.bn1.running_var.data.copy_(old_block.bn1.running_var.data[stage_keep])
+
+            # --- conv2 ---
+            new_block.conv2.weight.data.copy_(old_block.conv2.weight.data[stage_keep][:, stage_keep, :, :])
+            new_block.bn2.weight.data.copy_(old_block.bn2.weight.data[stage_keep])
+            new_block.bn2.bias.data.copy_(old_block.bn2.bias.data[stage_keep])
+            new_block.bn2.running_mean.data.copy_(old_block.bn2.running_mean.data[stage_keep])
+            new_block.bn2.running_var.data.copy_(old_block.bn2.running_var.data[stage_keep])
+
+            # --- conv3 ---
+            old_conv3_w = old_block.conv3.weight.data
+            expanded_idx = np.repeat(stage_keep, expansion)
+            old_idx = torch.tensor(expanded_idx, dtype=torch.long)
+            new_block.conv3.weight.data.copy_(old_conv3_w[old_idx][:, stage_keep, :, :])
+            new_block.bn3.weight.data.copy_(old_block.bn3.weight.data[old_idx])
+            new_block.bn3.bias.data.copy_(old_block.bn3.bias.data[old_idx])
+            new_block.bn3.running_mean.data.copy_(old_block.bn3.running_mean.data[old_idx])
+            new_block.bn3.running_var.data.copy_(old_block.bn3.running_var.data[old_idx])
+
+            # --- downsample ---
             if old_block.downsample is not None:
-                for name in old_block.downsample._modules:
-                    w = old_block.downsample._modules[name].weight.data
-                    new_block.downsample._modules[name].weight.data.copy_(w[kept][:, kept,:,:])
-        prev_expanded_idxs = kept
-    # fc
-    new_model.fc.weight.data.copy_(base_model.fc.weight.data)
+                ds_old_conv = old_block.downsample[0].weight.data
+                new_block.downsample[0].weight.data.copy_(ds_old_conv[old_idx][:, prev_keep, :, :])
+                new_block.downsample[1].weight.data.copy_(old_block.downsample[1].weight.data[old_idx])
+                new_block.downsample[1].bias.data.copy_(old_block.downsample[1].bias.data[old_idx])
+                new_block.downsample[1].running_mean.data.copy_(old_block.downsample[1].running_mean.data[old_idx])
+                new_block.downsample[1].running_var.data.copy_(old_block.downsample[1].running_var.data[old_idx])
+
+            # Update prev_keep for next block
+            prev_keep = stage_keep
+
+        # Update prev_stage_keep for next stage
+        prev_stage_keep = stage_keep
+
+    # --- fc ---
+    new_model.fc.weight.data.copy_(base_model.fc.weight.data[:, prev_stage_keep])
     new_model.fc.bias.data.copy_(base_model.fc.bias.data)
+
     return new_model
+
 
 # -------------------------
 # Calibration helpers
