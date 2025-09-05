@@ -521,8 +521,7 @@ def calibrate_stage(model, stage_name, train_loader, epochs=CAL_EPOCHS, max_batc
 rows = []
 
 # Baseline metrics
-print("
-=== EVALUATE BASELINE ===")
+print("=== EVALUATE BASELINE ===")
 base_ckpt = os.path.join(SAVE_DIR, "baseline.pth")
 torch.save(baseline.state_dict(), base_ckpt)
 row = collect_metrics_row("baseline", "baseline", 0.0, baseline, test_loader, base_ckpt)
@@ -596,5 +595,4 @@ for method in METHODS:
 # Save CSV
 csv_path = os.path.join(SAVE_DIR, "dermamnist_pgto_pruning_metrics.csv")
 df = pd.DataFrame(rows); df.to_csv(csv_path, index=False)
-print("
-All done. CSV:", csv_path)
+print("All done. CSV:", csv_path)
