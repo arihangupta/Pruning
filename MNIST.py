@@ -1,5 +1,5 @@
 import medmnist
-from medmnist import DermaMNIST, PathMNIST
+from medmnist import DermaMNIST, PathMNIST, OCTMNIST, BloodMNIST, TissueMNIST
 import numpy as np
 import os
 
@@ -10,31 +10,33 @@ IMG_SIZE = 224
 ROOT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
 os.makedirs(ROOT_DIR, exist_ok=True)  # Create directory if it doesn't exist
 
-# Download DermaMNIST (train/val/test) at 224x224
-derma_train = DermaMNIST(split="train", download=True, size=IMG_SIZE, root=ROOT_DIR)
-derma_val = DermaMNIST(split="val", download=True, size=IMG_SIZE, root=ROOT_DIR)
-derma_test = DermaMNIST(split="test", download=True, size=IMG_SIZE, root=ROOT_DIR)
+# -------------------------
+# Download datasets
+# -------------------------
+datasets = {
+    "DermaMNIST": DermaMNIST,
+    "PathMNIST": PathMNIST,
+    "OCTMNIST": OCTMNIST,
+    "BloodMNIST": BloodMNIST,
+    "TissueMNIST": TissueMNIST
+}
 
-# Download PathMNIST (train/val/test) at 224x224
-path_train = PathMNIST(split="train", download=True, size=IMG_SIZE, root=ROOT_DIR)
-path_val = PathMNIST(split="val", download=True, size=IMG_SIZE, root=ROOT_DIR)
-path_test = PathMNIST(split="test", download=True, size=IMG_SIZE, root=ROOT_DIR)
+loaded_datasets = {}
 
-# Print dataset sizes
-print("DermaMNIST Train:", len(derma_train))
-print("DermaMNIST Val:", len(derma_val))
-print("DermaMNIST Test:", len(derma_test))
-print("PathMNIST Train:", len(path_train))
-print("PathMNIST Val:", len(path_val))
-print("PathMNIST Test:", len(path_test))
+for name, cls in datasets.items():
+    print(f"\nDownloading {name} (size={IMG_SIZE})...")
+    train_set = cls(split="train", download=True, size=IMG_SIZE, root=ROOT_DIR)
+    val_set   = cls(split="val", download=True, size=IMG_SIZE, root=ROOT_DIR)
+    test_set  = cls(split="test", download=True, size=IMG_SIZE, root=ROOT_DIR)
+    loaded_datasets[name] = (train_set, val_set, test_set)
 
-# Verify a sample image from each dataset
-derma_img, derma_label = derma_train[0]
-path_img, path_label = path_train[0]
+    print(f"{name} Train: {len(train_set)}")
+    print(f"{name} Val:   {len(val_set)}")
+    print(f"{name} Test:  {len(test_set)}")
 
-# Convert PIL images to NumPy arrays for shape verification
-derma_img_array = np.array(derma_img)
-path_img_array = np.array(path_img)
+    # Verify one sample
+    img, label = train_set[0]
+    img_array = np.array(img)
+    print(f"{name} sample image shape:", img_array.shape, "Label:", label)
 
-print("DermaMNIST sample image shape:", derma_img_array.shape, "Label:", derma_label)
-print("PathMNIST sample image shape:", path_img_array.shape, "Label:", path_label)
+print("\n✅ All datasets downloaded and verified.")
