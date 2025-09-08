@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
 Progressive PGTO pruning for multiple MedMNIST datasets (fixed surgery + progressive updates + KD).
-
-- Progressive: importance computed on the updated model each stage
-- Surgery fixes: grouped expansion channels preserved; prev_out_idx uses contiguous groups
-- KD: applied after progressive prune+local calibrations, before final global finetune
-- Metrics saved per key checkpoint
+Optimized for memory efficiency using memory-mapped data loading.
 """
 
 import os, time, math, random, tempfile, copy
@@ -16,60 +12,51 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 from torchvision.models.resnet import Bottleneck
-from torchvision import models
+from torchvision import models, transforms as T
 from sklearn.metrics import roc_auc_score
-from torchprofile import profile_macs  # Added for MACs-based FLOPs calculation
-import psutil  # For memory monitoring
+from torchprofile import profile_macs
+import psutil
 
 # -------------------------
 # Config
 # -------------------------
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/experiment_1"
-
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/experiment1"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
+BATCH_SIZE = 32  # Default batch size as fallback
 
 METHODS = ["regional_gradients", "l1", "bn_gamma"]
 TARGET_RATIOS = [0.5, 0.6, 0.7]
 
-# calibration / local fine-tune
 CAL_EPOCHS = 1
 CAL_MAX_BATCHES = 150
 CAL_LR = 3e-4
 
-# KD
 KD_EPOCHS = 1
 KD_LR = 3e-4
 KD_ALPHA = 0.7
 KD_TEMPERATURE = 3.0
-KD_MAX_BATCHES = None  # set to int to limit batches per epoch
+KD_MAX_BATCHES = None
 
-# final finetune
 FINAL_FINETUNE_EPOCHS = 2
 FINAL_LR = 1e-4
 
 LOG_INTERVAL = 20
 WARMUP = 5
 TIMING_BATCHES = 30
-
-# misc
 RG_CAL_MAX_BATCHES = 50
 
-# Dataset-specific batch sizes to manage memory
 DATASET_BATCH_SIZES = {
     "dermamnist": 32,
-    "pathmnist": 16,  # Reduced for pathmnist due to potential memory issues
+    "pathmnist": 16,
     "bloodmnist": 32,
-    "octmnist": 16,   # Reduced for octmnist (potentially large)
-    "tissuemnist": 8, # Reduced for tissuemnist (potentially very large)
+    "octmnist": 16,
+    "tissuemnist": 8,
 }
 
-# -------------------------
-# Multi-dataset config
-# -------------------------
 DATASETS = {
     "pathmnist": {
         "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets/pathmnist_224.npz",
@@ -121,25 +108,45 @@ def log_memory_usage(prefix=""):
 # -------------------------
 # Data helpers
 # -------------------------
-def preprocess(arr: np.ndarray) -> np.ndarray:
-    arr = arr.astype("float32") / 255.0
-    if arr.ndim == 3 or arr.shape[-1] == 1:
-        arr = np.repeat(arr[..., np.newaxis], 3, axis=-1)
-    return np.transpose(arr, (0, 3, 1, 2))  # NHWC -> NCHW
+class NumpyMemmapDataset(Dataset):
+    def __init__(self, imgs_np, labels_np, img_size=224):
+        self.imgs = imgs_np
+        self.labels = labels_np
+        self.img_size = img_size
+        self.base_tfms = T.Compose([
+            T.ToPILImage(),
+            T.Resize((img_size, img_size)),
+            T.ToTensor(),
+        ])
+        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        img = self.imgs[idx]
+        label = int(self.labels[idx])
+        x = self.base_tfms(img)
+        if x.shape[0] == 1:
+            x = x.repeat(3, 1, 1)
+        x = self.normalize(x)
+        return x, label
 
 def make_loaders(npz_path, batch_size):
-    data = np.load(npz_path)
+    data = np.load(npz_path, mmap_mode="r")
     X_train, y_train = data["train_images"], data["train_labels"].flatten()
-    X_val, y_val     = data["val_images"], data["val_labels"].flatten()
-    X_test, y_test   = data["test_images"], data["test_labels"].flatten()
-    X_train = preprocess(X_train); X_val = preprocess(X_val); X_test = preprocess(X_test)
-    train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
-    val_ds   = TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
-    test_ds  = TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long))
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader, test_loader, int(len(np.unique(y_train))), train_ds
+    X_val, y_val = data["val_images"], data["val_labels"].flatten()
+    X_test, y_test = data["test_images"], data["test_labels"].flatten()
+    n_train, n_val, n_test = len(y_train), len(y_val), len(y_test)
+    print(f"Dataset sizes: train={n_train}, val={n_val}, test={n_test}, total={n_train + n_val + n_test}")
+    train_ds = NumpyMemmapDataset(X_train, y_train, img_size=IMG_SIZE)
+    val_ds = NumpyMemmapDataset(X_val, y_val, img_size=IMG_SIZE)
+    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    num_classes = int(len(np.unique(np.concatenate([y_train, y_val, y_test]))))
+    return train_loader, val_loader, test_loader, num_classes, train_ds
 
 # -------------------------
 # Models / builder
@@ -152,15 +159,12 @@ class CustomResNet(nn.Module):
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
         self.stage_planes = stage_planes[:]
         self.layers_cfg = layers[:]
-
         self.layer1 = self._make_layer(block, stage_planes[0], layers[0])
         self.layer2 = self._make_layer(block, stage_planes[1], layers[1], stride=2)
         self.layer3 = self._make_layer(block, stage_planes[2], layers[2], stride=2)
         self.layer4 = self._make_layer(block, stage_planes[3], layers[3], stride=2)
-
         self.avgpool = nn.AdaptiveAvgPool2d((1,1))
         self.fc = nn.Linear(stage_planes[3] * block.expansion, num_classes)
 
@@ -189,7 +193,7 @@ def build_resnet50_for_load(num_classes):
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
-STAGES = ["layer1","layer2","layer3","layer4"]
+STAGES = ["layer1", "layer2", "layer3", "layer4"]
 
 def stage_orig_channels(model, stage_name):
     first_block = next(getattr(model, stage_name).children())
@@ -199,12 +203,11 @@ def stage_orig_channels(model, stage_name):
 # Importance scoring
 # -------------------------
 def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k: int, method: str="l1",
-                                      calib_loader: DataLoader=None, max_batches:int=RG_CAL_MAX_BATCHES):
+                                      calib_loader: DataLoader=None, max_batches: int=RG_CAL_MAX_BATCHES):
     stage = getattr(model, stage_name)
     first_block = next(stage.children())
     orig_planes = first_block.conv1.out_channels
     expansion = 4
-
     if method == "l1":
         block_importances = []
         for block in stage.children():
@@ -212,7 +215,6 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
             per_plane = [np.sum(conv3[p*expansion:(p+1)*expansion,:,:,:]) for p in range(orig_planes)]
             block_importances.append(np.array(per_plane))
         agg = np.mean(np.stack(block_importances, axis=0), axis=0)
-
     elif method == "bn_gamma":
         block_importances = []
         for block in stage.children():
@@ -220,25 +222,21 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
             per_plane = [np.mean(gammas[p*expansion:(p+1)*expansion]) for p in range(orig_planes)]
             block_importances.append(np.array(per_plane))
         agg = np.mean(np.stack(block_importances, axis=0), axis=0)
-
     elif method == "regional_gradients":
         assert calib_loader is not None, "regional_gradients requires a calib_loader"
         device = DEVICE
         act_norms = torch.zeros(orig_planes, device=device)
         grad_norms = torch.zeros(orig_planes, device=device)
         weight_l1 = torch.zeros(orig_planes, device=device)
-
         for block in stage.children():
             w = block.conv3.weight.detach().abs().cpu().numpy()
             for p in range(orig_planes):
                 weight_l1[p] += np.sum(w[p*expansion:(p+1)*expansion,:,:,:])
         weight_l1 = weight_l1.to(device)
-
         saved = {}
         def hook_fn(module, inp, out):
             saved['act'] = out
         handle = stage.register_forward_hook(hook_fn)
-
         model.train()
         batch_count = 0
         for bidx, (imgs, _) in enumerate(calib_loader):
@@ -247,23 +245,19 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
             imgs = imgs.to(device)
             model.zero_grad()
             _ = model(imgs)
-
             if 'act' not in saved:
                 continue
-            act = saved['act']  # shape [B, C_exp, H, W]
-
+            act = saved['act']
             loss = (act ** 2).mean()
             loss.backward(retain_graph=True)
-
             with torch.no_grad():
                 Cexp = act.shape[1]
-                act_flat = act.detach().permute(1,0,2,3).reshape(Cexp, -1)  # [Cexp, B*H*W]
+                act_flat = act.detach().permute(1,0,2,3).reshape(Cexp, -1)
                 for p in range(orig_planes):
                     idx0 = p*expansion
                     idx1 = (p+1)*expansion
                     part = act_flat[idx0:idx1]
                     act_norms[p] += torch.norm(part)
-
             for block in stage.children():
                 g = block.conv3.weight.grad
                 if g is None:
@@ -273,10 +267,8 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
                 for p in range(orig_planes):
                     idx0 = p*expansion; idx1 = (p+1)*expansion
                     grad_norms[p] += g_per_out[idx0:idx1].norm()
-
             batch_count += 1
             saved.pop('act', None)
-
         handle.remove()
         if batch_count == 0:
             agg = weight_l1.cpu().numpy()
@@ -284,10 +276,8 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
             act_norms /= batch_count
             grad_norms /= batch_count
             agg = (act_norms * grad_norms * weight_l1).cpu().numpy()
-
     else:
         raise ValueError(f"Unknown method {method}")
-
     keep = np.arange(len(agg)) if keep_k >= len(agg) else np.argsort(agg)[-keep_k:]
     return np.sort(keep)
 
@@ -301,19 +291,15 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
     new_model = CustomResNet(block=Bottleneck, layers=[3,4,6,3], stage_planes=stage_planes, num_classes=num_classes).to(DEVICE)
     new_model.eval()
     base_model = base_model.to(DEVICE)
-
     prev_out_idx = torch.arange(base_model.conv1.out_channels, dtype=torch.long, device=DEVICE)
-
-    for stage_name in ["layer1","layer2","layer3","layer4"]:
+    for stage_name in ["layer1", "layer2", "layer3", "layer4"]:
         old_stage = getattr(base_model, stage_name)
         new_stage = getattr(new_model, stage_name)
         kept_planes = torch.tensor(keep_indices[stage_name], dtype=torch.long, device=DEVICE)
-
         for block_idx, (old_block, new_block) in enumerate(zip(old_stage, new_stage)):
             in_idx = prev_out_idx
             out_planes = kept_planes
             expanded_rows = torch.cat([ (k * expansion + torch.arange(expansion, device=DEVICE)) for k in out_planes ])
-
             old_w = old_block.conv1.weight.data
             new_block.conv1.weight.data.copy_(old_w[out_planes][:, in_idx, :, :])
             if getattr(old_block.conv1, 'bias', None) is not None:
@@ -322,7 +308,6 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
             new_block.bn1.bias.data.copy_(old_block.bn1.bias.data[out_planes])
             new_block.bn1.running_mean.data.copy_(old_block.bn1.running_mean.data[out_planes])
             new_block.bn1.running_var.data.copy_(old_block.bn1.running_var.data[out_planes])
-
             new_block.conv2.weight.data.copy_(old_block.conv2.weight.data[out_planes][:, out_planes, :, :])
             if getattr(old_block.conv2, 'bias', None) is not None:
                 new_block.conv2.bias.data.copy_(old_block.conv2.bias.data[out_planes])
@@ -330,7 +315,6 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
             new_block.bn2.bias.data.copy_(old_block.bn2.bias.data[out_planes])
             new_block.bn2.running_mean.data.copy_(old_block.bn2.running_mean.data[out_planes])
             new_block.bn2.running_var.data.copy_(old_block.bn2.running_var.data[out_planes])
-
             new_block.conv3.weight.data.copy_(old_block.conv3.weight.data[expanded_rows][:, out_planes, :, :])
             if getattr(old_block.conv3, 'bias', None) is not None:
                 new_block.conv3.bias.data.copy_(old_block.conv3.bias.data[expanded_rows])
@@ -338,7 +322,6 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
             new_block.bn3.bias.data.copy_(old_block.bn3.bias.data[expanded_rows])
             new_block.bn3.running_mean.data.copy_(old_block.bn3.running_mean.data[expanded_rows])
             new_block.bn3.running_var.data.copy_(old_block.bn3.running_var.data[expanded_rows])
-
             if old_block.downsample is not None:
                 ds_conv = old_block.downsample[0]
                 ds_bn = old_block.downsample[1]
@@ -347,14 +330,11 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
                 new_block.downsample[1].bias.data.copy_(ds_bn.bias.data[expanded_rows])
                 new_block.downsample[1].running_mean.data.copy_(ds_bn.running_mean.data[expanded_rows])
                 new_block.downsample[1].running_var.data.copy_(ds_bn.running_var.data[expanded_rows])
-
             prev_out_idx = expanded_rows
-
     last_kept = torch.tensor(keep_indices['layer4'], dtype=torch.long, device=DEVICE)
     fc_in_idx = torch.cat([torch.arange(p * expansion, (p + 1) * expansion, dtype=torch.long, device=DEVICE) for p in last_kept])
     new_model.fc.weight.data.copy_(base_model.fc.weight.data[:, fc_in_idx])
     new_model.fc.bias.data.copy_(base_model.fc.bias.data)
-
     return new_model
 
 # -------------------------
@@ -500,11 +480,11 @@ def calibrate_stage(model, stage_name, train_loader, epochs=CAL_EPOCHS, max_batc
     return model
 
 # -------------------------
-# KD (fixed max_batches usage)
+# KD
 # -------------------------
 def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLoader,
-                    epochs:int=KD_EPOCHS, lr:float=KD_LR, alpha:float=KD_ALPHA, T:float=KD_TEMPERATURE,
-                    max_batches: int = KD_MAX_BATCHES):
+                    epochs: int=KD_EPOCHS, lr: float=KD_LR, alpha: float=KD_ALPHA, T: float=KD_TEMPERATURE,
+                    max_batches: int=KD_MAX_BATCHES):
     teacher.eval()
     student.train()
     opt = optim.Adam(student.parameters(), lr=lr)
@@ -539,11 +519,11 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
 # -------------------------
 # Global finetune
 # -------------------------
-def global_finetune(model, train_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR):
+def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR):
     model.train()
     opt = optim.Adam(model.parameters(), lr=lr)
     for ep in range(epochs):
-        running_loss = 0.0; total=0; correct=0
+        running_loss = 0.0; total = 0; correct = 0
         for bidx, (imgs, labels) in enumerate(train_loader, 1):
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
             opt.zero_grad()
@@ -571,19 +551,16 @@ for dataset_name, cfg in DATASETS.items():
         SAVE_DIR = f"{SAVE_DIR_BASE}/{dataset_name}"
         os.makedirs(SAVE_DIR, exist_ok=True)
 
-        # Skip if CSV already exists (to avoid re-running completed datasets)
         csv_path = os.path.join(SAVE_DIR, f"{dataset_name}_pgto_pruning_metrics_progressive_fixed.csv")
         if os.path.exists(csv_path):
             print(f"Skipping {dataset_name}: CSV already exists at {csv_path}")
             continue
 
-        # Loaders with dataset-specific batch size
-        batch_size = DATASET_BATCH_SIZES.get(dataset_name, 32)
+        batch_size = DATASET_BATCH_SIZES.get(dataset_name, BATCH_SIZE)
         train_loader, val_loader, test_loader, NUM_CLASSES, train_ds = make_loaders(cfg["path"], batch_size)
         print(f"Data loaded for {dataset_name}. NUM_CLASSES={NUM_CLASSES}, device={DEVICE}, batch_size={batch_size}")
         log_memory_usage(f"After loading data for {dataset_name}: ")
 
-        # Baseline
         def load_baseline_ckpt(path):
             model = build_resnet50_for_load(NUM_CLASSES)
             if os.path.exists(path):
@@ -602,7 +579,7 @@ for dataset_name, cfg in DATASETS.items():
         torch.save(baseline.state_dict(), base_ckpt)
         row = collect_metrics_row("baseline", "baseline", 0.0, baseline, test_loader, base_ckpt)
         rows.append(row)
-        print("Baseline done:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
+        print("Baseline done:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
         log_memory_usage(f"After baseline evaluation for {dataset_name}: ")
 
         for method in METHODS:
@@ -615,76 +592,60 @@ for dataset_name, cfg in DATASETS.items():
                 for s in STAGES:
                     orig = stage_orig_channels(current_model, s)
                     keep_k = max(1, int(math.floor(orig * (1.0 - target_ratio))))
-
                     keeps = compute_stage_importance_and_keeps(current_model, s, keep_k, method=method, calib_loader=train_loader)
                     keep_indices[s] = keeps
                     print(f"  Stage {s}: keep {len(keeps)}/{orig} ({100*len(keeps)/orig:.1f}% kept)")
-
                     pruned_model = build_pruned_resnet_and_copy_weights_fixed(current_model, keep_indices={**{k: keep_indices[k] if k==s else np.arange(stage_orig_channels(current_model, k)) for k in STAGES}}, num_classes=NUM_CLASSES)
                     pruned_model = pruned_model.to(DEVICE)
                     pruned_model.eval()
                     with torch.no_grad(): _ = pruned_model(torch.randn(1,3,IMG_SIZE,IMG_SIZE).to(DEVICE))
-
                     stage_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_{s}_postprune.pth")
                     torch.save(pruned_model.state_dict(), stage_pruned_ckpt)
                     row = collect_metrics_row(method, f"{s}_postprune", target_ratio, pruned_model, test_loader, stage_pruned_ckpt)
                     rows.append(row)
-                    print("    Post-prune metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
-
+                    print("    Post-prune metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
                     print(f"    Calibrating {s} (local)...")
                     pruned_model = calibrate_stage(pruned_model, s, train_loader, epochs=CAL_EPOCHS, max_batches=CAL_MAX_BATCHES, lr=CAL_LR, allow_fc_bn1=False)
-
                     stage_calib_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_{s}_calibrated.pth")
                     torch.save(pruned_model.state_dict(), stage_calib_ckpt)
                     row = collect_metrics_row(method, f"{s}_postcalib", target_ratio, pruned_model, test_loader, stage_calib_ckpt)
                     rows.append(row)
-                    print("    Post-calib metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
-
+                    print("    Post-calib metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
                     current_model = pruned_model
                     log_memory_usage(f"After stage {s} for {method}, ratio={target_ratio}: ")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-
                 all_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_allpruned_preKD.pth")
                 torch.save(current_model.state_dict(), all_pruned_ckpt)
                 row = collect_metrics_row(method, "all_pruned_preKD", target_ratio, current_model, test_loader, all_pruned_ckpt)
                 rows.append(row)
-                print("  All-pruned (pre-KD) metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
-
+                print("  All-pruned (pre-KD) metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
                 print("  Knowledge distillation (student <- teacher)...")
                 current_model = distill_student(current_model, baseline, train_loader, epochs=KD_EPOCHS, lr=KD_LR, alpha=KD_ALPHA, T=KD_TEMPERATURE, max_batches=KD_MAX_BATCHES)
                 kd_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_afterKD.pth")
                 torch.save(current_model.state_dict(), kd_ckpt)
                 row = collect_metrics_row(method, "after_kd", target_ratio, current_model, test_loader, kd_ckpt)
                 rows.append(row)
-                print("  KD metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
-
+                print("  KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
                 print("  Final global finetune...")
-                current_model = global_finetune(current_model, train_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
+                current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
                 final_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_final.pth")
                 torch.save(current_model.state_dict(), final_ckpt)
                 row = collect_metrics_row(method, "after_global_finetune", target_ratio, current_model, test_loader, final_ckpt)
                 rows.append(row)
-                print("  Final metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
-
+                print("  Final metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-
-        # Save dataset-specific CSV
         df = pd.DataFrame(rows)
         df.to_csv(csv_path, index=False)
         print(f"All done for {dataset_name}. CSV: {csv_path}")
-
-        # Clean up memory
         del baseline, current_model, pruned_model, train_loader, val_loader, test_loader, train_ds
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         log_memory_usage(f"After completing {dataset_name}: ")
-
     except Exception as e:
         print(f"Error processing {dataset_name}: {str(e)}")
         import traceback
         traceback.print_exc()
         print(f"Continuing to next dataset...")
-
 print("All datasets processed.")
