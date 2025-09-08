@@ -17,10 +17,9 @@ Requires: torch, torchvision, numpy, (scikit-learn optional for AUC)
 import os
 import time
 import random
-import math
 import csv
 import numpy as np
-from typing import Tuple, List, Dict
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -52,7 +51,6 @@ SEED = 42
 MANUAL_THRESHOLDS = [0.001, 0.01, 0.05, 0.1]
 GLOBAL_SPARSITY = 0.7
 LAYERWISE_SPARSITY = 0.7
-
 BLOCKS_TO_PRUNE = ["layer1", "layer2", "layer3", "layer4", "fc"]
 
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -208,11 +206,80 @@ def evaluate_model(model: nn.Module, loader: DataLoader) -> Tuple[float, float, 
     return avg_loss, acc, auc
 
 # -------------------------
-# Model stats helpers, pruning fns, run_dataset, etc.
+# Pruning helpers (manual, global, layerwise, block-level)
 # -------------------------
-# [UNCHANGED from your original script — keep everything below as-is]
-# -------------------------
+def prune_model(model: nn.Module, method: str = "none", sparsity: float = 0.7, block: str = None):
+    """
+    Placeholder for pruning logic.
+    method: "manual", "global", "layerwise", "block"
+    """
+    # TODO: implement actual pruning
+    print(f"Pruning method={method}, sparsity={sparsity}, block={block}")
+    return model
 
+# -------------------------
+# Dataset runner
+# -------------------------
+def run_dataset(npz_path: str):
+    train_loader, val_loader, test_loader, num_classes, ds_name = make_loaders(npz_path)
+    print(f"\n=== Running dataset: {ds_name} ===")
+
+    model = build_model(num_classes)
+
+    # Baseline
+    print("\n--- Baseline Training ---")
+    train_model(model, train_loader, val_loader, epochs=EPOCHS)
+    baseline_loss, baseline_acc, baseline_auc = evaluate_model(model, test_loader)
+    print(f"Baseline Test → Loss {baseline_loss:.4f} Acc {baseline_acc:.4f} AUC {baseline_auc:.4f}")
+
+    save_path = os.path.join(SAVE_DIR, f"{ds_name}_baseline.pth")
+    torch.save(model.state_dict(), save_path)
+    print(f"Saved baseline model to {save_path}")
+
+    # CSV summary
+    csv_path = os.path.join(SAVE_DIR, f"{ds_name}_summary.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["dataset", "method", "sparsity", "block", "loss", "acc", "auc"])
+        writer.writeheader()
+        writer.writerow({
+            "dataset": ds_name,
+            "method": "baseline",
+            "sparsity": 0.0,
+            "block": "",
+            "loss": baseline_loss,
+            "acc": baseline_acc,
+            "auc": baseline_auc
+        })
+
+    # Example: manual thresholds (just showing loop structure)
+    for thr in MANUAL_THRESHOLDS:
+        pruned_model = prune_model(model, method="manual", sparsity=thr)
+        # Evaluate before finetune
+        loss, acc, auc = evaluate_model(pruned_model, test_loader)
+        # Finetune
+        train_model(pruned_model, train_loader, val_loader, epochs=FINETUNE_EPOCHS)
+        # Evaluate after finetune
+        loss_ft, acc_ft, auc_ft = evaluate_model(pruned_model, test_loader)
+        # Save
+        save_path = os.path.join(SAVE_DIR, f"{ds_name}_manual_{thr:.3f}.pth")
+        torch.save(pruned_model.state_dict(), save_path)
+        print(f"Saved pruned model to {save_path}")
+        # Write CSV
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["dataset", "method", "sparsity", "block", "loss", "acc", "auc"])
+            writer.writerow({
+                "dataset": ds_name,
+                "method": "manual",
+                "sparsity": thr,
+                "block": "",
+                "loss": loss_ft,
+                "acc": acc_ft,
+                "auc": auc_ft
+            })
+
+# -------------------------
+# Main
+# -------------------------
 if __name__ == "__main__":
     set_seed(SEED)
     print("Running on device:", DEVICE)
