@@ -38,7 +38,7 @@ except Exception:
 # Config
 # -------------------------
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
-SAVE_DIR    = "/home/arihangupta/Pruning/dinov2/Pruning/saved_models"
+SAVE_DIR    = "/home/arihangupta/Pruning/dinov2/Pruning/exp1_saved_models"
 
 EPOCHS = 10
 FINETUNE_EPOCHS = 2
