@@ -1,20 +1,22 @@
 import numpy as np
 import os
 
-ROOT = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
+ROOT = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
 
-datasets = ["bloodmnist_224", "dermamnist_224", "octmnist_224", "pathmnist_224", "tissuemnist_224"]
+datasets = [
+    "bloodmnist_224.npz",
+    "dermamnist_224.npz",
+    "octmnist_224.npz",
+    "pathmnist_224.npz",
+    "tissuemnist_224.npz"
+]
 splits = ["train", "val", "test"]
 
-for ds in datasets:
-    ds_path = os.path.join(ROOT, ds)
-    print(f"\nDataset: {ds}")
-    for split in splits:
-        images_file = os.path.join(ds_path, f"{split}_images.npy")
-        labels_file = os.path.join(ds_path, f"{split}_labels.npy")
-
-        # Memory-map to avoid loading entire array
-        images = np.load(images_file, mmap_mode='r')
-        labels = np.load(labels_file, mmap_mode='r')
-
-        print(f"  {split}: images={images.shape[0]}, labels={labels.shape[0]}")
+for ds_file in datasets:
+    ds_path = os.path.join(ROOT, ds_file)
+    print(f"\nDataset: {ds_file}")
+    with np.load(ds_path, mmap_mode='r') as data:
+        for split in splits:
+            images = data[f"{split}_images"]
+            labels = data[f"{split}_labels"]
+            print(f"  {split}: images={images.shape[0]}, labels={labels.shape[0]}")
