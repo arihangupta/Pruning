@@ -208,11 +208,6 @@ def run_dataset(npz_path: str):
     train_loader, val_loader, test_loader, num_classes, ds_name = make_loaders(npz_path)
     print(f"\n=== Running dataset: {ds_name} ===")
 
-    # Only proceed if OCT, Blood, Tissue
-    if not any(x in ds_name.lower() for x in ["octmnist", "bloodmnist", "tissuemnist"]):
-        print(f"Skipping {ds_name} (not OCT/Blood/Tissue).")
-        return
-
     model = build_model(num_classes)
 
     # Baseline
