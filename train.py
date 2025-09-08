@@ -24,8 +24,8 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from torchvision import models
+from torch.utils.data import DataLoader, Dataset
+from torchvision import models, transforms as T
 
 try:
     from sklearn.metrics import roc_auc_score
@@ -67,76 +67,66 @@ def set_seed(seed: int = SEED):
     torch.backends.cudnn.benchmark = False
 
 # -------------------------
-# Data utilities
+# Dataset utilities
 # -------------------------
-def preprocess(arr: np.ndarray) -> np.ndarray:
-    arr = arr.astype("float32") / 255.0
-    if arr.ndim == 3 or arr.shape[-1] == 1:
-        arr = np.repeat(arr[..., np.newaxis], 3, axis=-1)
-    arr = np.transpose(arr, (0, 3, 1, 2))  # NHWC -> NCHW
-    return arr
+class NumpyMemmapDataset(Dataset):
+    """
+    Wraps a numpy array (H,W[,C]) and a label array.
+    Performs on-the-fly normalization and channel handling.
+    Assumes images are stored as uint8 in [0,255].
+    """
+    def __init__(self, imgs_np, labels_np, img_size=224):
+        self.imgs = imgs_np
+        self.labels = labels_np
+        self.img_size = img_size
+
+        self.transform = T.Compose([
+            T.ToPILImage(),
+            T.Resize((img_size, img_size)),
+            T.ToTensor(),  # float32 [0,1], shape CxHxW
+            # Optional: normalize to ImageNet stats since using pretrained ResNet
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225]),
+        ])
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        img = self.imgs[idx]          # HxW, HxWx1, or HxWx3
+        label = int(self.labels[idx])
+        x = self.transform(img)
+        if x.shape[0] == 1:  # grayscale → 3 channels
+            x = x.repeat(3, 1, 1)
+        return x, label
 
 def make_loaders(npz_path: str) -> Tuple[DataLoader, DataLoader, DataLoader, int, str]:
     print(f"\nLoading {npz_path} ...")
     data = np.load(npz_path, mmap_mode="r")
 
-    n_train = data["train_images"].shape[0]
-    n_val   = data["val_images"].shape[0]
-    n_test  = data["test_images"].shape[0]
-    total   = n_train + n_val + n_test
+    X_train = data["train_images"]
+    y_train = data["train_labels"].flatten()
+    X_val   = data["val_images"]
+    y_val   = data["val_labels"].flatten()
+    X_test  = data["test_images"]
+    y_test  = data["test_labels"].flatten()
+
+    n_train, n_val, n_test = len(y_train), len(y_val), len(y_test)
+    total = n_train + n_val + n_test
     print(f"Dataset sizes: train={n_train}, val={n_val}, test={n_test}, total={total}")
 
-    if total > 20000:
-        print("Downsampling to 20,000 images (14k train, 2k val, 4k test)")
-        idx = np.arange(total)
-        np.random.shuffle(idx)
-        idx = idx[:20000]
+    train_ds = NumpyMemmapDataset(X_train, y_train, img_size=IMG_SIZE)
+    val_ds   = NumpyMemmapDataset(X_val, y_val, img_size=IMG_SIZE)
+    test_ds  = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE)
 
-        train_idx = idx[:14000]
-        val_idx   = idx[14000:16000]
-        test_idx  = idx[16000:]
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=2, pin_memory=True)
+    val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=2, pin_memory=True)
+    test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=2, pin_memory=True)
 
-        def gather(indices):
-            out_imgs, out_lbls = [], []
-            for i in indices:
-                if i < n_train:
-                    out_imgs.append(data["train_images"][i])
-                    out_lbls.append(data["train_labels"][i])
-                elif i < n_train + n_val:
-                    j = i - n_train
-                    out_imgs.append(data["val_images"][j])
-                    out_lbls.append(data["val_labels"][j])
-                else:
-                    j = i - n_train - n_val
-                    out_imgs.append(data["test_images"][j])
-                    out_lbls.append(data["test_labels"][j])
-            return np.stack(out_imgs), np.array(out_lbls)
-
-        X_train, y_train = gather(train_idx)
-        X_val, y_val     = gather(val_idx)
-        X_test, y_test   = gather(test_idx)
-
-    else:
-        X_train, y_train = data["train_images"], data["train_labels"].flatten()
-        X_val, y_val     = data["val_images"], data["val_labels"].flatten()
-        X_test, y_test   = data["test_images"], data["test_labels"].flatten()
-
-    X_train = preprocess(X_train)
-    X_val   = preprocess(X_val)
-    X_test  = preprocess(X_test)
-
-    train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
-                             torch.tensor(y_train, dtype=torch.long))
-    val_ds   = TensorDataset(torch.tensor(X_val, dtype=torch.float32),
-                             torch.tensor(y_val, dtype=torch.long))
-    test_ds  = TensorDataset(torch.tensor(X_test, dtype=torch.float32),
-                             torch.tensor(y_test, dtype=torch.long))
-
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
-
-    num_classes = int(len(np.unique(y_train)))
+    num_classes = int(len(np.unique(np.concatenate([y_train, y_val, y_test]))))
     ds_name = os.path.splitext(os.path.basename(npz_path))[0]
     return train_loader, val_loader, test_loader, num_classes, ds_name
 
@@ -251,20 +241,15 @@ def run_dataset(npz_path: str):
             "auc": baseline_auc
         })
 
-    # Example: manual thresholds (just showing loop structure)
+    # Example: manual thresholds
     for thr in MANUAL_THRESHOLDS:
         pruned_model = prune_model(model, method="manual", sparsity=thr)
-        # Evaluate before finetune
         loss, acc, auc = evaluate_model(pruned_model, test_loader)
-        # Finetune
         train_model(pruned_model, train_loader, val_loader, epochs=FINETUNE_EPOCHS)
-        # Evaluate after finetune
         loss_ft, acc_ft, auc_ft = evaluate_model(pruned_model, test_loader)
-        # Save
         save_path = os.path.join(SAVE_DIR, f"{ds_name}_manual_{thr:.3f}.pth")
         torch.save(pruned_model.state_dict(), save_path)
         print(f"Saved pruned model to {save_path}")
-        # Write CSV
         with open(csv_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["dataset", "method", "sparsity", "block", "loss", "acc", "auc"])
             writer.writerow({
