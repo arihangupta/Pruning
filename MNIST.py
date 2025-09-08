@@ -1,5 +1,5 @@
 import medmnist
-from medmnist import DermaMNIST, PathMNIST, OCTMNIST, BloodMNIST, TissueMNIST
+from medmnist import DermaMNIST, BloodMNIST
 import numpy as np
 import os
 import shutil
@@ -22,10 +22,7 @@ RNG_SEED = 42
 # -------------------------
 datasets = {
     "DermaMNIST": DermaMNIST,
-    "PathMNIST": PathMNIST,
-    "OCTMNIST": OCTMNIST,
-    "BloodMNIST": BloodMNIST,
-    "TissueMNIST": TissueMNIST
+    "BloodMNIST": BloodMNIST
 }
 
 # -------------------------
