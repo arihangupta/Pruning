@@ -21,15 +21,15 @@ from torchvision.models.resnet import Bottleneck
 from torchvision import models
 from sklearn.metrics import roc_auc_score
 from torchprofile import profile_macs  # Added for MACs-based FLOPs calculation
+import psutil  # For memory monitoring
 
 # -------------------------
 # Config
 # -------------------------
-SAVE_DIR_BASE   = "/home/arihangupta/Pruning/dinov2/Pruning/saved_models_pgto_fixed"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/experiment_1"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
-BATCH_SIZE = 32
 IMG_SIZE = 224
 
 METHODS = ["regional_gradients", "l1", "bn_gamma"]
@@ -58,17 +58,26 @@ TIMING_BATCHES = 30
 # misc
 RG_CAL_MAX_BATCHES = 50
 
+# Dataset-specific batch sizes to manage memory
+DATASET_BATCH_SIZES = {
+    "dermamnist": 32,
+    "pathmnist": 16,  # Reduced for pathmnist due to potential memory issues
+    "bloodmnist": 32,
+    "octmnist": 16,   # Reduced for octmnist (potentially large)
+    "tissuemnist": 8, # Reduced for tissuemnist (potentially very large)
+}
+
 # -------------------------
 # Multi-dataset config
 # -------------------------
 DATASETS = {
-    "dermamnist": {
-        "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets/dermamnist_224.npz",
-        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/exp1_saved_models/dermamnist_224_baseline.pth"
-    },
     "pathmnist": {
         "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets/pathmnist_224.npz",
         "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/exp1_saved_models/pathmnist_224_baseline.pth"
+    },
+    "dermamnist": {
+        "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets/dermamnist_224.npz",
+        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/exp1_saved_models/dermamnist_224_baseline.pth"
     },
     "bloodmnist": {
         "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets/bloodmnist_224.npz",
@@ -101,6 +110,15 @@ def set_seed(s=SEED, deterministic=True):
 set_seed(SEED, deterministic=True)
 
 # -------------------------
+# Memory monitoring
+# -------------------------
+def log_memory_usage(prefix=""):
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    gpu_mem = torch.cuda.memory_allocated() / (1024**2) if torch.cuda.is_available() else 0
+    print(f"{prefix}Memory Usage: RSS={mem_info.rss/(1024**2):.2f}MB, GPU={gpu_mem:.2f}MB")
+
+# -------------------------
 # Data helpers
 # -------------------------
 def preprocess(arr: np.ndarray) -> np.ndarray:
@@ -109,7 +127,7 @@ def preprocess(arr: np.ndarray) -> np.ndarray:
         arr = np.repeat(arr[..., np.newaxis], 3, axis=-1)
     return np.transpose(arr, (0, 3, 1, 2))  # NHWC -> NCHW
 
-def make_loaders(npz_path):
+def make_loaders(npz_path, batch_size):
     data = np.load(npz_path)
     X_train, y_train = data["train_images"], data["train_labels"].flatten()
     X_val, y_val     = data["val_images"], data["val_labels"].flatten()
@@ -118,9 +136,9 @@ def make_loaders(npz_path):
     train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
     val_ds   = TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
     test_ds  = TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long))
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
     return train_loader, val_loader, test_loader, int(len(np.unique(y_train))), train_ds
 
 # -------------------------
@@ -178,14 +196,10 @@ def stage_orig_channels(model, stage_name):
     return first_block.conv1.out_channels
 
 # -------------------------
-# Importance scoring (reuse your implementation)
+# Importance scoring
 # -------------------------
 def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k: int, method: str="l1",
                                       calib_loader: DataLoader=None, max_batches:int=RG_CAL_MAX_BATCHES):
-    """
-    same algorithm as original: returns sorted indices to KEEP for the stage (length keep_k).
-    For regional_gradients, requires calib_loader.
-    """
     stage = getattr(model, stage_name)
     first_block = next(stage.children())
     orig_planes = first_block.conv1.out_channels
@@ -214,14 +228,12 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
         grad_norms = torch.zeros(orig_planes, device=device)
         weight_l1 = torch.zeros(orig_planes, device=device)
 
-        # weight L1 per plane (sum over blocks)
         for block in stage.children():
             w = block.conv3.weight.detach().abs().cpu().numpy()
             for p in range(orig_planes):
                 weight_l1[p] += np.sum(w[p*expansion:(p+1)*expansion,:,:,:])
         weight_l1 = weight_l1.to(device)
 
-        # register forward hook to capture stage output
         saved = {}
         def hook_fn(module, inp, out):
             saved['act'] = out
@@ -240,11 +252,9 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
                 continue
             act = saved['act']  # shape [B, C_exp, H, W]
 
-            # regional loss = L2 norm (mean) of stage activations
             loss = (act ** 2).mean()
             loss.backward(retain_graph=True)
 
-            # activation norms per plane: group expanded channels
             with torch.no_grad():
                 Cexp = act.shape[1]
                 act_flat = act.detach().permute(1,0,2,3).reshape(Cexp, -1)  # [Cexp, B*H*W]
@@ -254,14 +264,12 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
                     part = act_flat[idx0:idx1]
                     act_norms[p] += torch.norm(part)
 
-            # gradient norms: gather conv3.weight.grad from each block and group
             for block in stage.children():
                 g = block.conv3.weight.grad
                 if g is None:
                     continue
                 g_abs = g.detach().abs()
-                # g_abs shape [Cexp, Cin, k, k]
-                g_per_out = g_abs.view(g_abs.shape[0], -1).norm(dim=1)  # per expanded-out-channel norm
+                g_per_out = g_abs.view(g_abs.shape[0], -1).norm(dim=1)
                 for p in range(orig_planes):
                     idx0 = p*expansion; idx1 = (p+1)*expansion
                     grad_norms[p] += g_per_out[idx0:idx1].norm()
@@ -287,38 +295,25 @@ def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k
 # Surgery: fixed copying
 # -------------------------
 def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indices: Dict[str, np.ndarray], num_classes: int):
-    """
-    Build a pruned CustomResNet with stage widths according to keep_indices and copy weights
-    from base_model correctly, preserving grouped expansion channels for Bottleneck blocks.
-
-    keep_indices: dict with keys 'layer1'..'layer4' -> array/list of kept plane indices (in original numbering)
-    """
     expansion = 4
-    # new stage planes
     stage_planes = [len(keep_indices['layer1']), len(keep_indices['layer2']),
                     len(keep_indices['layer3']), len(keep_indices['layer4'])]
-    # build new model architecture
     new_model = CustomResNet(block=Bottleneck, layers=[3,4,6,3], stage_planes=stage_planes, num_classes=num_classes).to(DEVICE)
     new_model.eval()
     base_model = base_model.to(DEVICE)
 
-    # prev_out_idx: indices of channels from previous stage's output (expanded channels)
-    prev_out_idx = torch.arange(base_model.conv1.out_channels, dtype=torch.long, device=DEVICE)  # initial input channels (conv1 out)
+    prev_out_idx = torch.arange(base_model.conv1.out_channels, dtype=torch.long, device=DEVICE)
 
-    # iterate stages and blocks
     for stage_name in ["layer1","layer2","layer3","layer4"]:
         old_stage = getattr(base_model, stage_name)
         new_stage = getattr(new_model, stage_name)
         kept_planes = torch.tensor(keep_indices[stage_name], dtype=torch.long, device=DEVICE)
 
         for block_idx, (old_block, new_block) in enumerate(zip(old_stage, new_stage)):
-            in_idx = prev_out_idx  # indices of expanded channels from previous layer's output
-            out_planes = kept_planes  # indices of kept planes in original numbering for this stage
-
-            # compute old expanded out indices for conv3, bn3, downsample
+            in_idx = prev_out_idx
+            out_planes = kept_planes
             expanded_rows = torch.cat([ (k * expansion + torch.arange(expansion, device=DEVICE)) for k in out_planes ])
 
-            # ----- conv1
             old_w = old_block.conv1.weight.data
             new_block.conv1.weight.data.copy_(old_w[out_planes][:, in_idx, :, :])
             if getattr(old_block.conv1, 'bias', None) is not None:
@@ -328,7 +323,6 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
             new_block.bn1.running_mean.data.copy_(old_block.bn1.running_mean.data[out_planes])
             new_block.bn1.running_var.data.copy_(old_block.bn1.running_var.data[out_planes])
 
-            # ----- conv2
             new_block.conv2.weight.data.copy_(old_block.conv2.weight.data[out_planes][:, out_planes, :, :])
             if getattr(old_block.conv2, 'bias', None) is not None:
                 new_block.conv2.bias.data.copy_(old_block.conv2.bias.data[out_planes])
@@ -337,7 +331,6 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
             new_block.bn2.running_mean.data.copy_(old_block.bn2.running_mean.data[out_planes])
             new_block.bn2.running_var.data.copy_(old_block.bn2.running_var.data[out_planes])
 
-            # ----- conv3: expanded out channels
             new_block.conv3.weight.data.copy_(old_block.conv3.weight.data[expanded_rows][:, out_planes, :, :])
             if getattr(old_block.conv3, 'bias', None) is not None:
                 new_block.conv3.bias.data.copy_(old_block.conv3.bias.data[expanded_rows])
@@ -346,7 +339,6 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
             new_block.bn3.running_mean.data.copy_(old_block.bn3.running_mean.data[expanded_rows])
             new_block.bn3.running_var.data.copy_(old_block.bn3.running_var.data[expanded_rows])
 
-            # ----- downsample (if present)
             if old_block.downsample is not None:
                 ds_conv = old_block.downsample[0]
                 ds_bn = old_block.downsample[1]
@@ -358,7 +350,6 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
 
             prev_out_idx = expanded_rows
 
-    # Copy final fc weights
     last_kept = torch.tensor(keep_indices['layer4'], dtype=torch.long, device=DEVICE)
     fc_in_idx = torch.cat([torch.arange(p * expansion, (p + 1) * expansion, dtype=torch.long, device=DEVICE) for p in last_kept])
     new_model.fc.weight.data.copy_(base_model.fc.weight.data[:, fc_in_idx])
@@ -415,7 +406,6 @@ def compute_flops(model):
     try:
         inputs = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(DEVICE)
         macs = profile_macs(model, inputs)
-        # Convert MACs to FLOPs (multiply by 2 for multiply-accumulate)
         flops = macs * 2
         return float(flops)
     except Exception as e:
@@ -468,7 +458,7 @@ def collect_metrics_row(tag_variant, tag_stage, ratio, model, test_loader, path_
         "Acc": acc, "AUC": auc, "Loss": loss,
         "Params": params, "Zeros": zeros, "TotalParams": total, "PctZeros": (zeros/total)*100 if total>0 else 0,
         "ModelSizeMB": size_mb, "FLOPs_per_image": flops, "FLOPs_M_per_image": flops_m,
-        "InferenceTime_per_batch32_s": avg_time, "PeakRAM_MB": peak_ram,
+        "InferenceTime_per_batch_s": avg_time, "PeakRAM_MB": peak_ram,
         "PowerProxy_MFLOPs": power_m, "ModelPath": path_hint
     }
 
@@ -482,10 +472,8 @@ def unfreeze_stage(model, stage_name, allow_fc_bn1=False):
     for name, p in model.named_parameters():
         if name.startswith(stage_name):
             p.requires_grad = True
-    if allow_fc_bn1:
-        for name, p in model.named_parameters():
-            if name.startswith("fc.") or name.startswith("bn1."):
-                p.requires_grad = True
+        if allow_fc_bn1 and (name.startswith("fc.") or name.startswith("bn1.")):
+            p.requires_grad = True
 
 def calibrate_stage(model, stage_name, train_loader, epochs=CAL_EPOCHS, max_batches=CAL_MAX_BATCHES, lr=CAL_LR, allow_fc_bn1=False):
     freeze_all(model)
@@ -530,21 +518,16 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
             imgs = imgs.to(device); labels = labels.to(device)
             with torch.no_grad():
                 t_logits = teacher(imgs)
-
             s_logits = student(imgs)
             loss_ce = criterion(s_logits, labels)
-
             s_log_soft = F.log_softmax(s_logits / T, dim=1)
             with torch.no_grad():
                 t_soft = F.softmax(t_logits / T, dim=1)
             loss_kd = kl_loss(s_log_soft, t_soft) * (T * T)
-
             loss = alpha * loss_ce + (1.0 - alpha) * loss_kd
-
             opt.zero_grad()
             loss.backward()
             opt.step()
-
             running_loss += float(loss.item()) * imgs.size(0)
             _, preds = s_logits.max(1)
             total += labels.size(0); correct = int(preds.eq(labels).sum().item())
@@ -578,110 +561,130 @@ def global_finetune(model, train_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_
     return model
 
 # -------------------------
-# Run pipeline per dataset
+# Main pipeline
 # -------------------------
 for dataset_name, cfg in DATASETS.items():
-    print(f"\n\n===================== DATASET: {dataset_name.upper()} =====================")
+    try:
+        print(f"\n\n===================== DATASET: {dataset_name.upper()} =====================")
+        log_memory_usage(f"Before loading {dataset_name}: ")
 
-    SAVE_DIR = f"{SAVE_DIR_BASE}/{dataset_name}"
-    os.makedirs(SAVE_DIR, exist_ok=True)
+        SAVE_DIR = f"{SAVE_DIR_BASE}/{dataset_name}"
+        os.makedirs(SAVE_DIR, exist_ok=True)
 
-    # loaders
-    train_loader, val_loader, test_loader, NUM_CLASSES, train_ds = make_loaders(cfg["path"])
-    print(f"Data loaded for {dataset_name}. NUM_CLASSES={NUM_CLASSES}, device={DEVICE}")
+        # Skip if CSV already exists (to avoid re-running completed datasets)
+        csv_path = os.path.join(SAVE_DIR, f"{dataset_name}_pgto_pruning_metrics_progressive_fixed.csv")
+        if os.path.exists(csv_path):
+            print(f"Skipping {dataset_name}: CSV already exists at {csv_path}")
+            continue
 
-    # baseline
-    def load_baseline_ckpt(path):
-        model = build_resnet50_for_load(NUM_CLASSES)
-        if os.path.exists(path):
-            state = torch.load(path, map_location="cpu")
-            model.load_state_dict(state)
-        return model.to(DEVICE).eval()
+        # Loaders with dataset-specific batch size
+        batch_size = DATASET_BATCH_SIZES.get(dataset_name, 32)
+        train_loader, val_loader, test_loader, NUM_CLASSES, train_ds = make_loaders(cfg["path"], batch_size)
+        print(f"Data loaded for {dataset_name}. NUM_CLASSES={NUM_CLASSES}, device={DEVICE}, batch_size={batch_size}")
+        log_memory_usage(f"After loading data for {dataset_name}: ")
 
-    baseline = load_baseline_ckpt(cfg["baseline"])
-    print("Baseline loaded.")
+        # Baseline
+        def load_baseline_ckpt(path):
+            model = build_resnet50_for_load(NUM_CLASSES)
+            if os.path.exists(path):
+                state = torch.load(path, map_location="cpu")
+                model.load_state_dict(state)
+            return model.to(DEVICE).eval()
 
-    rows = []
+        baseline = load_baseline_ckpt(cfg["baseline"])
+        print("Baseline loaded.")
+        log_memory_usage(f"After loading baseline for {dataset_name}: ")
 
-    print("=== EVALUATE BASELINE ===")
-    base_ckpt = os.path.join(SAVE_DIR, "baseline.pth")
-    torch.save(baseline.state_dict(), base_ckpt)
-    row = collect_metrics_row("baseline", "baseline", 0.0, baseline, test_loader, base_ckpt)
-    rows.append(row)
-    print("Baseline done:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
+        rows = []
 
-    for method in METHODS:
-        for target_ratio in TARGET_RATIOS:
-            print(f"\n=== PROGRESSIVE PGTO: method={method}, target_ratio={target_ratio} ===")
-            # start with current_model = baseline (deepcopy to avoid overwriting baseline)
-            current_model = copy.deepcopy(baseline).to(DEVICE)
-            keep_indices = {s: np.arange(stage_orig_channels(baseline, s)) for s in STAGES}
+        print("=== EVALUATE BASELINE ===")
+        base_ckpt = os.path.join(SAVE_DIR, "baseline.pth")
+        torch.save(baseline.state_dict(), base_ckpt)
+        row = collect_metrics_row("baseline", "baseline", 0.0, baseline, test_loader, base_ckpt)
+        rows.append(row)
+        print("Baseline done:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
+        log_memory_usage(f"After baseline evaluation for {dataset_name}: ")
 
-            # per-stage progressive loop
-            for s in STAGES:
-                orig = stage_orig_channels(current_model, s)
-                keep_k = max(1, int(math.floor(orig * (1.0 - target_ratio))))
+        for method in METHODS:
+            for target_ratio in TARGET_RATIOS:
+                print(f"\n=== PROGRESSIVE PGTO: method={method}, target_ratio={target_ratio} ===")
+                current_model = copy.deepcopy(baseline).to(DEVICE)
+                keep_indices = {s: np.arange(stage_orig_channels(baseline, s)) for s in STAGES}
+                log_memory_usage(f"Before pruning loop for {method}, ratio={target_ratio}: ")
 
-                # compute importance on the CURRENT model (progressive)
-                keeps = compute_stage_importance_and_keeps(current_model, s, keep_k, method=method, calib_loader=train_loader)
-                keep_indices[s] = keeps
-                print(f"  Stage {s}: keep {len(keeps)}/{orig} ({100*len(keeps)/orig:.1f}% kept)")
+                for s in STAGES:
+                    orig = stage_orig_channels(current_model, s)
+                    keep_k = max(1, int(math.floor(orig * (1.0 - target_ratio))))
 
-                # Build a new pruned model from current_model (not baseline) and copy weights properly
-                pruned_model = build_pruned_resnet_and_copy_weights_fixed(current_model, keep_indices={**{k: keep_indices[k] if k==s else np.arange(stage_orig_channels(current_model, k)) for k in STAGES}}, num_classes=NUM_CLASSES)
-                pruned_model = pruned_model.to(DEVICE)
-                pruned_model.eval()
-                with torch.no_grad(): _ = pruned_model(torch.randn(1,3,IMG_SIZE,IMG_SIZE).to(DEVICE))
+                    keeps = compute_stage_importance_and_keeps(current_model, s, keep_k, method=method, calib_loader=train_loader)
+                    keep_indices[s] = keeps
+                    print(f"  Stage {s}: keep {len(keeps)}/{orig} ({100*len(keeps)/orig:.1f}% kept)")
 
-                # Metric: post-prune (before local calib)
-                stage_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_{s}_postprune.pth")
-                torch.save(pruned_model.state_dict(), stage_pruned_ckpt)
-                row = collect_metrics_row(method, f"{s}_postprune", target_ratio, pruned_model, test_loader, stage_pruned_ckpt)
+                    pruned_model = build_pruned_resnet_and_copy_weights_fixed(current_model, keep_indices={**{k: keep_indices[k] if k==s else np.arange(stage_orig_channels(current_model, k)) for k in STAGES}}, num_classes=NUM_CLASSES)
+                    pruned_model = pruned_model.to(DEVICE)
+                    pruned_model.eval()
+                    with torch.no_grad(): _ = pruned_model(torch.randn(1,3,IMG_SIZE,IMG_SIZE).to(DEVICE))
+
+                    stage_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_{s}_postprune.pth")
+                    torch.save(pruned_model.state_dict(), stage_pruned_ckpt)
+                    row = collect_metrics_row(method, f"{s}_postprune", target_ratio, pruned_model, test_loader, stage_pruned_ckpt)
+                    rows.append(row)
+                    print("    Post-prune metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
+
+                    print(f"    Calibrating {s} (local)...")
+                    pruned_model = calibrate_stage(pruned_model, s, train_loader, epochs=CAL_EPOCHS, max_batches=CAL_MAX_BATCHES, lr=CAL_LR, allow_fc_bn1=False)
+
+                    stage_calib_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_{s}_calibrated.pth")
+                    torch.save(pruned_model.state_dict(), stage_calib_ckpt)
+                    row = collect_metrics_row(method, f"{s}_postcalib", target_ratio, pruned_model, test_loader, stage_calib_ckpt)
+                    rows.append(row)
+                    print("    Post-calib metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
+
+                    current_model = pruned_model
+                    log_memory_usage(f"After stage {s} for {method}, ratio={target_ratio}: ")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                all_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_allpruned_preKD.pth")
+                torch.save(current_model.state_dict(), all_pruned_ckpt)
+                row = collect_metrics_row(method, "all_pruned_preKD", target_ratio, current_model, test_loader, all_pruned_ckpt)
                 rows.append(row)
-                print("    Post-prune metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
+                print("  All-pruned (pre-KD) metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
 
-                # Local calibration on pruned_model (but only unfreeze this stage)
-                print(f"    Calibrating {s} (local)...")
-                pruned_model = calibrate_stage(pruned_model, s, train_loader, epochs=CAL_EPOCHS, max_batches=CAL_MAX_BATCHES, lr=CAL_LR, allow_fc_bn1=False)
-
-                # Save calibrated stage and metrics
-                stage_calib_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_{s}_calibrated.pth")
-                torch.save(pruned_model.state_dict(), stage_calib_ckpt)
-                row = collect_metrics_row(method, f"{s}_postcalib", target_ratio, pruned_model, test_loader, stage_calib_ckpt)
+                print("  Knowledge distillation (student <- teacher)...")
+                current_model = distill_student(current_model, baseline, train_loader, epochs=KD_EPOCHS, lr=KD_LR, alpha=KD_ALPHA, T=KD_TEMPERATURE, max_batches=KD_MAX_BATCHES)
+                kd_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_afterKD.pth")
+                torch.save(current_model.state_dict(), kd_ckpt)
+                row = collect_metrics_row(method, "after_kd", target_ratio, current_model, test_loader, kd_ckpt)
                 rows.append(row)
-                print("    Post-calib metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
+                print("  KD metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
 
-                # Update current_model to be the tuned pruned_model so future stages compute importance on it
-                current_model = pruned_model
+                print("  Final global finetune...")
+                current_model = global_finetune(current_model, train_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
+                final_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_final.pth")
+                torch.save(current_model.state_dict(), final_ckpt)
+                row = collect_metrics_row(method, "after_global_finetune", target_ratio, current_model, test_loader, final_ckpt)
+                rows.append(row)
+                print("  Final metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
 
-            # At this point we've done progressive prune+tune across stages.
-            # Save "all-pruned pre-KD" checkpoint and metrics
-            all_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_allpruned_preKD.pth")
-            torch.save(current_model.state_dict(), all_pruned_ckpt)
-            row = collect_metrics_row(method, "all_pruned_preKD", target_ratio, current_model, test_loader, all_pruned_ckpt)
-            rows.append(row)
-            print("  All-pruned (pre-KD) metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            # KD: student = current_model, teacher = baseline
-            print("  Knowledge distillation (student <- teacher)...")
-            current_model = distill_student(current_model, baseline, train_loader, epochs=KD_EPOCHS, lr=KD_LR, alpha=KD_ALPHA, T=KD_TEMPERATURE, max_batches=KD_MAX_BATCHES)
-            kd_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_afterKD.pth")
-            torch.save(current_model.state_dict(), kd_ckpt)
-            row = collect_metrics_row(method, "after_kd", target_ratio, current_model, test_loader, kd_ckpt)
-            rows.append(row)
-            print("  KD metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
+        # Save dataset-specific CSV
+        df = pd.DataFrame(rows)
+        df.to_csv(csv_path, index=False)
+        print(f"All done for {dataset_name}. CSV: {csv_path}")
 
-            # Final global finetune
-            print("  Final global finetune...")
-            current_model = global_finetune(current_model, train_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
-            final_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(target_ratio*100)}_final.pth")
-            torch.save(current_model.state_dict(), final_ckpt)
-            row = collect_metrics_row(method, "after_global_finetune", target_ratio, current_model, test_loader, final_ckpt)
-            rows.append(row)
-            print("  Final metrics:", {k: row[k] for k in ["Acc","AUC","ModelSizeMB","FLOPs_M_per_image"]})
+        # Clean up memory
+        del baseline, current_model, pruned_model, train_loader, val_loader, test_loader, train_ds
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log_memory_usage(f"After completing {dataset_name}: ")
 
-    # Save dataset-specific CSV
-    csv_path = os.path.join(SAVE_DIR, f"{dataset_name}_pgto_pruning_metrics_progressive_fixed.csv")
-    df = pd.DataFrame(rows)
-    df.to_csv(csv_path, index=False)
-    print(f"All done for {dataset_name}. CSV: {csv_path}")
+    except Exception as e:
+        print(f"Error processing {dataset_name}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        print(f"Continuing to next dataset...")
+
+print("All datasets processed.")
