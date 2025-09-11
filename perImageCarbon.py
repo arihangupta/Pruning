@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 import os
 import glob
@@ -151,7 +152,7 @@ def load_images(npz_path, num_images=NUM_IMAGES):
 def predict_with_energy(model, images, labels, model_path, emissions_dir):
     """
     Predict on a batch of images and measure energy consumption.
-    Returns accuracy, number of correct predictions, and total energy consumption.
+    Returns predictions, accuracy, number of correct predictions, and total energy consumption.
     """
     try:
         os.makedirs(emissions_dir, exist_ok=True)
@@ -208,6 +209,7 @@ def main():
         model_files += sorted(glob.glob(os.path.join(EXPERIMENT_DIR, dset, "*_final.pth")))
 
         results = []
+        total = len(labels)  # Define total here
         for mpath in model_files:
             try:
                 # Determine pruning ratio from model file name
@@ -263,22 +265,26 @@ def main():
                     writer = csv.writer(f)
                     writer.writerow(["model", "image_index", "true_label", "predicted_label"])
                     for mpath in model_files:
-                        model_name = os.path.basename(mpath)
-                        pruning_ratio = None
-                        if "r50" in mpath:
-                            pruning_ratio = 0.5
-                        elif "r60" in mpath:
-                            pruning_ratio = 0.6
-                        elif "r70" in mpath:
-                            pruning_ratio = 0.7
-                        model = build_model(num_classes, pruning_ratio).to(DEVICE)
-                        state_dict = torch.load(mpath, map_location=DEVICE, weights_only=True)
-                        model.load_state_dict(state_dict)
-                        preds, _, _, _ = predict_with_energy(
-                            model, norm_imgs, labels, mpath, os.path.join(EXPERIMENT_DIR, dset)
-                        )
-                        for idx, (true, pred) in enumerate(zip(labels.tolist(), preds)):
-                            writer.writerow([model_name, idx, true, pred])
+                        try:
+                            model_name = os.path.basename(mpath)
+                            pruning_ratio = None
+                            if "r50" in mpath:
+                                pruning_ratio = 0.5
+                            elif "r60" in mpath:
+                                pruning_ratio = 0.6
+                            elif "r70" in mpath:
+                                pruning_ratio = 0.7
+                            model = build_model(num_classes, pruning_ratio).to(DEVICE)
+                            state_dict = torch.load(mpath, map_location=DEVICE, weights_only=True)
+                            model.load_state_dict(state_dict)
+                            preds, _, _, _ = predict_with_energy(
+                                model, norm_imgs, labels, mpath, os.path.join(EXPERIMENT_DIR, dset)
+                            )
+                            for idx, (true, pred) in enumerate(zip(labels.tolist(), preds)):
+                                writer.writerow([model_name, idx, true, pred])
+                        except Exception as e:
+                            print(f"Error writing individual predictions for {mpath}: {e}")
+                            continue
                 print(f"→ Saved individual predictions to {individual_csv}")
             except Exception as e:
                 print(f"Error writing CSV for {dset}: {e}")
