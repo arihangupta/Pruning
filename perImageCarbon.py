@@ -49,7 +49,6 @@ def load_one_image(npz_path):
         img = np.expand_dims(img, -1)
 
     img = torch.tensor(img).permute(2, 0, 1).float() / 255.0  # (C, H, W)
-
     in_channels = img.shape[0]
 
     # if grayscale, keep 1 channel for model conv1,
@@ -65,7 +64,11 @@ def load_one_image(npz_path):
     ])
     norm_img = transform(norm_img)
 
-    return img.unsqueeze(0), norm_img.unsqueeze(0), int(np.asscalar(label)), in_channels
+    # ensure label is a Python int
+    label = int(label.item()) if isinstance(label, np.ndarray) else int(label)
+
+    return img.unsqueeze(0), norm_img.unsqueeze(0), label, in_channels
+
 
 def predict_with_energy(model, img, model_path, emissions_dir):
     os.makedirs(emissions_dir, exist_ok=True)
