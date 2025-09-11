@@ -2,6 +2,7 @@
 """
 Progressive PGTO pruning for multiple MedMNIST datasets (regional gradients only + CodeCarbon).
 Optimized for memory efficiency using memory-mapped data loading.
+
 Outputs:
 - metrics CSV per dataset (your original metrics plus energy/emissions rows)
 - CodeCarbon emissions.csv in each dataset SAVE_DIR with detailed run info
@@ -37,7 +38,7 @@ except Exception:
 # -------------------------
 # Config
 # -------------------------
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/experiment3"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/experiment2"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
@@ -428,7 +429,10 @@ def predict_single_image(model: nn.Module, image: np.ndarray, img_size=IMG_SIZE,
         T.ToTensor(),
         T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
     ])
-    if len(image.shape) == 3 and image.shape[-1] == 1:  # grayscale -> 3 channels
+    # Handle grayscale images by repeating to 3 channels
+    if len(image.shape) == 2 or (len(image.shape) == 3 and image.shape[-1] == 1):
+        if len(image.shape) == 2:
+            image = image[..., np.newaxis]
         image = np.repeat(image, 3, axis=-1)
     x = tfms(image).unsqueeze(0).to(DEVICE)
     tracker = None
@@ -628,7 +632,7 @@ for dataset_name, cfg in DATASETS.items():
             print(f"Skipping {dataset_name}: CSV already exists at {csv_path}")
             continue
         batch_size = DATASET_BATCH_SIZES.get(dataset_name, BATCH_SIZE)
-        train_loader, val_loader, test_loader, NUM_CLASSES, _ = make_loaders(cfg["path"], batch_size)
+        train_loader, val_loader, test_loader, NUM_CLASSES, train_ds = make_loaders(cfg["path"], batch_size)
         test_ds = test_loader.dataset
         sample_raw = test_ds.imgs[0]
         sample_label = int(test_ds.labels[0])
@@ -824,7 +828,7 @@ for dataset_name, cfg in DATASETS.items():
         df = pd.DataFrame(rows)
         df.to_csv(csv_path, index=False)
         print(f"All done for {dataset_name}. CSV: {csv_path}")
-        del baseline, current_model, pruned_model, train_loader, val_loader, test_loader
+        del baseline, current_model, pruned_model, train_loader, val_loader, test_loader, train_ds
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         log_memory_usage(f"After completing {dataset_name}: ")
