@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from codecarbon import EmissionsTracker
 from torchvision import transforms, models
+from torchvision.models.resnet import Bottleneck
 
 # ---------- CONFIG ----------
 DATASETS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
@@ -16,26 +17,74 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_SIZE = 224
 # ----------------------------
 
-def build_model(num_classes: int, in_channels: int = 3):
-    """
-    Build a ResNet-50 model with the right classifier head
-    and input channel handling (1 or 3).
-    """
-    model = models.resnet50(weights=None)
+class CustomResNet(nn.Module):
+    def __init__(self, block=Bottleneck, layers=[3, 4, 6, 3], stage_planes=[64, 128, 256, 512], num_classes=1000, in_channels=3):
+        super().__init__()
+        self.inplanes = 64
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.stage_planes = stage_planes[:]
+        self.layers_cfg = layers[:]
+        self.layer1 = self._make_layer(block, stage_planes[0], layers[0])
+        self.layer2 = self._make_layer(block, stage_planes[1], layers[1], stride=2)
+        self.layer3 = self._make_layer(block, stage_planes[2], layers[2], stride=2)
+        self.layer4 = self._make_layer(block, stage_planes[3], layers[3], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(stage_planes[3] * block.expansion, num_classes)
 
-    # Adjust the first conv layer if grayscale
-    if in_channels == 1:
-        old_conv = model.conv1
-        model.conv1 = nn.Conv2d(
-            1, old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=old_conv.stride,
-            padding=old_conv.padding,
-            bias=old_conv.bias
-        )
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+        layers = []
+        layers.append(block(self.inplanes, planes, stride=stride, downsample=downsample))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
 
-    # Replace classifier head
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+def build_model(num_classes: int, in_channels: int = 3, pruning_ratio=None):
+    """
+    Build a ResNet-50 model with the right classifier head, input channels, and optional pruning.
+    pruning_ratio: None for baseline, or 0.5, 0.6, 0.7 for pruned models.
+    """
+    if pruning_ratio is None:
+        # Baseline ResNet-50
+        stage_planes = [64, 128, 256, 512]
+    else:
+        # Pruned model with reduced channels
+        stage_planes = [
+            max(1, int(math.floor(64 * (1.0 - pruning_ratio)))),
+            max(1, int(math.floor(128 * (1.0 - pruning_ratio)))),
+            max(1, int(math.floor(256 * (1.0 - pruning_ratio)))),
+            max(1, int(math.floor(512 * (1.0 - pruning_ratio))))
+        ]
+    model = CustomResNet(
+        block=Bottleneck,
+        layers=[3, 4, 6, 3],
+        stage_planes=stage_planes,
+        num_classes=num_classes,
+        in_channels=in_channels
+    )
     return model
 
 def load_one_image(npz_path):
@@ -44,15 +93,14 @@ def load_one_image(npz_path):
     idx = random.randint(0, len(images) - 1)
     img, label = images[idx], labels[idx]
 
-    # ensure channel dimension
+    # Ensure channel dimension
     if img.ndim == 2:  # (H, W)
         img = np.expand_dims(img, -1)
 
     img = torch.tensor(img).permute(2, 0, 1).float() / 255.0  # (C, H, W)
     in_channels = img.shape[0]
 
-    # if grayscale, keep 1 channel for model conv1,
-    # but duplicate for normalization (which expects 3 channels)
+    # If grayscale, keep 1 channel for model conv1, but duplicate for normalization
     if in_channels == 1:
         norm_img = img.repeat(3, 1, 1)
     else:
@@ -64,11 +112,10 @@ def load_one_image(npz_path):
     ])
     norm_img = transform(norm_img)
 
-    # ensure label is a Python int
+    # Ensure label is a Python int
     label = int(label.item()) if isinstance(label, np.ndarray) else int(label)
 
     return img.unsqueeze(0), norm_img.unsqueeze(0), label, in_channels
-
 
 def predict_with_energy(model, img, model_path, emissions_dir):
     os.makedirs(emissions_dir, exist_ok=True)
@@ -102,13 +149,22 @@ def main():
 
         results = []
         for mpath in model_files:
-            model = build_model(num_classes, in_channels).to(DEVICE)
+            # Determine pruning ratio from model file name
+            pruning_ratio = None
+            if "r50" in mpath:
+                pruning_ratio = 0.5
+            elif "r60" in mpath:
+                pruning_ratio = 0.6
+            elif "r70" in mpath:
+                pruning_ratio = 0.7
 
-            # load weights
+            model = build_model(num_classes, in_channels, pruning_ratio).to(DEVICE)
+
+            # Load weights
             state_dict = torch.load(mpath, map_location=DEVICE)
             model.load_state_dict(state_dict)
 
-            # use normalized image for prediction
+            # Use normalized image for prediction
             pred, energy_kwh = predict_with_energy(model, norm_img, mpath, os.path.join(EXPERIMENT_DIR, dset))
 
             print(f"Model: {os.path.basename(mpath):40s} | True: {true_label} | Pred: {pred} | kWh: {energy_kwh:.6f}")
@@ -119,7 +175,7 @@ def main():
                 "energy_kWh": energy_kwh,
             })
 
-        # write one CSV per dataset
+        # Write one CSV per dataset
         out_csv = os.path.join(EXPERIMENT_DIR, dset, "predictions_with_energy.csv")
         with open(out_csv, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=results[0].keys())
