@@ -3,6 +3,7 @@ import os
 import glob
 import random
 import csv
+import math  # Added math import
 import numpy as np
 import torch
 import torch.nn as nn
@@ -88,50 +89,64 @@ def build_model(num_classes: int, in_channels: int = 3, pruning_ratio=None):
     return model
 
 def load_one_image(npz_path):
-    data = np.load(npz_path)
-    images, labels = data["test_images"], data["test_labels"]
-    idx = random.randint(0, len(images) - 1)
-    img, label = images[idx], labels[idx]
+    try:
+        data = np.load(npz_path)
+        images, labels = data["test_images"], data["test_labels"]
+        idx = random.randint(0, len(images) - 1)
+        img, label = images[idx], labels[idx]
 
-    # Ensure channel dimension
-    if img.ndim == 2:  # (H, W)
-        img = np.expand_dims(img, -1)
+        # Ensure channel dimension
+        if img.ndim == 2:  # (H, W)
+            img = np.expand_dims(img, -1)
 
-    img = torch.tensor(img).permute(2, 0, 1).float() / 255.0  # (C, H, W)
-    in_channels = img.shape[0]
+        img = torch.tensor(img).permute(2, 0, 1).float() / 255.0  # (C, H, W)
+        in_channels = img.shape[0]
 
-    # If grayscale, keep 1 channel for model conv1, but duplicate for normalization
-    if in_channels == 1:
-        norm_img = img.repeat(3, 1, 1)
-    else:
-        norm_img = img
+        # If grayscale, keep 1 channel for model conv1, but duplicate for normalization
+        if in_channels == 1:
+            norm_img = img.repeat(3, 1, 1)
+        else:
+            norm_img = img
 
-    transform = transforms.Compose([
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ])
-    norm_img = transform(norm_img)
+        # Use same normalization as pruning code
+        transform = transforms.Compose([
+            transforms.Resize((IMG_SIZE, IMG_SIZE)),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        norm_img = transform(norm_img)
 
-    # Ensure label is a Python int
-    label = int(label.item()) if isinstance(label, np.ndarray) else int(label)
+        # Ensure label is a Python int
+        label = int(label.item()) if isinstance(label, np.ndarray) else int(label)
 
-    return img.unsqueeze(0), norm_img.unsqueeze(0), label, in_channels
+        return img.unsqueeze(0), norm_img.unsqueeze(0), label, in_channels
+    except Exception as e:
+        print(f"Error loading image from {npz_path}: {e}")
+        raise
 
 def predict_with_energy(model, img, model_path, emissions_dir):
-    os.makedirs(emissions_dir, exist_ok=True)
-    tracker = EmissionsTracker(
-        project_name=os.path.basename(model_path),
-        output_dir=emissions_dir,
-        output_file="emissions.csv",
-        log_level="error"
-    )
-    tracker.start()
-    model.eval()
-    with torch.no_grad():
-        out = model(img.to(DEVICE))
-        pred = torch.argmax(out, dim=1).item()
-    energy_kwh = tracker.stop()  # returns float
-    return pred, energy_kwh
+    try:
+        os.makedirs(emissions_dir, exist_ok=True)
+        tracker = EmissionsTracker(
+            project_name=os.path.basename(model_path),
+            output_dir=emissions_dir,
+            output_file="emissions.csv",
+            log_level="error"
+        )
+        tracker.start()
+        model.eval()
+        with torch.no_grad():
+            out = model(img.to(DEVICE))
+            pred = torch.argmax(out, dim=1).item()
+        energy_kwh = tracker.stop()  # returns float
+        return pred, energy_kwh
+    except Exception as e:
+        print(f"Error in predict_with_energy for {model_path}: {e}")
+        raise
+    finally:
+        if 'tracker' in locals():
+            tracker.stop()  # Ensure tracker is stopped
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # Clear GPU memory
 
 def main():
     datasets = ["bloodmnist", "dermamnist", "octmnist", "pathmnist", "tissuemnist"]
@@ -139,49 +154,68 @@ def main():
         print(f"\n=== {dset.upper()} ===")
         npz_path = os.path.join(DATASETS_DIR, f"{dset}_224.npz")
 
-        raw_img, norm_img, true_label, in_channels = load_one_image(npz_path)
+        try:
+            raw_img, norm_img, true_label, in_channels = load_one_image(npz_path)
+        except Exception as e:
+            print(f"Skipping {dset} due to error: {e}")
+            continue
 
-        labels = np.load(npz_path)["test_labels"]
-        num_classes = len(np.unique(labels))
+        try:
+            labels = np.load(npz_path)["test_labels"]
+            num_classes = len(np.unique(labels))
+        except Exception as e:
+            print(f"Error loading labels for {dset}: {e}")
+            continue
 
         model_files = [os.path.join(EXPERIMENT_DIR, dset, "baseline.pth")]
         model_files += sorted(glob.glob(os.path.join(EXPERIMENT_DIR, dset, "*_final.pth")))
 
         results = []
         for mpath in model_files:
-            # Determine pruning ratio from model file name
-            pruning_ratio = None
-            if "r50" in mpath:
-                pruning_ratio = 0.5
-            elif "r60" in mpath:
-                pruning_ratio = 0.6
-            elif "r70" in mpath:
-                pruning_ratio = 0.7
+            try:
+                # Determine pruning ratio from model file name
+                pruning_ratio = None
+                if "r50" in mpath:
+                    pruning_ratio = 0.5
+                elif "r60" in mpath:
+                    pruning_ratio = 0.6
+                elif "r70" in mpath:
+                    pruning_ratio = 0.7
 
-            model = build_model(num_classes, in_channels, pruning_ratio).to(DEVICE)
+                model = build_model(num_classes, in_channels, pruning_ratio).to(DEVICE)
 
-            # Load weights
-            state_dict = torch.load(mpath, map_location=DEVICE)
-            model.load_state_dict(state_dict)
+                # Load weights with weights_only=True
+                state_dict = torch.load(mpath, map_location=DEVICE, weights_only=True)
+                model.load_state_dict(state_dict)
 
-            # Use normalized image for prediction
-            pred, energy_kwh = predict_with_energy(model, norm_img, mpath, os.path.join(EXPERIMENT_DIR, dset))
+                # Use normalized image for prediction
+                pred, energy_kwh = predict_with_energy(model, norm_img, mpath, os.path.join(EXPERIMENT_DIR, dset))
 
-            print(f"Model: {os.path.basename(mpath):40s} | True: {true_label} | Pred: {pred} | kWh: {energy_kwh:.6f}")
-            results.append({
-                "model": os.path.basename(mpath),
-                "true_label": true_label,
-                "predicted_label": pred,
-                "energy_kWh": energy_kwh,
-            })
+                print(f"Model: {os.path.basename(mpath):40s} | True: {true_label} | Pred: {pred} | kWh: {energy_kwh:.6f}")
+                results.append({
+                    "model": os.path.basename(mpath),
+                    "true_label": true_label,
+                    "predicted_label": pred,
+                    "energy_kWh": energy_kwh,
+                })
+            except Exception as e:
+                print(f"Error processing model {mpath}: {e}")
+                continue
+            finally:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()  # Clear GPU memory after each model
 
         # Write one CSV per dataset
-        out_csv = os.path.join(EXPERIMENT_DIR, dset, "predictions_with_energy.csv")
-        with open(out_csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=results[0].keys())
-            writer.writeheader()
-            writer.writerows(results)
-        print(f"→ Saved aggregated results to {out_csv}")
+        if results:
+            try:
+                out_csv = os.path.join(EXPERIMENT_DIR, dset, "predictions_with_energy.csv")
+                with open(out_csv, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=results[0].keys())
+                    writer.writeheader()
+                    writer.writerows(results)
+                print(f"→ Saved aggregated results to {out_csv}")
+            except Exception as e:
+                print(f"Error writing CSV for {dset}: {e}")
 
 if __name__ == "__main__":
     main()
