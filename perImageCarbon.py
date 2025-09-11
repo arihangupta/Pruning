@@ -72,7 +72,7 @@ def predict_with_energy(model, img, model_path, emissions_dir):
     tracker = EmissionsTracker(
         project_name=os.path.basename(model_path),
         output_dir=emissions_dir,
-        output_file=None,
+        output_file="emissions.csv",
         log_level="error"
     )
     tracker.start()
