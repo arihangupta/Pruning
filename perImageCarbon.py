@@ -3,7 +3,7 @@ import os
 import glob
 import random
 import csv
-import math  # Added math import
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -63,9 +63,10 @@ class CustomResNet(nn.Module):
         x = self.fc(x)
         return x
 
-def build_model(num_classes: int, in_channels: int = 3, pruning_ratio=None):
+def build_model(num_classes: int, pruning_ratio=None):
     """
-    Build a ResNet-50 model with the right classifier head, input channels, and optional pruning.
+    Build a ResNet-50 model with the right classifier head and optional pruning.
+    Always use in_channels=3 to match pruning code's expectation.
     pruning_ratio: None for baseline, or 0.5, 0.6, 0.7 for pruned models.
     """
     if pruning_ratio is None:
@@ -84,7 +85,7 @@ def build_model(num_classes: int, in_channels: int = 3, pruning_ratio=None):
         layers=[3, 4, 6, 3],
         stage_planes=stage_planes,
         num_classes=num_classes,
-        in_channels=in_channels
+        in_channels=3  # Always 3 channels to match pruning code
     )
     return model
 
@@ -102,7 +103,7 @@ def load_one_image(npz_path):
         img = torch.tensor(img).permute(2, 0, 1).float() / 255.0  # (C, H, W)
         in_channels = img.shape[0]
 
-        # If grayscale, keep 1 channel for model conv1, but duplicate for normalization
+        # Always convert to 3 channels to match pruning code's expectation
         if in_channels == 1:
             norm_img = img.repeat(3, 1, 1)
         else:
@@ -118,7 +119,8 @@ def load_one_image(npz_path):
         # Ensure label is a Python int
         label = int(label.item()) if isinstance(label, np.ndarray) else int(label)
 
-        return img.unsqueeze(0), norm_img.unsqueeze(0), label, in_channels
+        print(f"Loaded image from {npz_path}: original channels={in_channels}")
+        return img.unsqueeze(0), norm_img.unsqueeze(0), label
     except Exception as e:
         print(f"Error loading image from {npz_path}: {e}")
         raise
@@ -155,7 +157,7 @@ def main():
         npz_path = os.path.join(DATASETS_DIR, f"{dset}_224.npz")
 
         try:
-            raw_img, norm_img, true_label, in_channels = load_one_image(npz_path)
+            raw_img, norm_img, true_label = load_one_image(npz_path)
         except Exception as e:
             print(f"Skipping {dset} due to error: {e}")
             continue
@@ -182,13 +184,13 @@ def main():
                 elif "r70" in mpath:
                     pruning_ratio = 0.7
 
-                model = build_model(num_classes, in_channels, pruning_ratio).to(DEVICE)
+                model = build_model(num_classes, pruning_ratio).to(DEVICE)
 
                 # Load weights with weights_only=True
                 state_dict = torch.load(mpath, map_location=DEVICE, weights_only=True)
                 model.load_state_dict(state_dict)
 
-                # Use normalized image for prediction
+                # Use normalized image (always 3 channels) for prediction
                 pred, energy_kwh = predict_with_energy(model, norm_img, mpath, os.path.join(EXPERIMENT_DIR, dset))
 
                 print(f"Model: {os.path.basename(mpath):40s} | True: {true_label} | Pred: {pred} | kWh: {energy_kwh:.6f}")
