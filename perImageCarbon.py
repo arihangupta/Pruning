@@ -65,7 +65,7 @@ def load_one_image(npz_path):
     ])
     norm_img = transform(norm_img)
 
-    return img.unsqueeze(0), norm_img.unsqueeze(0), int(label), in_channels
+    return img.unsqueeze(0), norm_img.unsqueeze(0), int(np.asscalar(label)), in_channels
 
 def predict_with_energy(model, img, model_path, emissions_dir):
     os.makedirs(emissions_dir, exist_ok=True)
@@ -80,8 +80,8 @@ def predict_with_energy(model, img, model_path, emissions_dir):
     with torch.no_grad():
         out = model(img.to(DEVICE))
         pred = torch.argmax(out, dim=1).item()
-    emissions = tracker.stop()
-    return pred, emissions
+    energy_kwh = tracker.stop()  # returns float
+    return pred, energy_kwh
 
 def main():
     datasets = ["bloodmnist", "dermamnist", "octmnist", "pathmnist", "tissuemnist"]
@@ -105,17 +105,15 @@ def main():
             state_dict = torch.load(mpath, map_location=DEVICE)
             model.load_state_dict(state_dict)
 
-            # IMPORTANT: use normalized image for prediction
-            pred, emissions = predict_with_energy(model, norm_img, mpath, os.path.join(EXPERIMENT_DIR, dset))
+            # use normalized image for prediction
+            pred, energy_kwh = predict_with_energy(model, norm_img, mpath, os.path.join(EXPERIMENT_DIR, dset))
 
-            print(f"Model: {os.path.basename(mpath):40s} | True: {true_label} | Pred: {pred} | kWh: {emissions.energy_consumed:.6f}")
+            print(f"Model: {os.path.basename(mpath):40s} | True: {true_label} | Pred: {pred} | kWh: {energy_kwh:.6f}")
             results.append({
                 "model": os.path.basename(mpath),
                 "true_label": true_label,
                 "predicted_label": pred,
-                "energy_kWh": emissions.energy_consumed,
-                "emissions_kgCO2": emissions.emissions,
-                "duration_sec": emissions.duration,
+                "energy_kWh": energy_kwh,
             })
 
         # write one CSV per dataset
