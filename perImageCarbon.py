@@ -13,7 +13,7 @@ from torchvision.models.resnet import Bottleneck
 
 # ---------- CONFIG ----------
 DATASETS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
-EXPERIMENT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/experiment4"
+EXPERIMENT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/experiment2"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_SIZE = 224
 NUM_IMAGES_LIST = [10] + list(range(50, 1001, 50))  # [10, 50, 100, 150, ..., 1000]
