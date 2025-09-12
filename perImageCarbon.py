@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import os
 import glob
@@ -17,7 +16,7 @@ DATASETS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
 EXPERIMENT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/experiment2"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_SIZE = 224
-NUM_IMAGES = 100  # Number of random test images to process
+NUM_IMAGES_LIST = [10] + list(range(50, 1001, 50))  # [10, 50, 100, 150, ..., 1000]
 # ----------------------------
 
 class CustomResNet(nn.Module):
@@ -91,7 +90,7 @@ def build_model(num_classes: int, pruning_ratio=None):
     )
     return model
 
-def load_images(npz_path, num_images=NUM_IMAGES):
+def load_images(npz_path, num_images):
     """
     Load num_images random test images and their labels from the dataset.
     Returns batched images, normalized images, and labels.
@@ -99,11 +98,11 @@ def load_images(npz_path, num_images=NUM_IMAGES):
     try:
         data = np.load(npz_path)
         images, labels = data["test_images"], data["test_labels"]
-        if len(images) < num_images:
-            raise ValueError(f"Dataset has only {len(images)} images, but {num_images} requested")
+        available_images = len(images)
+        num_images = min(num_images, available_images)  # Use available images if fewer than requested
         
         # Select random indices
-        indices = random.sample(range(len(images)), num_images)
+        indices = random.sample(range(available_images), num_images)
         selected_images = images[indices]
         selected_labels = labels[indices]
 
@@ -159,7 +158,7 @@ def predict_with_energy(model, images, labels, model_path, emissions_dir):
         tracker = EmissionsTracker(
             project_name=os.path.basename(model_path),
             output_dir=emissions_dir,
-            output_file="emissions.csv",
+            output_file=f"emissions_{len(labels)}.csv",  # Unique file per num_images
             log_level="error"
         )
         tracker.start()
@@ -193,12 +192,6 @@ def main():
         npz_path = os.path.join(DATASETS_DIR, f"{dset}_224.npz")
 
         try:
-            raw_imgs, norm_imgs, labels = load_images(npz_path)
-        except Exception as e:
-            print(f"Skipping {dset} due to error: {e}")
-            continue
-
-        try:
             labels_np = np.load(npz_path)["test_labels"]
             num_classes = len(np.unique(labels_np))
         except Exception as e:
@@ -208,86 +201,94 @@ def main():
         model_files = [os.path.join(EXPERIMENT_DIR, dset, "baseline.pth")]
         model_files += sorted(glob.glob(os.path.join(EXPERIMENT_DIR, dset, "*_final.pth")))
 
-        results = []
-        total = len(labels)  # Define total here
-        for mpath in model_files:
+        for num_images in NUM_IMAGES_LIST:
+            print(f"\nProcessing {num_images} images")
             try:
-                # Determine pruning ratio from model file name
-                pruning_ratio = None
-                if "r50" in mpath:
-                    pruning_ratio = 0.5
-                elif "r60" in mpath:
-                    pruning_ratio = 0.6
-                elif "r70" in mpath:
-                    pruning_ratio = 0.7
-
-                model = build_model(num_classes, pruning_ratio).to(DEVICE)
-
-                # Load weights with weights_only=True
-                state_dict = torch.load(mpath, map_location=DEVICE, weights_only=True)
-                model.load_state_dict(state_dict)
-
-                # Predict on batch of images
-                preds, accuracy, correct, energy_kwh = predict_with_energy(
-                    model, norm_imgs, labels, mpath, os.path.join(EXPERIMENT_DIR, dset)
-                )
-
-                print(f"Model: {os.path.basename(mpath):40s} | "
-                      f"Accuracy: {accuracy:.4f} ({correct}/{total}) | "
-                      f"Energy kWh: {energy_kwh:.6f}")
-                results.append({
-                    "model": os.path.basename(mpath),
-                    "accuracy": accuracy,
-                    "correct_predictions": correct,
-                    "total_images": total,
-                    "energy_kWh": energy_kwh,
-                })
+                raw_imgs, norm_imgs, labels = load_images(npz_path, num_images)
             except Exception as e:
-                print(f"Error processing model {mpath}: {e}")
+                print(f"Skipping {dset} for {num_images} images due to error: {e}")
                 continue
-            finally:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()  # Clear GPU memory after each model
 
-        # Write one CSV per dataset
-        if results:
-            try:
-                out_csv = os.path.join(EXPERIMENT_DIR, dset, "predictions_with_energy.csv")
-                with open(out_csv, "w", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=results[0].keys())
-                    writer.writeheader()
-                    writer.writerows(results)
-                print(f"→ Saved aggregated results to {out_csv}")
-                
-                # Optionally save individual predictions
-                individual_csv = os.path.join(EXPERIMENT_DIR, dset, "individual_predictions.csv")
-                with open(individual_csv, "w", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["model", "image_index", "true_label", "predicted_label"])
-                    for mpath in model_files:
-                        try:
-                            model_name = os.path.basename(mpath)
-                            pruning_ratio = None
-                            if "r50" in mpath:
-                                pruning_ratio = 0.5
-                            elif "r60" in mpath:
-                                pruning_ratio = 0.6
-                            elif "r70" in mpath:
-                                pruning_ratio = 0.7
-                            model = build_model(num_classes, pruning_ratio).to(DEVICE)
-                            state_dict = torch.load(mpath, map_location=DEVICE, weights_only=True)
-                            model.load_state_dict(state_dict)
-                            preds, _, _, _ = predict_with_energy(
-                                model, norm_imgs, labels, mpath, os.path.join(EXPERIMENT_DIR, dset)
-                            )
-                            for idx, (true, pred) in enumerate(zip(labels.tolist(), preds)):
-                                writer.writerow([model_name, idx, true, pred])
-                        except Exception as e:
-                            print(f"Error writing individual predictions for {mpath}: {e}")
-                            continue
-                print(f"→ Saved individual predictions to {individual_csv}")
-            except Exception as e:
-                print(f"Error writing CSV for {dset}: {e}")
+            results = []
+            total = len(labels)  # Actual number of images loaded
+            for mpath in model_files:
+                try:
+                    # Determine pruning ratio from model file name
+                    pruning_ratio = None
+                    if "r50" in mpath:
+                        pruning_ratio = 0.5
+                    elif "r60" in mpath:
+                        pruning_ratio = 0.6
+                    elif "r70" in mpath:
+                        pruning_ratio = 0.7
+
+                    model = build_model(num_classes, pruning_ratio).to(DEVICE)
+
+                    # Load weights with weights_only=True
+                    state_dict = torch.load(mpath, map_location=DEVICE, weights_only=True)
+                    model.load_state_dict(state_dict)
+
+                    # Predict on batch of images
+                    preds, accuracy, correct, energy_kwh = predict_with_energy(
+                        model, norm_imgs, labels, mpath, os.path.join(EXPERIMENT_DIR, dset)
+                    )
+
+                    print(f"Model: {os.path.basename(mpath):40s} | "
+                          f"Accuracy: {accuracy:.4f} ({correct}/{total}) | "
+                          f"Energy kWh: {energy_kwh:.6f}")
+                    results.append({
+                        "model": os.path.basename(mpath),
+                        "num_images": total,
+                        "accuracy": accuracy,
+                        "correct_predictions": correct,
+                        "energy_kWh": energy_kwh,
+                    })
+                except Exception as e:
+                    print(f"Error processing model {mpath} for {num_images} images: {e}")
+                    continue
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()  # Clear GPU memory after each model
+
+            # Write aggregated results for this num_images
+            if results:
+                try:
+                    out_csv = os.path.join(EXPERIMENT_DIR, dset, f"predictions_with_energy_{num_images}.csv")
+                    with open(out_csv, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=results[0].keys())
+                        writer.writeheader()
+                        writer.writerows(results)
+                    print(f"→ Saved aggregated results to {out_csv}")
+                    
+                    # Optionally save individual predictions
+                    individual_csv = os.path.join(EXPERIMENT_DIR, dset, f"individual_predictions_{num_images}.csv")
+                    with open(individual_csv, "w", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(["model", "image_index", "true_label", "predicted_label"])
+                        for mpath in model_files:
+                            try:
+                                model_name = os.path.basename(mpath)
+                                pruning_ratio = None
+                                if "r50" in mpath:
+                                    pruning_ratio = 0.5
+                                elif "r60" in mpath:
+                                    pruning_ratio = 0.6
+                                elif "r70" in mpath:
+                                    pruning_ratio = 0.7
+                                model = build_model(num_classes, pruning_ratio).to(DEVICE)
+                                state_dict = torch.load(mpath, map_location=DEVICE, weights_only=True)
+                                model.load_state_dict(state_dict)
+                                preds, _, _, _ = predict_with_energy(
+                                    model, norm_imgs, labels, mpath, os.path.join(EXPERIMENT_DIR, dset)
+                                )
+                                for idx, (true, pred) in enumerate(zip(labels.tolist(), preds)):
+                                    writer.writerow([model_name, idx, true, pred])
+                            except Exception as e:
+                                print(f"Error writing individual predictions for {mpath} ({num_images} images): {e}")
+                                continue
+                    print(f"→ Saved individual predictions to {individual_csv}")
+                except Exception as e:
+                    print(f"Error writing CSV for {dset} ({num_images} images): {e}")
 
 if __name__ == "__main__":
     main()
