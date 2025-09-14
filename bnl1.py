@@ -232,6 +232,15 @@ def build_resnet50_for_load(num_classes, in_channels=3):
 # -------------------------
 criterion = nn.CrossEntropyLoss()
 
+def stage_orig_channels(model, stage):
+    stage_dict = {
+        'layer1': model.layer1[0].conv1.out_channels,
+        'layer2': model.layer2[0].conv1.out_channels,
+        'layer3': model.layer3[0].conv1.out_channels,
+        'layer4': model.layer4[0].conv1.out_channels
+    }
+    return stage_dict[stage]
+
 def evaluate_model_basic(model, loader):
     model.eval()
     loss_total = 0.0; correct = 0; total = 0
