@@ -47,7 +47,7 @@ except Exception:
 # -------------------------
 # Config
 # -------------------------
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/experiment2"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/original_multimethod_experiment"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
