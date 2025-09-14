@@ -2,6 +2,7 @@
 """
 Progressive PGTO pruning for multiple MedMNIST datasets (fixed surgery + progressive updates + KD).
 Optimized for memory efficiency using memory-mapped data loading.
+Implements three pruning methods: regional_gradients, l1, and bn_gamma
 """
 
 import os, time, math, random, tempfile, copy

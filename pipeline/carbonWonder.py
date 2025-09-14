@@ -6,6 +6,17 @@ Optimized for memory efficiency using memory-mapped data loading.
 Outputs:
 - metrics CSV per dataset (your original metrics plus energy/emissions rows)
 - CodeCarbon emissions.csv in each dataset SAVE_DIR with detailed run info
+1. Pruning Methods: Only implements regional_gradients method
+2. Energy/Carbon Tracking: Integrates CodeCarbon for comprehensive energy and emissions monitoring, including:
+    Energy consumption during training/retraining
+    Emissions tracking for both baseline and pruned model inference
+    Break-even analysis calculations
+    Additional energy-related metrics in the output CSV
+3. Energy Analysis Features
+    Tracks energy consumption for baseline vs. pruned model inference
+    Calculates energy per prediction
+    Computes break-even points (how many predictions needed to offset retraining energy cost)
+    Measures power consumption during different phases
 """
 
 import os
