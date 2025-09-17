@@ -3,7 +3,7 @@
 Complete script to run the full factorial benchmarking experiment on all 5 MedMNIST datasets.
 Dynamically discovers all models ending in '_final.pth' and 'baseline.pth' for each dataset.
 Uses CustomResNet with uniform pruning ratios for layers 1-4, preserving conv1 at 64 channels.
-Handles both RGB and grayscale images by detecting dataset channel count.
+Handles both RGB and grayscale images by detecting dataset channel count and converting to 3 channels.
 Includes CodeCarbon for power utilization and detailed analysis with pruning method and sparsity.
 
 Dependencies: torch, torchvision, pyyaml, psutil, codecarbon, scipy, matplotlib, seaborn, pandas
@@ -220,8 +220,8 @@ def discover_models():
         models.append({"dataset": dataset, "models": dataset_models})
     return models
 
-def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None, in_channels=3):
-    """Build model architecture based on model type and load weights."""
+def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None):
+    """Build model architecture based on model type and load weights, preserving conv1 at 64 channels."""
     if not os.path.exists(model_path):
         raise ValueError(f"Model path does not exist: {model_path}")
     
@@ -242,7 +242,7 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
         layers=[3, 4, 6, 3],
         stage_planes=stage_planes,
         num_classes=num_classes,
-        in_channels=in_channels
+        in_channels=3  # Always 3 channels to match pruning code
     )
     
     state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
@@ -278,17 +278,16 @@ def set_env_threads(omp_threads=4, mkl_threads=4):
     os.environ['PYTHONHASHSEED'] = '0'
 
 class NumpyMemmapDataset(torch.utils.data.Dataset):
-    def __init__(self, imgs_np, labels_np, img_size=224, in_channels=3):
+    def __init__(self, imgs_np, labels_np, img_size=224):
         self.imgs = imgs_np
         self.labels = labels_np
         self.img_size = img_size
-        self.in_channels = in_channels
         self.base_tfms = T.Compose([
             T.ToPILImage(),
             T.Resize((img_size, img_size)),
             T.ToTensor(),
         ])
-        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) if in_channels == 3 else T.Normalize(mean=[0.5], std=[0.5])
+        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
     def __len__(self):
         return len(self.labels)
@@ -297,23 +296,18 @@ class NumpyMemmapDataset(torch.utils.data.Dataset):
         img = self.imgs[idx]
         label = int(self.labels[idx])
         x = self.base_tfms(img)
-        if self.in_channels == 1 and x.shape[0] == 1:
-            x = x.repeat(3, 1, 1) if self.in_channels == 3 else x
+        if x.shape[0] == 1:
+            x = x.repeat(3, 1, 1)  # Convert grayscale to 3 channels
         x = self.normalize(x)
         return x, label
 
 def make_test_loader(npz_path, batch_size):
     data = np.load(npz_path, mmap_mode="r")
     X_test, y_test = data["test_images"], data["test_labels"].flatten()
-    in_channels = get_dataset_channels(npz_path)
-    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, in_channels=in_channels)
-    return DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True), in_channels
+    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE)
+    return DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
 def load_model(config, num_classes, dataset_name):
-    dataset_path = DATASETS.get(dataset_name)
-    if not dataset_path:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-    in_channels = get_dataset_channels(dataset_path)
     model_path = config.experiment['model_path']
     if not os.path.exists(model_path):
         raise ValueError(f"Model not found: {model_path}")
@@ -321,8 +315,7 @@ def load_model(config, num_classes, dataset_name):
         config.experiment['model_name'],
         num_classes,
         model_path,
-        config.experiment['pruning_ratio'],
-        in_channels=in_channels
+        config.experiment['pruning_ratio']
     )
     model = model.to(config.experiment['device']).eval()
     if config.experiment['precision'] == 'amp':
@@ -415,7 +408,7 @@ def bench_fixed_time(config):
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
     # Load data
-    test_loader, in_channels = make_test_loader(dataset_path, config.experiment['batch_size'])
+    test_loader = make_test_loader(dataset_path, config.experiment['batch_size'])
 
     # Load model
     num_classes = get_num_classes(dataset_name, dataset_path)
