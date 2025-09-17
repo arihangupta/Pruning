@@ -2,7 +2,8 @@
 """
 Complete script to run the full factorial benchmarking experiment on all 5 MedMNIST datasets.
 Dynamically discovers all models ending in '_final.pth' and 'baseline.pth' for each dataset.
-Uses CustomResNet with uniform pruning ratios derived from model filenames to handle pruned models.
+Uses CustomResNet with uniform pruning ratios for layers 1-4, preserving conv1 at 64 channels.
+Handles both RGB and grayscale images by detecting dataset channel count.
 Includes CodeCarbon for power utilization and detailed analysis with pruning method and sparsity.
 
 Dependencies: torch, torchvision, pyyaml, psutil, codecarbon, scipy, matplotlib, seaborn, pandas
@@ -173,6 +174,22 @@ class CustomResNet(nn.Module):
         x = self.fc(x)
         return x
 
+def get_dataset_channels(npz_path):
+    """Detect the number of channels in the dataset's test images."""
+    try:
+        data = np.load(npz_path, mmap_mode="r")
+        test_images = data["test_images"]
+        sample_img = test_images[0]
+        if sample_img.ndim == 3:
+            return sample_img.shape[-1]  # (H, W, C)
+        elif sample_img.ndim == 2:
+            return 1  # Grayscale
+        else:
+            raise ValueError(f"Unexpected image dimensions in {npz_path}: {sample_img.shape}")
+    except Exception as e:
+        print(f"Error detecting channels for {npz_path}: {e}")
+        return 3  # Fallback to RGB
+
 def parse_model_name(filename):
     """Parse model filename to extract pruning method, sparsity, and pruning_ratio."""
     basename = os.path.basename(filename)
@@ -203,7 +220,7 @@ def discover_models():
         models.append({"dataset": dataset, "models": dataset_models})
     return models
 
-def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None):
+def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None, in_channels=3):
     """Build model architecture based on model type and load weights."""
     if not os.path.exists(model_path):
         raise ValueError(f"Model path does not exist: {model_path}")
@@ -212,9 +229,9 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
         # Baseline ResNet-50
         stage_planes = ORIGINAL_PLANES[:]
     else:
-        # Pruned model with reduced channels
+        # Pruned model: conv1 retains 64 channels, others are pruned
         stage_planes = [
-            max(1, int(math.floor(64 * (1.0 - pruning_ratio)))),
+            64,  # conv1 always has 64 output channels
             max(1, int(math.floor(128 * (1.0 - pruning_ratio)))),
             max(1, int(math.floor(256 * (1.0 - pruning_ratio)))),
             max(1, int(math.floor(512 * (1.0 - pruning_ratio))))
@@ -225,7 +242,7 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
         layers=[3, 4, 6, 3],
         stage_planes=stage_planes,
         num_classes=num_classes,
-        in_channels=3
+        in_channels=in_channels
     )
     
     state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
@@ -261,16 +278,17 @@ def set_env_threads(omp_threads=4, mkl_threads=4):
     os.environ['PYTHONHASHSEED'] = '0'
 
 class NumpyMemmapDataset(torch.utils.data.Dataset):
-    def __init__(self, imgs_np, labels_np, img_size=224):
+    def __init__(self, imgs_np, labels_np, img_size=224, in_channels=3):
         self.imgs = imgs_np
         self.labels = labels_np
         self.img_size = img_size
+        self.in_channels = in_channels
         self.base_tfms = T.Compose([
             T.ToPILImage(),
             T.Resize((img_size, img_size)),
             T.ToTensor(),
         ])
-        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) if in_channels == 3 else T.Normalize(mean=[0.5], std=[0.5])
 
     def __len__(self):
         return len(self.labels)
@@ -279,18 +297,23 @@ class NumpyMemmapDataset(torch.utils.data.Dataset):
         img = self.imgs[idx]
         label = int(self.labels[idx])
         x = self.base_tfms(img)
-        if x.shape[0] == 1:
-            x = x.repeat(3, 1, 1)
+        if self.in_channels == 1 and x.shape[0] == 1:
+            x = x.repeat(3, 1, 1) if self.in_channels == 3 else x
         x = self.normalize(x)
         return x, label
 
 def make_test_loader(npz_path, batch_size):
     data = np.load(npz_path, mmap_mode="r")
     X_test, y_test = data["test_images"], data["test_labels"].flatten()
-    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE)
-    return DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    in_channels = get_dataset_channels(npz_path)
+    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, in_channels=in_channels)
+    return DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True), in_channels
 
 def load_model(config, num_classes, dataset_name):
+    dataset_path = DATASETS.get(dataset_name)
+    if not dataset_path:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    in_channels = get_dataset_channels(dataset_path)
     model_path = config.experiment['model_path']
     if not os.path.exists(model_path):
         raise ValueError(f"Model not found: {model_path}")
@@ -298,7 +321,8 @@ def load_model(config, num_classes, dataset_name):
         config.experiment['model_name'],
         num_classes,
         model_path,
-        config.experiment['pruning_ratio']
+        config.experiment['pruning_ratio'],
+        in_channels=in_channels
     )
     model = model.to(config.experiment['device']).eval()
     if config.experiment['precision'] == 'amp':
@@ -391,7 +415,7 @@ def bench_fixed_time(config):
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
     # Load data
-    test_loader = make_test_loader(dataset_path, config.experiment['batch_size'])
+    test_loader, in_channels = make_test_loader(dataset_path, config.experiment['batch_size'])
 
     # Load model
     num_classes = get_num_classes(dataset_name, dataset_path)
