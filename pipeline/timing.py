@@ -1,4 +1,4 @@
-```python
+
 #!/usr/bin/env python3
 """
 Complete script to run the full factorial benchmarking experiment on all 5 MedMNIST datasets.
@@ -705,4 +705,3 @@ if __name__ == "__main__":
     print("All runs complete. Running analysis...")
     run_full_analysis(Path(MATRIX_CONFIG['log_dir']))
     print("Full process complete! Check time_experiment_results/ for outputs.")
-```
