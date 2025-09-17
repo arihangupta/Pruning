@@ -82,8 +82,8 @@ MATRIX_CONFIG = {
     "num_workers": 4,
     "pin_memory": True,
     "batch_sizes": [1, 8, 32, 128],
-    "precisions": ["fp32", "amp"],
-    "repeats": 7
+    "precisions": ["fp32"],
+    "repeats": 3
 }
 
 # Use the proven CustomResNet class from the first script
