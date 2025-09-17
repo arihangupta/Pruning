@@ -1,9 +1,8 @@
-
 #!/usr/bin/env python3
 """
 Complete script to run the full factorial benchmarking experiment on all 5 MedMNIST datasets.
 Dynamically discovers all models ending in '_final.pth' and 'baseline.pth' for each dataset.
-Uses CustomResNet with layer-specific channel counts inferred from checkpoints to handle pruned models.
+Uses CustomResNet with uniform pruning ratios derived from model filenames to handle pruned models.
 Includes CodeCarbon for power utilization and detailed analysis with pruning method and sparsity.
 
 Dependencies: torch, torchvision, pyyaml, psutil, codecarbon, scipy, matplotlib, seaborn, pandas
@@ -116,10 +115,10 @@ class Bottleneck(nn.Module):
         return out
 
 class CustomResNet(nn.Module):
-    def __init__(self, block=Bottleneck, layers=[3, 4, 6, 3], stage_planes=[64, 128, 256, 512], num_classes=1000):
+    def __init__(self, block=Bottleneck, layers=[3, 4, 6, 3], stage_planes=[64, 128, 256, 512], num_classes=1000, in_channels=3):
         super().__init__()
         self.inplanes = stage_planes[0]
-        self.conv1 = nn.Conv2d(3, stage_planes[0], kernel_size=7, stride=2, padding=3, bias=False)
+        self.conv1 = nn.Conv2d(in_channels, stage_planes[0], kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = nn.BatchNorm2d(stage_planes[0])
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
@@ -174,43 +173,20 @@ class CustomResNet(nn.Module):
         x = self.fc(x)
         return x
 
-def infer_stage_planes(state_dict):
-    """Infer stage_planes from the checkpoint's state_dict."""
-    # Extract channel counts from key layers
-    stage_planes = []
-    
-    # conv1: input to first stage
-    conv1_weight = state_dict.get('conv1.weight')
-    if conv1_weight is None:
-        raise ValueError("Checkpoint missing 'conv1.weight'")
-    stage_planes.append(conv1_weight.shape[0])  # Output channels of conv1
-
-    # layer1 to layer4: use the first bottleneck's conv1 input channels
-    for layer_idx in range(1, 5):
-        key = f'layer{layer_idx}.0.conv1.weight'
-        weight = state_dict.get(key)
-        if weight is None:
-            raise ValueError(f"Checkpoint missing '{key}'")
-        # conv1 in Bottleneck takes inplanes, outputs planes
-        planes = weight.shape[0]  # Output channels
-        stage_planes.append(planes)
-
-    return stage_planes
-
 def parse_model_name(filename):
-    """Parse model filename to extract pruning method, sparsity, and keep_ratio."""
+    """Parse model filename to extract pruning method, sparsity, and pruning_ratio."""
     basename = os.path.basename(filename)
     if basename == "baseline.pth":
-        return {"model_name": "baseline", "pruning_method": "baseline", "sparsity": "0%", "keep_ratio": 1.0}
+        return {"model_name": "baseline", "pruning_method": "baseline", "sparsity": "0%", "pruning_ratio": None}
     # Match files ending in _final.pth
     match = re.match(r"(.+)_r(\d+)pruned_final\.pth$", basename)
     if not match:
         return None
     method, sparsity_str = match.groups()
     sparsity = int(sparsity_str)
-    keep_ratio = 1.0 - (sparsity / 100.0)  # Nominal keep_ratio, may not be used
+    pruning_ratio = float(sparsity) / 100.0
     model_name = f"{method}_r{sparsity}"
-    return {"model_name": model_name, "pruning_method": method, "sparsity": f"{sparsity}%", "keep_ratio": keep_ratio}
+    return {"model_name": model_name, "pruning_method": method, "sparsity": f"{sparsity}%", "pruning_ratio": pruning_ratio}
 
 def discover_models():
     """Dynamically discover all models ending in _final.pth and baseline.pth for each dataset."""
@@ -227,29 +203,36 @@ def discover_models():
         models.append({"dataset": dataset, "models": dataset_models})
     return models
 
-def build_model_for_load(model_name, num_classes, model_path, keep_ratio=1.0):
+def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None):
     """Build model architecture based on model type and load weights."""
     if not os.path.exists(model_path):
         raise ValueError(f"Model path does not exist: {model_path}")
     
-    # Load state_dict to infer architecture
-    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-    
-    if "baseline" in model_name:
-        # Use full planes for baseline
+    if pruning_ratio is None:
+        # Baseline ResNet-50
         stage_planes = ORIGINAL_PLANES[:]
     else:
-        # Infer stage_planes from checkpoint
-        try:
-            stage_planes = infer_stage_planes(state_dict)
-        except Exception as e:
-            raise ValueError(f"Failed to infer stage_planes from checkpoint {model_path}: {e}")
+        # Pruned model with reduced channels
+        stage_planes = [
+            max(1, int(math.floor(64 * (1.0 - pruning_ratio)))),
+            max(1, int(math.floor(128 * (1.0 - pruning_ratio)))),
+            max(1, int(math.floor(256 * (1.0 - pruning_ratio)))),
+            max(1, int(math.floor(512 * (1.0 - pruning_ratio))))
+        ]
     
-    model = CustomResNet(block=Bottleneck, layers=[3, 4, 6, 3], stage_planes=stage_planes, num_classes=num_classes)
+    model = CustomResNet(
+        block=Bottleneck,
+        layers=[3, 4, 6, 3],
+        stage_planes=stage_planes,
+        num_classes=num_classes,
+        in_channels=3
+    )
+    
+    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
     try:
         model.load_state_dict(state_dict)
     except Exception as e:
-        raise RuntimeError(f"Error loading state_dict for {model_name}: {e}")
+        raise RuntimeError(f"Error loading state_dict for {model_name} at {model_path}: {e}")
     return model
 
 # Update MATRIX_CONFIG with discovered models
@@ -315,7 +298,7 @@ def load_model(config, num_classes, dataset_name):
         config.experiment['model_name'],
         num_classes,
         model_path,
-        config.experiment['keep_ratio']
+        config.experiment['pruning_ratio']
     )
     model = model.to(config.experiment['device']).eval()
     if config.experiment['precision'] == 'amp':
@@ -589,7 +572,7 @@ def run_matrix(matrix_config):
                     'model_name': model_cfg['model_name'],
                     'pruning_method': model_cfg['pruning_method'],
                     'sparsity': model_cfg['sparsity'],
-                    'keep_ratio': model_cfg['keep_ratio'],
+                    'pruning_ratio': model_cfg['pruning_ratio'],
                     'model_path': model_cfg['model_path'],
                     'batch_size': bs,
                     'precision': prec,
