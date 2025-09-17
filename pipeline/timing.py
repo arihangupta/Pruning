@@ -3,7 +3,7 @@
 """
 Complete script to run the full factorial benchmarking experiment on all 5 MedMNIST datasets.
 Dynamically discovers all models ending in '_final.pth' and 'baseline.pth' for each dataset.
-Uses CustomResNet to account for reduced channels/neurons in pruned models.
+Uses CustomResNet with layer-specific channel counts inferred from checkpoints to handle pruned models.
 Includes CodeCarbon for power utilization and detailed analysis with pruning method and sparsity.
 
 Dependencies: torch, torchvision, pyyaml, psutil, codecarbon, scipy, matplotlib, seaborn, pandas
@@ -24,7 +24,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torchvision import models, transforms as T
+from torchvision import transforms as T
 from collections import defaultdict
 from typing import Dict, Any
 import psutil
@@ -33,7 +33,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from dataclasses import dataclass
 from pathlib import Path
-import hashlib
 import subprocess as sp
 import sys
 from itertools import product
@@ -175,6 +174,29 @@ class CustomResNet(nn.Module):
         x = self.fc(x)
         return x
 
+def infer_stage_planes(state_dict):
+    """Infer stage_planes from the checkpoint's state_dict."""
+    # Extract channel counts from key layers
+    stage_planes = []
+    
+    # conv1: input to first stage
+    conv1_weight = state_dict.get('conv1.weight')
+    if conv1_weight is None:
+        raise ValueError("Checkpoint missing 'conv1.weight'")
+    stage_planes.append(conv1_weight.shape[0])  # Output channels of conv1
+
+    # layer1 to layer4: use the first bottleneck's conv1 input channels
+    for layer_idx in range(1, 5):
+        key = f'layer{layer_idx}.0.conv1.weight'
+        weight = state_dict.get(key)
+        if weight is None:
+            raise ValueError(f"Checkpoint missing '{key}'")
+        # conv1 in Bottleneck takes inplanes, outputs planes
+        planes = weight.shape[0]  # Output channels
+        stage_planes.append(planes)
+
+    return stage_planes
+
 def parse_model_name(filename):
     """Parse model filename to extract pruning method, sparsity, and keep_ratio."""
     basename = os.path.basename(filename)
@@ -186,7 +208,7 @@ def parse_model_name(filename):
         return None
     method, sparsity_str = match.groups()
     sparsity = int(sparsity_str)
-    keep_ratio = 1.0 - (sparsity / 100.0)
+    keep_ratio = 1.0 - (sparsity / 100.0)  # Nominal keep_ratio, may not be used
     model_name = f"{method}_r{sparsity}"
     return {"model_name": model_name, "pruning_method": method, "sparsity": f"{sparsity}%", "keep_ratio": keep_ratio}
 
@@ -207,16 +229,27 @@ def discover_models():
 
 def build_model_for_load(model_name, num_classes, model_path, keep_ratio=1.0):
     """Build model architecture based on model type and load weights."""
+    if not os.path.exists(model_path):
+        raise ValueError(f"Model path does not exist: {model_path}")
+    
+    # Load state_dict to infer architecture
+    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+    
     if "baseline" in model_name:
         # Use full planes for baseline
         stage_planes = ORIGINAL_PLANES[:]
     else:
-        # For pruned models, compute stage_planes based on keep_ratio
-        stage_planes = [max(1, int(p * keep_ratio)) for p in ORIGINAL_PLANES]
+        # Infer stage_planes from checkpoint
+        try:
+            stage_planes = infer_stage_planes(state_dict)
+        except Exception as e:
+            raise ValueError(f"Failed to infer stage_planes from checkpoint {model_path}: {e}")
+    
     model = CustomResNet(block=Bottleneck, layers=[3, 4, 6, 3], stage_planes=stage_planes, num_classes=num_classes)
-    if os.path.exists(model_path):
-        state = torch.load(model_path, map_location="cpu")
-        model.load_state_dict(state)
+    try:
+        model.load_state_dict(state_dict)
+    except Exception as e:
+        raise RuntimeError(f"Error loading state_dict for {model_name}: {e}")
     return model
 
 # Update MATRIX_CONFIG with discovered models
@@ -379,7 +412,11 @@ def bench_fixed_time(config):
 
     # Load model
     num_classes = get_num_classes(dataset_name, dataset_path)
-    model = load_model(config, num_classes, dataset_name)
+    try:
+        model = load_model(config, num_classes, dataset_name)
+    except Exception as e:
+        print(f"Failed to load model {config.experiment['model_name']}: {e}")
+        raise
 
     # Logs
     log_dir = Path(config.log_dir)
