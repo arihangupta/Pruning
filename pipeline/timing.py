@@ -3,7 +3,7 @@
 Complete script to run the full factorial benchmarking experiment on all 5 MedMNIST datasets.
 Dynamically discovers all models ending in '_final.pth' and 'baseline.pth' for each dataset.
 Uses CustomResNet with uniform pruning ratios for layers 1-4, preserving conv1 at 64 channels.
-Handles both RGB and grayscale images by detecting dataset channel count and converting to 3 channels.
+Handles both RGB and grayscale images by detecting dataset channel count.
 Includes CodeCarbon for power utilization and detailed analysis with pruning method and sparsity.
 
 Dependencies: torch, torchvision, pyyaml, psutil, codecarbon, scipy, matplotlib, seaborn, pandas
@@ -48,6 +48,9 @@ except Exception:
     CODECARBON_AVAILABLE = False
     print("Warning: codecarbon not available. Energy/emissions will be NaN.")
 
+# Import the proven Bottleneck class from torchvision
+from torchvision.models.resnet import Bottleneck
+
 # Constants
 IMG_SIZE = 224
 SEED = 42
@@ -83,44 +86,13 @@ MATRIX_CONFIG = {
     "repeats": 7
 }
 
-class Bottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
-                               padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, planes * self.expansion, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        identity = x
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-        out = self.conv3(out)
-        out = self.bn3(out)
-        if self.downsample is not None:
-            identity = self.downsample(x)
-        out += identity
-        out = self.relu(out)
-        return out
-
+# Use the proven CustomResNet class from the first script
 class CustomResNet(nn.Module):
     def __init__(self, block=Bottleneck, layers=[3, 4, 6, 3], stage_planes=[64, 128, 256, 512], num_classes=1000, in_channels=3):
         super().__init__()
-        self.inplanes = stage_planes[0]
-        self.conv1 = nn.Conv2d(in_channels, stage_planes[0], kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(stage_planes[0])
+        self.inplanes = 64
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.stage_planes = stage_planes[:]
@@ -132,20 +104,6 @@ class CustomResNet(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(stage_planes[3] * block.expansion, num_classes)
 
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, 0, 0.01)
-            nn.init.constant_(m.bias, 0)
-
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
@@ -154,7 +112,7 @@ class CustomResNet(nn.Module):
                 nn.BatchNorm2d(planes * block.expansion),
             )
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample))
+        layers.append(block(self.inplanes, planes, stride=stride, downsample=downsample))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
             layers.append(block(self.inplanes, planes))
@@ -173,6 +131,33 @@ class CustomResNet(nn.Module):
         x = torch.flatten(x, 1)
         x = self.fc(x)
         return x
+
+# Use the proven build_model function from the first script
+def build_model(num_classes: int, pruning_ratio=None):
+    """
+    Build a ResNet-50 model with the right classifier head and optional pruning.
+    Always use in_channels=3 to match pruning code's expectation.
+    pruning_ratio: None for baseline, or 0.5, 0.6, 0.7 for pruned models.
+    """
+    if pruning_ratio is None:
+        # Baseline ResNet-50
+        stage_planes = [64, 128, 256, 512]
+    else:
+        # Pruned model with reduced channels
+        stage_planes = [
+            max(1, int(math.floor(64 * (1.0 - pruning_ratio)))),
+            max(1, int(math.floor(128 * (1.0 - pruning_ratio)))),
+            max(1, int(math.floor(256 * (1.0 - pruning_ratio)))),
+            max(1, int(math.floor(512 * (1.0 - pruning_ratio))))
+        ]
+    model = CustomResNet(
+        block=Bottleneck,
+        layers=[3, 4, 6, 3],
+        stage_planes=stage_planes,
+        num_classes=num_classes,
+        in_channels=3  # Always 3 channels to match pruning code
+    )
+    return model
 
 def get_dataset_channels(npz_path):
     """Detect the number of channels in the dataset's test images."""
@@ -220,31 +205,16 @@ def discover_models():
         models.append({"dataset": dataset, "models": dataset_models})
     return models
 
-def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None):
-    """Build model architecture based on model type and load weights, preserving conv1 at 64 channels."""
+# Replace the problematic build_model_for_load with the working logic
+def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None, in_channels=3):
+    """Build model architecture based on model type and load weights using proven logic."""
     if not os.path.exists(model_path):
         raise ValueError(f"Model path does not exist: {model_path}")
     
-    if pruning_ratio is None:
-        # Baseline ResNet-50
-        stage_planes = ORIGINAL_PLANES[:]
-    else:
-        # Pruned model: conv1 retains 64 channels, others are pruned
-        stage_planes = [
-            64,  # conv1 always has 64 output channels
-            max(1, int(math.floor(128 * (1.0 - pruning_ratio)))),
-            max(1, int(math.floor(256 * (1.0 - pruning_ratio)))),
-            max(1, int(math.floor(512 * (1.0 - pruning_ratio))))
-        ]
+    # Use the proven build_model function
+    model = build_model(num_classes, pruning_ratio)
     
-    model = CustomResNet(
-        block=Bottleneck,
-        layers=[3, 4, 6, 3],
-        stage_planes=stage_planes,
-        num_classes=num_classes,
-        in_channels=3  # Always 3 channels to match pruning code
-    )
-    
+    # Load state dict with weights_only=True for security
     state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
     try:
         model.load_state_dict(state_dict)
@@ -278,15 +248,17 @@ def set_env_threads(omp_threads=4, mkl_threads=4):
     os.environ['PYTHONHASHSEED'] = '0'
 
 class NumpyMemmapDataset(torch.utils.data.Dataset):
-    def __init__(self, imgs_np, labels_np, img_size=224):
+    def __init__(self, imgs_np, labels_np, img_size=224, in_channels=3):
         self.imgs = imgs_np
         self.labels = labels_np
         self.img_size = img_size
+        self.in_channels = in_channels
         self.base_tfms = T.Compose([
             T.ToPILImage(),
             T.Resize((img_size, img_size)),
             T.ToTensor(),
         ])
+        # Always use ImageNet normalization since we convert everything to 3 channels
         self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
     def __len__(self):
@@ -296,18 +268,26 @@ class NumpyMemmapDataset(torch.utils.data.Dataset):
         img = self.imgs[idx]
         label = int(self.labels[idx])
         x = self.base_tfms(img)
-        if x.shape[0] == 1:
-            x = x.repeat(3, 1, 1)  # Convert grayscale to 3 channels
+        
+        # Always convert to 3 channels to match model expectation
+        if x.shape[0] == 1:  # Grayscale
+            x = x.repeat(3, 1, 1)
+        
         x = self.normalize(x)
         return x, label
 
 def make_test_loader(npz_path, batch_size):
     data = np.load(npz_path, mmap_mode="r")
     X_test, y_test = data["test_images"], data["test_labels"].flatten()
-    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE)
-    return DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    in_channels = get_dataset_channels(npz_path)
+    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, in_channels=in_channels)
+    return DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True), in_channels
 
 def load_model(config, num_classes, dataset_name):
+    dataset_path = DATASETS.get(dataset_name)
+    if not dataset_path:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    in_channels = get_dataset_channels(dataset_path)
     model_path = config.experiment['model_path']
     if not os.path.exists(model_path):
         raise ValueError(f"Model not found: {model_path}")
@@ -315,7 +295,8 @@ def load_model(config, num_classes, dataset_name):
         config.experiment['model_name'],
         num_classes,
         model_path,
-        config.experiment['pruning_ratio']
+        config.experiment['pruning_ratio'],
+        in_channels=in_channels  # This parameter is not used in the new function, but kept for compatibility
     )
     model = model.to(config.experiment['device']).eval()
     if config.experiment['precision'] == 'amp':
@@ -408,7 +389,7 @@ def bench_fixed_time(config):
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
     # Load data
-    test_loader = make_test_loader(dataset_path, config.experiment['batch_size'])
+    test_loader, in_channels = make_test_loader(dataset_path, config.experiment['batch_size'])
 
     # Load model
     num_classes = get_num_classes(dataset_name, dataset_path)
