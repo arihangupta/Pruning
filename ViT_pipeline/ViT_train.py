@@ -231,11 +231,13 @@ criterion = nn.CrossEntropyLoss()
 # DINO pretraining
 # -------------------------
 def train_dino(model: nn.Module, pretrain_loader: DataLoader, epochs: int, out_dim=PROJ_OUT_DIM):
+    model = model.to(DEVICE)   ### FIX ensure student on device
     opt = make_optimizer(model)
     n_batches = len(pretrain_loader)
     scheduler = CosineAnnealingLR(opt, T_max=epochs * n_batches)
+
     # create teacher initialized as copy of student
-    teacher = build_model(out_dim, pretrain=True)
+    teacher = build_model(out_dim, pretrain=True).to(DEVICE)   ### FIX ensure teacher on device
     teacher.load_state_dict(model.state_dict())
     for p in teacher.parameters():
         p.requires_grad = False
@@ -385,16 +387,14 @@ def run_dataset(npz_path: str, freeze_backbone=False):
 
     # DINO Pretraining
     print("\n--- DINO Pretraining ---")
-    dino_model = build_model(PROJ_OUT_DIM, pretrain=True)
+    dino_model = build_model(PROJ_OUT_DIM, pretrain=True).to(DEVICE)   ### FIX
     train_dino(dino_model, pretrain_loader, PRETRAIN_EPOCHS, out_dim=PROJ_OUT_DIM)
     dino_pre_path = os.path.join(SAVE_DIR, f"{ds_name}_dino_pretrained.pth")
     torch.save(dino_model.state_dict(), dino_pre_path)
-    print(f"Saved DINO pretrained model to {dino_pre_path}")
 
     # Fine-tuning with pretrained weights
     print("\n--- Baseline Fine-tuning ---")
-    model = build_model(num_classes, pretrain=False, freeze_backbone=freeze_backbone)
-    # Copy backbone weights from dino_model to classifier model's backbone
+    model = build_model(num_classes, pretrain=False, freeze_backbone=freeze_backbone).to(DEVICE)   ### FIX
     model.backbone.load_state_dict(dino_model.backbone.state_dict())
     train_model(model, train_loader, val_loader, FINETUNE_EPOCHS)
     baseline_loss, baseline_acc, baseline_auc = evaluate_model(model, test_loader)
