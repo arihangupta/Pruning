@@ -46,8 +46,8 @@ PRUNE_RATIO = 0.1
 FINETUNE_EPOCHS = 10
 FINETUNE_EPOCHS_PER_PRUNE = 2
 BATCH_SIZE = 32
-SALIENCY_BATCH_SIZE = 4
-SALIENCY_NUM_BATCHES = 5
+SALIENCY_BATCH_SIZE = 2  # Further reduced
+SALIENCY_NUM_BATCHES = 3  # Further reduced
 LR = 5e-5
 ETA = 1.0
 IMG_SIZE = 224
@@ -199,13 +199,14 @@ def compute_hessian_saliency(model: nn.Module, loader: DataLoader, criterion) ->
         with autocast(dtype=torch.bfloat16):
             outputs = checkpoint.checkpoint(model, images)
             loss = criterion(outputs, labels)
-        scaler.scale(loss).backward(create_graph=True)
+        loss.backward(create_graph=True, retain_graph=True)  # Ensure retain_graph
         for name, param in model.named_parameters():
             if param.requires_grad and "backbone" in name and "weight" in name:
                 grad = param.grad
-                hessian_diag = torch.autograd.grad(loss, param, grad_outputs=grad, retain_graph=True)[0].diagonal()
-                norm = hessian_diag.norm().item()
-                hessian_norms[name] = hessian_norms.get(name, 0) + norm
+                if grad is not None and grad.requires_grad:
+                    hessian_diag = torch.autograd.grad(loss, param, grad_outputs=grad, retain_graph=True)[0].diagonal()
+                    norm = hessian_diag.norm().item()
+                    hessian_norms[name] = hessian_norms.get(name, 0) + norm
         model.zero_grad()
         torch.cuda.empty_cache()
         if i >= SALIENCY_NUM_BATCHES - 1:
@@ -322,11 +323,11 @@ def evaluate_model(model: nn.Module, loader: DataLoader) -> Tuple[float, float, 
 def count_params_flops(model: nn.Module, input_size=(1, 3, 224, 224)) -> Tuple[float, float]:
     input_tensor = torch.randn(*input_size).to(DEVICE)
     macs, params = profile(model, inputs=(input_tensor,))
-    # Convert FLOPs → MACs and scale to millions
-    macs_m = macs / 1e6
-    params_m = params / 1e6
-    return macs_m, params_m
-
+    macs_str, params_str = clever_format([macs, params], "%.3f")
+    # Extract numeric value before unit (e.g., '5.525G' -> 5.525)
+    macs_val = float(macs_str.split()[0])
+    params_val = float(params_str.split()[0])
+    return macs_val, params_val
 
 # -------------------------
 # Dataset runner
