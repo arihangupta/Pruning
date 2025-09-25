@@ -159,7 +159,9 @@ class ViTClassifier(nn.Module):
         return dims
 
     def forward(self, x):
-        x = self.backbone(x)[:, 0]  # CLS token
+        x = self.backbone(x)
+        if len(x.shape) == 3:
+            x = x[:, 0]  # CLS if sequence
         x = self.head(x)
         return x
 
