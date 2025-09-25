@@ -318,8 +318,12 @@ def evaluate_model(model: nn.Module, loader: DataLoader) -> Tuple[float, float, 
 def count_params_flops(model: nn.Module, input_size=(1, 3, 224, 224)) -> Tuple[float, float]:
     input_tensor = torch.randn(*input_size).to(DEVICE)
     macs, params = profile(model, inputs=(input_tensor,))
-    macs, params = clever_format([macs, params], "%.3f")
-    return float(macs.split()[0]), float(params.split()[0])
+    
+    # Convert to millions for consistent reporting
+    macs_millions = macs / 1e6
+    params_millions = params / 1e6
+    
+    return macs_millions, params_millions
 
 # -------------------------
 # Dataset runner
