@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-prune_and_fine_tune_from_dino.py
+dgmr_prune_and_fine_tune.py
 
-Loads the DINO pretrained model from the trials directory, applies global structural pruning with
-a data-aware gradient saliency (cheap approximation of Hessian saliency),
-fine-tunes the pruned model for a few epochs, and reports test accuracy, AUC, etc.
+Loads the DINO pretrained model from the trials directory, applies Diversity-Guided MLP Reduction (DGMR) from the arXiv paper,
+fine-tunes the pruned model for 10 epochs, and reports test accuracy, AUC, etc.
+Mimics the provided CNN script structure.
+Reduces MLP hidden dimensions while preserving diversity.
 
-Mimics provided CNN script structure. Reduces model size by pruning embedding, heads, QK, V, and MLP dimensions.
-Memory-friendly (no create_graph Hessian passes).
 Requires: torch, torchvision, numpy, thop (for FLOPs), (scikit-learn for AUC)
+Install thop: pip install thop
 DINOv2 loaded via torch.hub.
 """
 import os
@@ -16,7 +16,7 @@ import time
 import random
 import csv
 import numpy as np
-from typing import Tuple, Dict
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -25,8 +25,6 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from thop import profile, clever_format
-from torch.cuda.amp import autocast, GradScaler
-import torch.utils.checkpoint as checkpoint
 
 try:
     from sklearn.metrics import roc_auc_score
@@ -40,15 +38,10 @@ except Exception:
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
 TRIALS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/trials"
 
-PRUNE_ITERATIONS = 5
-PRUNE_RATIO = 0.1
+TARGET_EXPANSION_RATIO = 1  # r=1 as in paper (hidden = input dim)
 FINETUNE_EPOCHS = 10
-FINETUNE_EPOCHS_PER_PRUNE = 2
 BATCH_SIZE = 32
-SALIENCY_BATCH_SIZE = 2
-SALIENCY_NUM_BATCHES = 3
 LR = 5e-5
-ETA = 1.0
 IMG_SIZE = 224
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LOG_INTERVAL = 20
@@ -105,7 +98,7 @@ class NumpyMemmapDataset(Dataset):
         x = self.normalize(x)
         return x, label
 
-def make_loaders(npz_path: str) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader, int, str]:
+def make_loaders(npz_path: str) -> Tuple[DataLoader, DataLoader, DataLoader, int, str]:
     print(f"\nLoading {npz_path} ...")
     data = np.load(npz_path, mmap_mode="r")
 
@@ -126,8 +119,6 @@ def make_loaders(npz_path: str) -> Tuple[DataLoader, DataLoader, DataLoader, Dat
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=2, pin_memory=True)
-    saliency_loader = DataLoader(train_ds, batch_size=SALIENCY_BATCH_SIZE, shuffle=True,
-                                 num_workers=2, pin_memory=True)
     val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=2, pin_memory=True)
     test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
@@ -135,7 +126,7 @@ def make_loaders(npz_path: str) -> Tuple[DataLoader, DataLoader, DataLoader, Dat
 
     num_classes = int(len(np.unique(np.concatenate([y_train, y_val, y_test]))))
     ds_name = os.path.splitext(os.path.basename(npz_path))[0]
-    return train_loader, saliency_loader, val_loader, test_loader, num_classes, ds_name
+    return train_loader, val_loader, test_loader, num_classes, ds_name
 
 # -------------------------
 # Model / prune / train / eval
@@ -148,27 +139,9 @@ class ViTClassifier(nn.Module):
         if freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
-        # Store original dimensions for pruning
-        self.orig_dims = self._extract_dims()
-
-    def _extract_dims(self):
-        dims = {}
-        for name, module in self.backbone.named_modules():
-            if isinstance(module, nn.Linear):
-                if "qkv" in name:
-                    dims[name + "_qk"] = module.weight.shape[1]  # QK dim
-                    dims[name + "_h"] = module.weight.shape[0] // 384  # Heads
-                elif "fc1" in name:
-                    dims[name + "_mlp_in"] = module.weight.shape[1]
-                    dims[name + "_mlp_out"] = module.weight.shape[0]
-                elif "fc2" in name:
-                    dims[name + "_mlp_out"] = module.weight.shape[1]
-        return dims
 
     def forward(self, x):
-        x = self.backbone(x)
-        if x.dim() == 3:
-            x = x[:, 0]  # CLS token
+        x = self.backbone(x)[:, 0]  # CLS token
         x = self.head(x)
         return x
 
@@ -181,117 +154,39 @@ def build_model(num_classes: int, freeze_backbone=False) -> nn.Module:
 def load_dino_pretrained(model: nn.Module, ds_name: str):
     pretrained_path = os.path.join(TRIALS_DIR, f"{ds_name}_dino_pretrained.pth")
     print(f"Loading DINO pretrained weights from {pretrained_path}...")
-    pretrained_dict = torch.load(pretrained_path, map_location=DEVICE, weights_only=True)
+    pretrained_dict = torch.load(pretrained_path, map_location=DEVICE)
     backbone_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items() if k.startswith("backbone.")}
     model.backbone.load_state_dict(backbone_dict, strict=False)
     print("Loaded DINO pretrained backbone successfully.")
 
-def compute_gradient_saliency(model: nn.Module,
-                              loader: DataLoader,
-                              criterion,
-                              num_batches: int = SALIENCY_NUM_BATCHES) -> Dict[str, float]:
-    """
-    Data-aware gradient saliency:
-      - Runs `num_batches` batches from `loader`
-      - Accumulates per-parameter L1 gradient magnitudes for backbone weight params
-      - Returns dict: parameter_name -> average_score (higher => more important)
-    This is much cheaper and robust compared to second-order/Hessian-based computations.
-    """
-    model.train()  # allow gradients
-    saliency: Dict[str, float] = {}
-    # zero grads
-    for p in model.parameters():
-        if p.grad is not None:
-            p.grad = None
-
-    batches = 0
-    for images, labels in loader:
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
-
-        # Forward + backward (no create_graph, no AMP/GradScaler here for saliency pass)
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-
-        model.zero_grad()
-        loss.backward()
-
-        # accumulate L1 of gradients for backbone weight tensors
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            # only backbone weights (you used "backbone" substring earlier)
-            if "backbone" not in name or "weight" not in name:
-                continue
-            g = param.grad
-            if g is None:
-                continue
-            score = float(g.abs().sum().cpu().item())
-            saliency[name] = saliency.get(name, 0.0) + score
-
-        batches += 1
-        if batches >= num_batches:
-            break
-
-    # average over batches
-    if batches > 0:
-        for k in list(saliency.keys()):
-            saliency[k] /= float(batches)
-
-    model.eval()
-    # make sure gradients are cleared to free memory
-    model.zero_grad()
-    torch.cuda.empty_cache()
-    return saliency
-
-
-def estimate_latency_reduction(model: nn.Module, orig_dims: Dict, new_dims: Dict) -> float:
-    total_ops = sum([orig_dims.get(k, 0) for k in orig_dims if "mlp" in k or "qk" in k or "h" in k])
-    new_ops = sum([new_dims.get(k, 0) for k in new_dims if "mlp" in k or "qk" in k or "h" in k])
-    return 1 - (new_ops / max(1, total_ops))
-
-def prune_model(model: nn.Module, prune_ratio: float, hessian_norms: Dict) -> None:
-    orig_dims = model.orig_dims.copy()
-    new_dims = orig_dims.copy()
-    # Latency-aware saliency
-    norm_sum = sum(hessian_norms.values()) if len(hessian_norms) > 0 else 1.0
-    saliency = {k: v / norm_sum * (1 + ETA * estimate_latency_reduction(model, orig_dims, new_dims)) for k, v in hessian_norms.items()}
-    # Sort and prune lowest saliency
-    sorted_saliency = sorted(saliency.items(), key=lambda x: x[1])
-    total_prune = int(len(sorted_saliency) * prune_ratio)
-    pruned_params = sorted_saliency[:total_prune]
-    for param_name, _ in pruned_params:
-        # Prune dimensions based on param type
-        layer = param_name.split('.')[1] if '.' in param_name else param_name
-        if "qkv" in param_name:
-            new_dims[f"{layer}_qk"] = max(1, int(new_dims.get(f"{layer}_qk", 0) * 0.9))
-            new_dims[f"{layer}_h"] = max(1, int(new_dims.get(f"{layer}_h", 0) * 0.9))
-        elif "fc1" in param_name:
-            new_dims[f"{layer}_mlp_in"] = max(1, int(new_dims.get(f"{layer}_mlp_in", 0) * 0.9))
-        elif "fc2" in param_name:
-            new_dims[f"{layer}_mlp_out"] = max(1, int(new_dims.get(f"{layer}_mlp_out", 0) * 0.9))
-    # Apply new dimensions to model layers
+def dgmr_prune_mlp(model: nn.Module, target_r: int = 1):
+    print("\n--- Applying DGMR Pruning ---")
     for name, module in model.backbone.named_modules():
-        if isinstance(module, nn.Linear):
-            if "qkv" in name:
-                dim_qk = new_dims.get(f"{name.split('.')[1]}_qk", module.weight.shape[1])
-                dim_h = new_dims.get(f"{name.split('.')[1]}_h", module.weight.shape[0] // 384)
-                module.weight.data = module.weight.data[:dim_h * 384, :dim_qk]
-                if module.bias is not None:
-                    module.bias.data = module.bias.data[:dim_h * 384]
-                module.out_features = dim_h * 384
-                module.in_features = dim_qk
-            elif "fc1" in name:
-                dim_in = new_dims.get(f"{name.split('.')[1]}_mlp_in", module.weight.shape[1])
-                module.weight.data = module.weight.data[:, :dim_in]
-                if module.bias is not None:
-                    module.bias.data = module.bias.data[:dim_in]
-                module.in_features = dim_in
-            elif "fc2" in name:
-                dim_out = new_dims.get(f"{name.split('.')[1]}_mlp_out", module.weight.shape[0])
-                module.weight.data = module.weight.data[:dim_out, :]
-                if module.bias is not None:
-                    module.bias.data = module.bias.data[:dim_out]
-                module.out_features = dim_out
+        if isinstance(module, nn.Linear) and "fc1" in name:
+            W_hidden = module.weight.data.t()  # [hidden, input]
+            M = W_hidden.shape[0]  # Hidden size
+            N = W_hidden.shape[1]  # Input size
+            target_M = target_r * N
+            V = W_hidden.clone()
+            selected = []
+            for _ in range(target_M):
+                norms = torch.norm(V, p=2, dim=1)
+                j = torch.argmax(norms).item()
+                selected.append(j)
+                vj = V[j:j+1]
+                proj = (V @ vj.t()) / (vj @ vj.t())
+                V -= proj * vj
+            selected = sorted(selected)
+            # Prune to selected neurons
+            module.weight.data = module.weight.data[selected]
+            module.bias.data = module.bias.data[selected]
+            module.out_features = target_M
+            # Adjust next FC2
+            next_name = name.replace("fc1", "fc2")
+            next_module = dict(model.backbone.named_modules())[next_name]
+            next_module.weight.data = next_module.weight.data[:, selected]
+            next_module.in_features = target_M
+    print("DGMR pruning applied, expansion ratio reduced to r=1.")
 
 def make_optimizer(model: nn.Module):
     return optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
@@ -308,9 +203,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
         for bidx, (images, labels) in enumerate(train_loader, 1):
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             opt.zero_grad()
-            # use checkpointing + AMP in training pass (keeps memory lower)
-            with autocast(dtype=torch.bfloat16):
-                outputs = checkpoint.checkpoint(model, images)
+            outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
             opt.step()
@@ -354,24 +247,16 @@ def evaluate_model(model: nn.Module, loader: DataLoader) -> Tuple[float, float, 
     return avg_loss, acc, auc
 
 def count_params_flops(model: nn.Module, input_size=(1, 3, 224, 224)) -> Tuple[float, float]:
-    """
-    Returns (macs_m, params_m) where values are in MILLIONS.
-    Uses raw numeric outputs from thop.profile and scales to 1e6.
-    """
-    model.eval()
-    with torch.no_grad():
-        input_tensor = torch.randn(*input_size).to(DEVICE)
-        macs, params = profile(model, inputs=(input_tensor,), verbose=False)
-    macs_m = float(macs) / 1e6
-    params_m = float(params) / 1e6
-    return macs_m, params_m
-
+    input_tensor = torch.randn(*input_size).to(DEVICE)
+    macs, params = profile(model, inputs=(input_tensor,))
+    macs, params = clever_format([macs, params], "%.3f")
+    return float(macs.split()[0]), float(params.split()[0])
 
 # -------------------------
 # Dataset runner
 # -------------------------
 def run_dataset(npz_path: str, freeze_backbone=False):
-    train_loader, saliency_loader, val_loader, test_loader, num_classes, ds_name = make_loaders(npz_path)
+    train_loader, val_loader, test_loader, num_classes, ds_name = make_loaders(npz_path)
     print(f"\n=== Running dataset: {ds_name} ===\n")
 
     model = build_model(num_classes, freeze_backbone=freeze_backbone)
@@ -383,21 +268,11 @@ def run_dataset(npz_path: str, freeze_backbone=False):
     orig_macs, orig_params = count_params_flops(model)
     print(f"Original MACs: {orig_macs}M, Params: {orig_params}M")
 
-    # Pruning loop
-    for i in range(PRUNE_ITERATIONS):
-        print(f"\n--- Pruning Iteration {i+1}/{PRUNE_ITERATIONS} ---")
-        # compute gradient-based saliency (cheap and robust)
-        grad_saliency = compute_gradient_saliency(model, saliency_loader, criterion, num_batches=SALIENCY_NUM_BATCHES)
-        prune_model(model, PRUNE_RATIO, grad_saliency)
-        print(f"Pruned model structure updated.")
-        torch.cuda.empty_cache()
+    # Apply DGMR pruning
+    dgmr_prune_mlp(model, TARGET_EXPANSION_RATIO)
 
-        # Brief fine-tuning after pruning
-        print(f"--- Fine-tuning after Pruning {i+1} ---")
-        train_model(model, train_loader, val_loader, FINETUNE_EPOCHS_PER_PRUNE)
-
-    # Final fine-tuning
-    print("\n--- Final Fine-tuning ---")
+    # Fine-tuning
+    print("\n--- Fine-tuning ---")
     train_model(model, train_loader, val_loader, FINETUNE_EPOCHS)
 
     # Evaluate and save
@@ -406,18 +281,18 @@ def run_dataset(npz_path: str, freeze_backbone=False):
     print(f"Final Test → Loss {final_loss:.4f} Acc {final_acc:.4f} AUC {final_auc:.4f}")
     print(f"Final MACs: {final_macs}M, Params: {final_params}M")
 
-    save_path = os.path.join(TRIALS_DIR, f"{ds_name}_pruned_baseline.pth")
+    save_path = os.path.join(TRIALS_DIR, f"{ds_name}_dgmr_pruned.pth")
     torch.save(model.state_dict(), save_path)
-    print(f"Saved pruned baseline model to {save_path}")
+    print(f"Saved DGMR pruned model to {save_path}")
 
-    csv_path = os.path.join(TRIALS_DIR, f"{ds_name}_pruned_summary.csv")
+    csv_path = os.path.join(TRIALS_DIR, f"{ds_name}_dgmr_summary.csv")
     with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["dataset", "method", "sparsity", "macs_m", "params_m", "loss", "acc", "auc"])
+        writer = csv.DictWriter(f, fieldnames=["dataset", "method", "expansion_r", "macs_m", "params_m", "loss", "acc", "auc"])
         writer.writeheader()
         writer.writerow({
             "dataset": ds_name,
-            "method": "pruned_baseline",
-            "sparsity": 1 - (final_params / orig_params),
+            "method": "dgmr_pruned",
+            "expansion_r": TARGET_EXPANSION_RATIO,
             "macs_m": final_macs,
             "params_m": final_params,
             "loss": final_loss,
