@@ -160,9 +160,8 @@ class ViTClassifier(nn.Module):
                     dims[name + "_h"] = module.weight.shape[0] // 384  # Heads
                 elif "fc1" in name:
                     dims[name + "_mlp_in"] = module.weight.shape[1]
-                    dims[name + "_mlp_out"] = module.weight.shape[0]
                 elif "fc2" in name:
-                    dims[name + "_mlp_out"] = module.weight.shape[1]
+                    dims[name + "_mlp_out"] = module.weight.shape[0]
         return dims
 
     def forward(self, x):
@@ -243,55 +242,43 @@ def compute_gradient_saliency(model: nn.Module,
     torch.cuda.empty_cache()
     return saliency
 
-
 def estimate_latency_reduction(model: nn.Module, orig_dims: Dict, new_dims: Dict) -> float:
-    total_ops = sum([orig_dims.get(k, 0) for k in orig_dims if "mlp" in k or "qk" in k or "h" in k])
-    new_ops = sum([new_dims.get(k, 0) for k in new_dims if "mlp" in k or "qk" in k or "h" in k])
+    total_ops = sum([orig_dims.get(k, 0) for k in orig_dims if "qk" in k or "h" in k])  # Only attention dims
+    new_ops = sum([new_dims.get(k, 0) for k in new_dims if "qk" in k or "h" in k])
     return 1 - (new_ops / max(1, total_ops))
 
-def prune_model(model: nn.Module, prune_ratio: float, hessian_norms: Dict) -> None:
+def prune_model(model: nn.Module, prune_ratio: float, saliency: Dict) -> None:
     orig_dims = model.orig_dims.copy()
     new_dims = orig_dims.copy()
     # Latency-aware saliency
-    norm_sum = sum(hessian_norms.values()) if len(hessian_norms) > 0 else 1.0
-    saliency = {k: v / norm_sum * (1 + ETA * estimate_latency_reduction(model, orig_dims, new_dims)) for k, v in hessian_norms.items()}
-    # Sort and prune lowest saliency
-    sorted_saliency = sorted(saliency.items(), key=lambda x: x[1])
-    total_prune = int(len(sorted_saliency) * prune_ratio)
+    norm_sum = sum(saliency.values()) if len(saliency) > 0 else 1.0
+    saliency_adjusted = {k: v / norm_sum * (1 + ETA * estimate_latency_reduction(model, orig_dims, new_dims)) for k, v in saliency.items()}
+    # Sort and prune lowest saliency (only attention layers)
+    sorted_saliency = sorted(saliency_adjusted.items(), key=lambda x: x[1])
+    total_prune = int(len([k for k in saliency if "qkv" in k]) * prune_ratio)  # Limit to qkv layers
     pruned_params = sorted_saliency[:total_prune]
     for param_name, _ in pruned_params:
-        # Prune dimensions based on param type
-        layer = param_name.split('.')[1] if '.' in param_name else param_name
         if "qkv" in param_name:
-            new_dims[f"{layer}_qk"] = max(1, int(new_dims.get(f"{layer}_qk", 0) * 0.9))
-            new_dims[f"{layer}_h"] = max(1, int(new_dims.get(f"{layer}_h", 0) * 0.9))
-        elif "fc1" in param_name:
-            new_dims[f"{layer}_mlp_in"] = max(1, int(new_dims.get(f"{layer}_mlp_in", 0) * 0.9))
-        elif "fc2" in param_name:
-            new_dims[f"{layer}_mlp_out"] = max(1, int(new_dims.get(f"{layer}_mlp_out", 0) * 0.9))
-    # Apply new dimensions to model layers
+            layer = param_name.split('.')[1]
+            new_dims[f"{layer}_qk"] = max(1, int(new_dims.get(f"{layer}_qk", 0) * (1 - PRUNE_RATIO)))
+            new_dims[f"{layer}_h"] = max(1, int(new_dims.get(f"{layer}_h", 0) * (1 - PRUNE_RATIO)))
+
+    # Apply new dimensions to model layers, preserving MLP structure
     for name, module in model.backbone.named_modules():
         if isinstance(module, nn.Linear):
             if "qkv" in name:
                 dim_qk = new_dims.get(f"{name.split('.')[1]}_qk", module.weight.shape[1])
                 dim_h = new_dims.get(f"{name.split('.')[1]}_h", module.weight.shape[0] // 384)
+                # Ensure compatibility with next layer (e.g., 384 * dim_h)
+                dim_h = min(dim_h, module.weight.shape[0] // 384)  # Cap to original heads
                 module.weight.data = module.weight.data[:dim_h * 384, :dim_qk]
                 if module.bias is not None:
                     module.bias.data = module.bias.data[:dim_h * 384]
                 module.out_features = dim_h * 384
                 module.in_features = dim_qk
-            elif "fc1" in name:
-                dim_in = new_dims.get(f"{name.split('.')[1]}_mlp_in", module.weight.shape[1])
-                module.weight.data = module.weight.data[:, :dim_in]
-                if module.bias is not None:
-                    module.bias.data = module.bias.data[:dim_in]
-                module.in_features = dim_in
-            elif "fc2" in name:
-                dim_out = new_dims.get(f"{name.split('.')[1]}_mlp_out", module.weight.shape[0])
-                module.weight.data = module.weight.data[:dim_out, :]
-                if module.bias is not None:
-                    module.bias.data = module.bias.data[:dim_out]
-                module.out_features = dim_out
+            # Do not prune fc1/fc2 to maintain MLP integrity
+            elif "fc1" in name or "fc2" in name:
+                continue
 
 def make_optimizer(model: nn.Module):
     return optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
@@ -308,9 +295,9 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
         for bidx, (images, labels) in enumerate(train_loader, 1):
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             opt.zero_grad()
-            # use checkpointing + AMP in training pass (keeps memory lower)
+            # Use checkpointing + AMP in training pass (keeps memory lower)
             with autocast(dtype=torch.bfloat16):
-                outputs = checkpoint.checkpoint(model, images)
+                outputs = checkpoint.checkpoint(model, images, use_reentrant=False)  # Explicit use_reentrant
             loss = criterion(outputs, labels)
             loss.backward()
             opt.step()
@@ -366,7 +353,6 @@ def count_params_flops(model: nn.Module, input_size=(1, 3, 224, 224)) -> Tuple[f
     params_m = float(params) / 1e6
     return macs_m, params_m
 
-
 # -------------------------
 # Dataset runner
 # -------------------------
@@ -386,7 +372,7 @@ def run_dataset(npz_path: str, freeze_backbone=False):
     # Pruning loop
     for i in range(PRUNE_ITERATIONS):
         print(f"\n--- Pruning Iteration {i+1}/{PRUNE_ITERATIONS} ---")
-        # compute gradient-based saliency (cheap and robust)
+        # Compute gradient-based saliency (cheap and robust)
         grad_saliency = compute_gradient_saliency(model, saliency_loader, criterion, num_batches=SALIENCY_NUM_BATCHES)
         prune_model(model, PRUNE_RATIO, grad_saliency)
         print(f"Pruned model structure updated.")
