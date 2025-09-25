@@ -46,8 +46,8 @@ PRUNE_RATIO = 0.1
 FINETUNE_EPOCHS = 10
 FINETUNE_EPOCHS_PER_PRUNE = 2
 BATCH_SIZE = 32
-SALIENCY_BATCH_SIZE = 4  # Reduced for memory
-SALIENCY_NUM_BATCHES = 5  # Reduced for memory
+SALIENCY_BATCH_SIZE = 4
+SALIENCY_NUM_BATCHES = 5
 LR = 5e-5
 ETA = 1.0
 IMG_SIZE = 224
@@ -127,6 +127,8 @@ def make_loaders(npz_path: str) -> Tuple[DataLoader, DataLoader, DataLoader, int
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=2, pin_memory=True)
+    saliency_loader = DataLoader(train_ds, batch_size=SALIENCY_BATCH_SIZE, shuffle=True,
+                                 num_workers=2, pin_memory=True)  # Separate for saliency
     val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=2, pin_memory=True)
     test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
@@ -134,7 +136,7 @@ def make_loaders(npz_path: str) -> Tuple[DataLoader, DataLoader, DataLoader, int
 
     num_classes = int(len(np.unique(np.concatenate([y_train, y_val, y_test]))))
     ds_name = os.path.splitext(os.path.basename(npz_path))[0]
-    return train_loader, val_loader, test_loader, num_classes, ds_name
+    return train_loader, saliency_loader, val_loader, test_loader, num_classes, ds_name
 
 # -------------------------
 # Model / prune / train / eval
@@ -165,7 +167,9 @@ class ViTClassifier(nn.Module):
         return dims
 
     def forward(self, x):
-        x = self.backbone(x)[:, 0]  # CLS token
+        x = self.backbone(x)
+        if x.dim() == 3:
+            x = x[:, 0]  # CLS if sequence
         x = self.head(x)
         return x
 
@@ -178,7 +182,7 @@ def build_model(num_classes: int, freeze_backbone=False) -> nn.Module:
 def load_dino_pretrained(model: nn.Module, ds_name: str):
     pretrained_path = os.path.join(TRIALS_DIR, f"{ds_name}_dino_pretrained.pth")
     print(f"Loading DINO pretrained weights from {pretrained_path}...")
-    pretrained_dict = torch.load(pretrained_path, map_location=DEVICE)
+    pretrained_dict = torch.load(pretrained_path, map_location=DEVICE, weights_only=True)  # Fixed warning
     backbone_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items() if k.startswith("backbone.")}
     model.backbone.load_state_dict(backbone_dict, strict=False)
     print("Loaded DINO pretrained backbone successfully.")
@@ -193,17 +197,17 @@ def compute_hessian_saliency(model: nn.Module, loader: DataLoader, criterion) ->
     for i, (images, labels) in enumerate(loader):
         images, labels = images.to(DEVICE), labels.to(DEVICE)
         with autocast(dtype=torch.bfloat16):
-            outputs = checkpoint.checkpoint(model, images)  # Checkpoint for memory
+            outputs = checkpoint.checkpoint(model, images)
             loss = criterion(outputs, labels)
         scaler.scale(loss).backward(create_graph=True)
         for name, param in model.named_parameters():
             if param.requires_grad and "backbone" in name and "weight" in name:
                 grad = param.grad
-                hessian_diag = autograd.grad(loss, param, grad_outputs=grad, retain_graph=True)[0]
+                hessian_diag = autograd.grad(loss, param, grad_outputs=grad, retain_graph=True)[0].diagonal()
                 norm = hessian_diag.norm().item()
                 hessian_norms[name] = hessian_norms.get(name, 0) + norm
         model.zero_grad()
-        torch.cuda.empty_cache()  # Clear cache per batch
+        torch.cuda.empty_cache()
         if i >= SALIENCY_NUM_BATCHES - 1:
             break
     for name in hessian_norms:
@@ -272,7 +276,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             opt.zero_grad()
             with autocast(dtype=torch.bfloat16):
-                outputs = checkpoint.checkpoint(model, images)  # Checkpoint for memory
+                outputs = checkpoint.checkpoint(model, images)
             loss = criterion(outputs, labels)
             loss.backward()
             opt.step()
@@ -325,7 +329,7 @@ def count_params_flops(model: nn.Module, input_size=(1, 3, 224, 224)) -> Tuple[f
 # Dataset runner
 # -------------------------
 def run_dataset(npz_path: str, freeze_backbone=False):
-    train_loader, val_loader, test_loader, num_classes, ds_name = make_loaders(npz_path)
+    train_loader, saliency_loader, val_loader, test_loader, num_classes, ds_name = make_loaders(npz_path)
     print(f"\n=== Running dataset: {ds_name} ===\n")
 
     model = build_model(num_classes, freeze_backbone=freeze_backbone)
@@ -340,7 +344,7 @@ def run_dataset(npz_path: str, freeze_backbone=False):
     # Pruning loop
     for i in range(PRUNE_ITERATIONS):
         print(f"\n--- Pruning Iteration {i+1}/{PRUNE_ITERATIONS} ---")
-        hessian_norms = compute_hessian_saliency(model, train_loader, criterion)
+        hessian_norms = compute_hessian_saliency(model, saliency_loader, criterion)
         prune_model(model, PRUNE_RATIO, hessian_norms)
         print(f"Pruned model structure updated.")
         torch.cuda.empty_cache()
