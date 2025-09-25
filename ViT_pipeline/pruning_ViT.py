@@ -106,7 +106,7 @@ class NumpyMemmapDataset(Dataset):
         x = self.normalize(x)
         return x, label
 
-def make_loaders(npz_path: str) -> Tuple[DataLoader, DataLoader, DataLoader, int, str]:
+def make_loaders(npz_path: str) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader, int, str]:
     print(f"\nLoading {npz_path} ...")
     data = np.load(npz_path, mmap_mode="r")
 
@@ -128,7 +128,7 @@ def make_loaders(npz_path: str) -> Tuple[DataLoader, DataLoader, DataLoader, int
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=2, pin_memory=True)
     saliency_loader = DataLoader(train_ds, batch_size=SALIENCY_BATCH_SIZE, shuffle=True,
-                                 num_workers=2, pin_memory=True)  # Separate for saliency
+                                 num_workers=2, pin_memory=True)
     val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=2, pin_memory=True)
     test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
@@ -169,7 +169,7 @@ class ViTClassifier(nn.Module):
     def forward(self, x):
         x = self.backbone(x)
         if x.dim() == 3:
-            x = x[:, 0]  # CLS if sequence
+            x = x[:, 0]  # CLS token
         x = self.head(x)
         return x
 
@@ -182,7 +182,7 @@ def build_model(num_classes: int, freeze_backbone=False) -> nn.Module:
 def load_dino_pretrained(model: nn.Module, ds_name: str):
     pretrained_path = os.path.join(TRIALS_DIR, f"{ds_name}_dino_pretrained.pth")
     print(f"Loading DINO pretrained weights from {pretrained_path}...")
-    pretrained_dict = torch.load(pretrained_path, map_location=DEVICE, weights_only=True)  # Fixed warning
+    pretrained_dict = torch.load(pretrained_path, map_location=DEVICE, weights_only=True)
     backbone_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items() if k.startswith("backbone.")}
     model.backbone.load_state_dict(backbone_dict, strict=False)
     print("Loaded DINO pretrained backbone successfully.")
@@ -203,7 +203,7 @@ def compute_hessian_saliency(model: nn.Module, loader: DataLoader, criterion) ->
         for name, param in model.named_parameters():
             if param.requires_grad and "backbone" in name and "weight" in name:
                 grad = param.grad
-                hessian_diag = autograd.grad(loss, param, grad_outputs=grad, retain_graph=True)[0].diagonal()
+                hessian_diag = torch.autograd.grad(loss, param, grad_outputs=grad, retain_graph=True)[0].diagonal()
                 norm = hessian_diag.norm().item()
                 hessian_norms[name] = hessian_norms.get(name, 0) + norm
         model.zero_grad()
@@ -322,8 +322,11 @@ def evaluate_model(model: nn.Module, loader: DataLoader) -> Tuple[float, float, 
 def count_params_flops(model: nn.Module, input_size=(1, 3, 224, 224)) -> Tuple[float, float]:
     input_tensor = torch.randn(*input_size).to(DEVICE)
     macs, params = profile(model, inputs=(input_tensor,))
-    macs, params = clever_format([macs, params], "%.3f")
-    return float(macs.split()[0]), float(params.split()[0])
+    macs_str, params_str = clever_format([macs, params], "%.3f")
+    # Extract numeric value before unit (e.g., '5.525G' -> 5.525)
+    macs_val = float(macs_str.split()[0])
+    params_val = float(params_str.split()[0])
+    return macs_val, params_val
 
 # -------------------------
 # Dataset runner
