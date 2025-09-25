@@ -187,33 +187,63 @@ def load_dino_pretrained(model: nn.Module, ds_name: str):
     model.backbone.load_state_dict(backbone_dict, strict=False)
     print("Loaded DINO pretrained backbone successfully.")
 
-def compute_hessian_saliency(model: nn.Module, loader: DataLoader, criterion) -> Dict[str, float]:
-    model.eval()
-    hessian_norms = {}
-    scaler = GradScaler()
-    for name, param in model.named_parameters():
-        if param.requires_grad and "backbone" in name and "weight" in name:
-            param.grad = None
-    for i, (images, labels) in enumerate(loader):
+def compute_gradient_saliency(model: nn.Module,
+                              loader: DataLoader,
+                              criterion,
+                              num_batches: int = SALIENCY_NUM_BATCHES) -> Dict[str, float]:
+    """
+    Data-aware gradient saliency:
+      - Runs `num_batches` batches from `loader`
+      - Accumulates per-parameter L1 gradient magnitudes for backbone weight params
+      - Returns dict: parameter_name -> average_score (higher => more important)
+    This is much cheaper and robust compared to second-order/Hessian-based computations.
+    """
+    model.train()  # allow gradients
+    saliency: Dict[str, float] = {}
+    # zero grads
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad = None
+
+    batches = 0
+    for images, labels in loader:
         images, labels = images.to(DEVICE), labels.to(DEVICE)
-        with autocast(dtype=torch.bfloat16):
-            outputs = checkpoint.checkpoint(model, images)
-            loss = criterion(outputs, labels)
-        loss.backward(create_graph=True, retain_graph=True)  # Ensure retain_graph
-        for name, param in model.named_parameters():
-            if param.requires_grad and "backbone" in name and "weight" in name:
-                grad = param.grad
-                if grad is not None and grad.requires_grad:
-                    hessian_diag = torch.autograd.grad(loss, param, grad_outputs=grad, retain_graph=True)[0].diagonal()
-                    norm = hessian_diag.norm().item()
-                    hessian_norms[name] = hessian_norms.get(name, 0) + norm
+
+        # Forward + backward (no create_graph, no AMP/GradScaler here for saliency pass)
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
         model.zero_grad()
-        torch.cuda.empty_cache()
-        if i >= SALIENCY_NUM_BATCHES - 1:
+        loss.backward()
+
+        # accumulate L1 of gradients for backbone weight tensors
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            # only backbone weights (you used "backbone" substring earlier)
+            if "backbone" not in name or "weight" not in name:
+                continue
+            g = param.grad
+            if g is None:
+                continue
+            score = float(g.abs().sum().cpu().item())
+            saliency[name] = saliency.get(name, 0.0) + score
+
+        batches += 1
+        if batches >= num_batches:
             break
-    for name in hessian_norms:
-        hessian_norms[name] /= SALIENCY_NUM_BATCHES
-    return hessian_norms
+
+    # average over batches
+    if batches > 0:
+        for k in list(saliency.keys()):
+            saliency[k] /= float(batches)
+
+    model.eval()
+    # make sure gradients are cleared to free memory
+    model.zero_grad()
+    torch.cuda.empty_cache()
+    return saliency
+
 
 def estimate_latency_reduction(model: nn.Module, orig_dims: Dict, new_dims: Dict) -> float:
     total_ops = sum([orig_dims.get(k, 0) for k in orig_dims if "mlp" in k or "qk" in k or "h" in k])
@@ -321,13 +351,19 @@ def evaluate_model(model: nn.Module, loader: DataLoader) -> Tuple[float, float, 
     return avg_loss, acc, auc
 
 def count_params_flops(model: nn.Module, input_size=(1, 3, 224, 224)) -> Tuple[float, float]:
-    input_tensor = torch.randn(*input_size).to(DEVICE)
-    macs, params = profile(model, inputs=(input_tensor,))
-    macs_str, params_str = clever_format([macs, params], "%.3f")
-    # Extract numeric value before unit (e.g., '5.525G' -> 5.525)
-    macs_val = float(macs_str.split()[0])
-    params_val = float(params_str.split()[0])
-    return macs_val, params_val
+    """
+    Returns (macs_m, params_m) where values are in MILLIONS.
+    Uses raw numeric outputs from thop.profile and scales to 1e6.
+    """
+    model_cpu_state = next(model.parameters()).device  # just to be safe
+    model.eval()
+    with torch.no_grad():
+        input_tensor = torch.randn(*input_size).to(DEVICE)
+        macs, params = profile(model, inputs=(input_tensor,), verbose=False)
+    macs_m = float(macs) / 1e6
+    params_m = float(params) / 1e6
+    return macs_m, params_m
+
 
 # -------------------------
 # Dataset runner
