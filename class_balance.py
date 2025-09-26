@@ -53,32 +53,40 @@ def balanced_indices(lbls, n_keep, rng):
     rng.shuffle(selected)
     return np.array(selected, dtype=np.int64)
 
-def subsample_split_npy_balanced(dataset_dir, split, target_per_class, rng):
-    imgs = np.load(os.path.join(dataset_dir, f"{split}_images.npy"))
-    lbls = np.load(os.path.join(dataset_dir, f"{split}_labels.npy"))
+def subsample_split_npy_balanced(dataset_dir, split, target_per_class, rng, chunk_size=100):
+    imgs = np.load(os.path.join(dataset_dir, f"{split}_images.npy"), mmap_mode="r")
+    lbls = np.load(os.path.join(dataset_dir, f"{split}_labels.npy"), mmap_mode="r")
 
+    # collect indices per class without materializing all at once
     class_indices = defaultdict(list)
     for i, y in enumerate(lbls):
         class_indices[int(y)].append(i)
 
-    # find the maximum consistent size across classes
+    # instead of forcing equality, allow smallest class to define cap
     min_class_size = min(len(idxs) for idxs in class_indices.values())
     n_samples = min(target_per_class, min_class_size)
 
-    out_imgs = []
-    out_lbls = []
+    total_per_class = {cls: 0 for cls in class_indices}
+    out_imgs = np.empty((n_samples * len(class_indices),) + imgs.shape[1:], dtype=imgs.dtype)
+    out_lbls = np.empty((n_samples * len(class_indices),), dtype=lbls.dtype)
 
+    pos = 0
     for cls, idxs in class_indices.items():
         idxs = np.array(idxs)
         rng.shuffle(idxs)
         chosen = idxs[:n_samples]
-        out_imgs.append(imgs[chosen])
-        out_lbls.append(lbls[chosen])
 
-    out_imgs = np.concatenate(out_imgs, axis=0)
-    out_lbls = np.concatenate(out_lbls, axis=0)
+        # write in chunks to avoid blowing RAM
+        for i in range(0, n_samples, chunk_size):
+            j = min(i + chunk_size, n_samples)
+            out_imgs[pos:pos+(j-i)] = imgs[chosen[i:j]]
+            out_lbls[pos:pos+(j-i)] = lbls[chosen[i:j]]
+            pos += (j - i)
+
+        total_per_class[cls] = n_samples
 
     return out_imgs, out_lbls
+
 
 
 # -------------------------
