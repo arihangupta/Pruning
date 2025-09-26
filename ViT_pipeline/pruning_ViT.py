@@ -38,11 +38,11 @@ except Exception:
 # Config
 # -------------------------
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
-TRIALS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/trials"
+TRIALS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/exp2_saved_models"
 
 PRUNE_ITERATIONS = 5
 PRUNE_RATIO = 0.1
-FINETUNE_EPOCHS = 10
+FINETUNE_EPOCHS = 3
 FINETUNE_EPOCHS_PER_PRUNE = 2
 BATCH_SIZE = 32
 SALIENCY_BATCH_SIZE = 2
