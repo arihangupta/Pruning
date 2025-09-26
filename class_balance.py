@@ -76,12 +76,12 @@ def subsample_split_npy_balanced(dataset_dir, split, target_per_class, rng, chun
         rng.shuffle(idxs)
         chosen = idxs[:n_samples]
 
-        # write in chunks to avoid blowing RAM
         for i in range(0, n_samples, chunk_size):
             j = min(i + chunk_size, n_samples)
             out_imgs[pos:pos+(j-i)] = imgs[chosen[i:j]]
-            out_lbls[pos:pos+(j-i)] = lbls[chosen[i:j]]
+            out_lbls[pos:pos+(j-i)] = lbls[chosen[i:j]].reshape(-1)
             pos += (j - i)
+
 
         total_per_class[cls] = n_samples
 
