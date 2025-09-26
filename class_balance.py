@@ -35,59 +35,71 @@ def get_memory_usage():
     return psutil.Process().memory_info().rss / 1024 / 1024
 
 def balanced_indices(lbls, n_keep, rng):
-    """Return balanced subset of indices for lbls."""
-    class_indices = defaultdict(list)
-    for i, y in enumerate(lbls):
-        class_indices[int(y)].append(i)
+    """Return indices balanced across classes, allowing compensation if some classes are small."""
+    # flatten labels in case they are (N,1)
+    lbls = lbls.reshape(-1)
+    classes = np.unique(lbls)
+    n_classes = len(classes)
 
-    classes = sorted(class_indices.keys())
-    per_class = n_keep // len(classes)
-    remainder = n_keep % len(classes)
+    # initial quota per class
+    base_quota = n_keep // n_classes
+    remainder = n_keep % n_classes
 
-    selected = []
-    for ci, c in enumerate(classes):
-        n_c = per_class + (1 if ci < remainder else 0)
-        idxs = rng.choice(class_indices[c], size=min(n_c, len(class_indices[c])), replace=False)
-        selected.extend(idxs)
+    per_class_counts = {c: base_quota for c in classes}
+    # distribute remainder one by one
+    for i, c in enumerate(classes[:remainder]):
+        per_class_counts[c] += 1
 
-    rng.shuffle(selected)
-    return np.array(selected, dtype=np.int64)
+    # adjust if some classes are too small
+    deficit = 0
+    for c in classes:
+        n_available = np.sum(lbls == c)
+        if n_available < per_class_counts[c]:
+            deficit += per_class_counts[c] - n_available
+            per_class_counts[c] = n_available
 
-def subsample_split_npy_balanced(dataset_dir, split, target_per_class, rng, chunk_size=100):
-    imgs = np.load(os.path.join(dataset_dir, f"{split}_images.npy"), mmap_mode="r")
-    lbls = np.load(os.path.join(dataset_dir, f"{split}_labels.npy"), mmap_mode="r")
+    # redistribute deficit evenly to other classes with capacity
+    while deficit > 0:
+        for c in classes:
+            n_available = np.sum(lbls == c)
+            if per_class_counts[c] < n_available:
+                per_class_counts[c] += 1
+                deficit -= 1
+                if deficit == 0:
+                    break
 
-    # collect indices per class without materializing all at once
-    class_indices = defaultdict(list)
-    for i, y in enumerate(lbls):
-        class_indices[int(y)].append(i)
+    # now sample indices
+    all_indices = []
+    for c in classes:
+        cls_indices = np.where(lbls == c)[0]
+        chosen = rng.choice(cls_indices, size=per_class_counts[c], replace=False)
+        all_indices.extend(chosen)
 
-    # instead of forcing equality, allow smallest class to define cap
-    min_class_size = min(len(idxs) for idxs in class_indices.values())
-    n_samples = min(target_per_class, min_class_size)
-
-    total_per_class = {cls: 0 for cls in class_indices}
-    out_imgs = np.empty((n_samples * len(class_indices),) + imgs.shape[1:], dtype=imgs.dtype)
-    out_lbls = np.empty((n_samples * len(class_indices),), dtype=lbls.dtype)
-
-    pos = 0
-    for cls, idxs in class_indices.items():
-        idxs = np.array(idxs)
-        rng.shuffle(idxs)
-        chosen = idxs[:n_samples]
-
-        for i in range(0, n_samples, chunk_size):
-            j = min(i + chunk_size, n_samples)
-            out_imgs[pos:pos+(j-i)] = imgs[chosen[i:j]]
-            out_lbls[pos:pos+(j-i)] = lbls[chosen[i:j]].reshape(-1)
-            pos += (j - i)
+    rng.shuffle(all_indices)
+    return np.array(all_indices, dtype=np.int64)
 
 
-        total_per_class[cls] = n_samples
+def subsample_split_npy_balanced(npy_dir, split, n_keep, rng):
+    """Subsample split directly from .npy arrays with mmap, class-balanced."""
+    img_path = os.path.join(npy_dir, f"{split}_images.npy")
+    lbl_path = os.path.join(npy_dir, f"{split}_labels.npy")
+
+    imgs = np.load(img_path, mmap_mode="r")
+    lbls = np.load(lbl_path, mmap_mode="r")
+
+    n_keep = min(n_keep, len(imgs))
+    idxs = balanced_indices(lbls, n_keep, rng)
+
+    out_imgs = np.empty((n_keep, *imgs.shape[1:]), dtype=imgs.dtype)
+    out_lbls = np.empty((n_keep, *lbls.shape[1:]), dtype=lbls.dtype)
+
+    for i in tqdm(range(0, n_keep, CHUNK_SIZE), desc=f"{split} balanced", unit="chunk"):
+        j = min(i + CHUNK_SIZE, n_keep)
+        out_imgs[i:j] = imgs[idxs[i:j]]
+        out_lbls[i:j] = lbls[idxs[i:j]]
+        gc.collect()
 
     return out_imgs, out_lbls
-
-
 
 # -------------------------
 # Main
