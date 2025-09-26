@@ -53,27 +53,33 @@ def balanced_indices(lbls, n_keep, rng):
     rng.shuffle(selected)
     return np.array(selected, dtype=np.int64)
 
-def subsample_split_npy_balanced(npy_dir, split, n_keep, rng):
-    """Subsample split directly from .npy arrays with mmap, class-balanced."""
-    img_path = os.path.join(npy_dir, f"{split}_images.npy")
-    lbl_path = os.path.join(npy_dir, f"{split}_labels.npy")
+def subsample_split_npy_balanced(dataset_dir, split, target_per_class, rng):
+    imgs = np.load(os.path.join(dataset_dir, f"{split}_images.npy"))
+    lbls = np.load(os.path.join(dataset_dir, f"{split}_labels.npy"))
 
-    imgs = np.load(img_path, mmap_mode="r")
-    lbls = np.load(lbl_path, mmap_mode="r")
+    class_indices = defaultdict(list)
+    for i, y in enumerate(lbls):
+        class_indices[int(y)].append(i)
 
-    n_keep = min(n_keep, len(imgs))
-    idxs = balanced_indices(lbls, n_keep, rng)
+    # find the maximum consistent size across classes
+    min_class_size = min(len(idxs) for idxs in class_indices.values())
+    n_samples = min(target_per_class, min_class_size)
 
-    out_imgs = np.empty((n_keep, *imgs.shape[1:]), dtype=imgs.dtype)
-    out_lbls = np.empty((n_keep, *lbls.shape[1:]), dtype=lbls.dtype)
+    out_imgs = []
+    out_lbls = []
 
-    for i in tqdm(range(0, n_keep, CHUNK_SIZE), desc=f"{split} balanced", unit="chunk"):
-        j = min(i + CHUNK_SIZE, n_keep)
-        out_imgs[i:j] = imgs[idxs[i:j]]
-        out_lbls[i:j] = lbls[idxs[i:j]]
-        gc.collect()
+    for cls, idxs in class_indices.items():
+        idxs = np.array(idxs)
+        rng.shuffle(idxs)
+        chosen = idxs[:n_samples]
+        out_imgs.append(imgs[chosen])
+        out_lbls.append(lbls[chosen])
+
+    out_imgs = np.concatenate(out_imgs, axis=0)
+    out_lbls = np.concatenate(out_lbls, axis=0)
 
     return out_imgs, out_lbls
+
 
 # -------------------------
 # Main
