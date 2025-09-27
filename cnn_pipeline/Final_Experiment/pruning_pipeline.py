@@ -3,7 +3,7 @@
 Outputs:
 - Single CSV per dataset with all variants (Variant column distinguishes).
 - emissions.csv in SAVE_DIR.
-- Corrected to prune 50%, 60%, or 70% of channels (keep 50%, 40%, 30%).
+- Corrected to prune 50%, 75%, or 87.5% of bits (keep 50%, 25%, 12.5% from FP32).
 - Measures energy for predictions on 50 test images after training, reports energy per image.
 """
 
@@ -26,7 +26,7 @@ from torchvision import models, transforms as T
 from sklearn.metrics import roc_auc_score
 from torchprofile import profile_macs
 import psutil
-from torch.quantization import quantize_dynamic
+from torch.quantization import quantize_dynamic, get_default_qconfig, prepare, convert, fuse_modules
 import gc
 
 # CodeCarbon
@@ -52,8 +52,8 @@ WARMUP = 5
 NUM_BASELINE_RUNS = 3
 PREDICTION_IMAGES = 50  # Number of images for prediction energy measurement
 
-# Compression ratios (fraction to REMOVE for pruning; equivalent bits for quantization)
-TARGET_COMPRESS_RATIOS = [0.5, 0.6, 0.7]  # 50% prune = INT8 equiv, 75% prune = INT4 equiv from FP16
+# Compression ratios (fraction to REMOVE for pruning; equivalent bits for quantization from FP32)
+TARGET_COMPRESS_RATIOS = [0.5, 0.75, 0.875]  # FP32 to FP16 (50%), INT8 (75%), INT4 (87.5%)
 
 # Methods: pruning + slim_kd + quantization
 METHODS = ["regional_gradients", "slim_kd", "quantization"]
@@ -78,30 +78,20 @@ DATASET_BATCH_SIZES = {
     "dermamnist": 32,
     "pathmnist": 16,
     "bloodmnist": 32,
-    "octmnist": 16,
-    "tissuemnist": 8,
 }
 
 DATASETS = {
     "pathmnist": {
-        "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets/pathmnist_224.npz",
+        "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/pathmnist_224.npz",
         "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1/pathmnist_224_baseline.pth"
     },
     "dermamnist": {
-        "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets/dermamnist_224.npz",
+        "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/dermamnist_224.npz",
         "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1/dermamnist_224_baseline.pth"
     },
     "bloodmnist": {
-        "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets/bloodmnist_224.npz",
+        "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/bloodmnist_224.npz",
         "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1/bloodmnist_224_baseline.pth"
-    },
-    "octmnist": {
-        "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets/octmnist_224.npz",
-        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/exp1_saved_models/octmnist_224_baseline.pth"
-    },
-    "tissuemnist": {
-        "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets/tissuemnist_224.npz",
-        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/exp1_saved_models/tissuemnist_224_baseline.pth"
     },
 }
 
@@ -505,6 +495,8 @@ def compute_flops(model):
     model.eval()
     try:
         inputs = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(DEVICE)
+        if next(model.parameters()).dtype == torch.half:
+            inputs = inputs.half()
         macs = profile_macs(model, inputs)
         flops = macs * 2
         return float(flops)
@@ -520,6 +512,8 @@ def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES)
         for _ in range(warmup):
             imgs, _ = next(it)
             imgs = imgs.to(DEVICE)
+            if next(model.parameters()).dtype == torch.half:
+                imgs = imgs.half()
             with torch.no_grad(): _ = model(imgs)
             if use_cuda: torch.cuda.synchronize()
     except StopIteration:
@@ -532,6 +526,8 @@ def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES)
         for _ in range(timed):
             imgs, _ = next(it)
             imgs = imgs.to(DEVICE)
+            if next(model.parameters()).dtype == torch.half:
+                imgs = imgs.half()
             with torch.no_grad(): _ = model(imgs)
             if use_cuda: torch.cuda.synchronize()
             batches_done += 1
@@ -558,6 +554,8 @@ def measure_prediction_energy(model, test_loader, save_dir, project_name, num_im
             try:
                 imgs, _ = next(it)
                 imgs = imgs.to(DEVICE)
+                if next(model.parameters()).dtype == torch.half:
+                    imgs = imgs.half()
                 batch_size = imgs.size(0)
                 if images_processed + batch_size > num_images:
                     imgs = imgs[:num_images - images_processed]
@@ -651,7 +649,10 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
         for bidx, (imgs, labels) in enumerate(train_loader, 1):
             if max_batches is not None and bidx > max_batches:
                 break
-            imgs = imgs.to(device); labels = labels.to(device)
+            imgs = imgs.to(device)
+            if next(student.parameters()).dtype == torch.half:
+                imgs = imgs.half()
+            labels = labels.to(device)
             with torch.no_grad():
                 t_logits = teacher(imgs)
             s_logits = student(imgs)
@@ -681,7 +682,10 @@ def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCH
     for ep in range(epochs):
         running_loss = 0.0; total = 0; correct = 0
         for bidx, (imgs, labels) in enumerate(train_loader, 1):
-            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            imgs = imgs.to(DEVICE)
+            if next(model.parameters()).dtype == torch.half:
+                imgs = imgs.half()
+            labels = labels.to(DEVICE)
             opt.zero_grad()
             out = model(imgs)
             loss = criterion(out, labels)
@@ -699,16 +703,49 @@ def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCH
 # -------------------------
 # Quantization
 # -------------------------
-def symmetric_quantize_model(model, bit_width=8):
+def fuse_resnet(model):
+    for m in model.modules():
+        if type(m) == Bottleneck:
+            fuse_modules(m, ['conv1', 'bn1', 'relu'], inplace=True)
+            fuse_modules(m, ['conv2', 'bn2', 'relu'], inplace=True)
+            fuse_modules(m, ['conv3', 'bn3'], inplace=True)
+            if m.downsample is not None:
+                fuse_modules(m.downsample, ['0', '1'], inplace=True)
+    fuse_modules(model, ['conv1', 'bn1', 'relu'], inplace=True)
+    return model
+
+def symmetric_quantize_model(model, train_loader, bit_width=8):
     model.eval()
-    if bit_width == 8:
-        quantized_model = quantize_dynamic(
-            model,
-            {nn.Linear, nn.Conv2d},
-            dtype=torch.qint8
-        )
+    if bit_width == 16:
+        quantized_model = model.half()
+        print("Applied FP16 quantization.")
+    elif bit_width == 8:
+        model = fuse_resnet(model)
+        model.qconfig = get_default_qconfig('fbgemm')
+        model_prepared = prepare(model, inplace=False)
+        model_prepared.eval()
+        with torch.no_grad():
+            for i, (data, _) in enumerate(train_loader):
+                if i >= 100:
+                    break
+                data = data.to(DEVICE)
+                model_prepared(data)
+        quantized_model = convert(model_prepared, inplace=False)
+        print("Applied INT8 static quantization with calibration.")
+    elif bit_width == 4:
+        quantized_model = copy.deepcopy(model)
+        for name, module in quantized_model.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                weight = module.weight.data
+                w_max = torch.max(torch.abs(weight))
+                if w_max == 0:
+                    continue
+                scale = w_max / 7.0
+                q_weight = torch.round(weight / scale).clamp(-8, 7)
+                module.weight.data = q_weight * scale
+        print("Applied custom INT4 quantization (simulated).")
     else:
-        print(f"Warning: Custom {bit_width}-bit quantization not implemented. Using model as-is.")
+        print(f"Warning: {bit_width}-bit quantization not implemented. Using model as-is.")
         quantized_model = model
     return quantized_model.to(DEVICE)
 
@@ -882,7 +919,7 @@ def load_baseline_ckpt_safe(path, num_classes):
     return model.to(DEVICE).eval()
 
 # -------------------------
-# Main pipeline
+# Dataset processing with error handling
 # -------------------------
 def process_dataset_safely(dataset_name, cfg):
     """Process a single dataset with comprehensive error handling"""
@@ -1120,14 +1157,14 @@ def process_dataset_safely(dataset_name, cfg):
                 print(f"\n=== QUANTIZATION VARIANT ===")
                 for compress_ratio in TARGET_COMPRESS_RATIOS:
                     keep_ratio = 1 - compress_ratio
-                    bit_width = int(16 * keep_ratio)  # FP16 baseline, e.g., 0.5 -> INT8
+                    bit_width = int(32 * keep_ratio)  # FP32 baseline: 0.5->16-bit, 0.75->8-bit, 0.875->4-bit
                     print(f"  Quantization: to {bit_width} bits (compression ratio {compress_ratio*100}%)")
 
                     q_retrain_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_q_retrain"
                     q_retrain_tracker = start_tracker(SAVE_DIR, q_retrain_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
 
                     current_model = copy.deepcopy(baseline).to(DEVICE)
-                    current_model = symmetric_quantize_model(current_model, bit_width=bit_width)
+                    current_model = symmetric_quantize_model(current_model, train_loader, bit_width=bit_width)
                     print(f"  Model quantized to {bit_width} bits.")
 
                     q_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_quantized.pth")
