@@ -14,6 +14,7 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.optim as optim  # Added missing import
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms as T
 from thop import profile
