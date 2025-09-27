@@ -41,7 +41,7 @@ except Exception:
 # -------------------------
 # Config
 # -------------------------
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/combined_pruning_kd_experiment"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/CNN_prune"
 CNN_EXP1_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1"  # Load from previous
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
