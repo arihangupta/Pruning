@@ -344,107 +344,101 @@ def compute_stage_importance_and_keeps_regional(model: nn.Module, stage_name: st
             break
     handle.remove()
 
-    if batch_count == 0:
-        agg = weight_l1.cpu().numpy()
+    with torch.no_grad():
+        importance = act_norms * grad_norms * weight_l1
+        importance_np = importance.cpu().numpy()
+    if keep_k >= len(importance_np):
+        keep = np.arange(len(importance_np))
     else:
-        act_norms /= batch_count
-        grad_norms /= batch_count
-        agg = (act_norms * grad_norms * weight_l1).cpu().numpy()
-    keep = np.arange(len(agg)) if keep_k >= len(agg) else np.argsort(agg)[-keep_k:]
+        keep = np.argsort(importance_np)[-keep_k:]
     return np.sort(keep)
 
-def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k: int,
-                                      method="regional_gradients", calib_loader=None, max_batches=RG_CAL_MAX_BATCHES):
+def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k: int, method: str="regional_gradients", calib_loader: DataLoader=None, max_batches: int=RG_CAL_MAX_BATCHES):
     if method == "l1":
         return compute_stage_importance_and_keeps_l1(model, stage_name, keep_k)
     elif method == "bn_gamma":
         return compute_stage_importance_and_keeps_bn_gamma(model, stage_name, keep_k)
     elif method == "regional_gradients":
-        assert calib_loader is not None, "calib_loader required for regional_gradients"
+        if calib_loader is None:
+            raise ValueError("calib_loader required for regional_gradients method")
         return compute_stage_importance_and_keeps_regional(model, stage_name, keep_k, calib_loader, max_batches)
     else:
-        raise ValueError(f"Unknown method {method}")
+        raise ValueError(f"Unknown method: {method}")
 
 # -------------------------
-# Surgery (pruning only)
+# Weight copying for pruned ResNet (fixed)
 # -------------------------
-def copy_bn_params(new_bn, old_bn, indices):
-    new_bn.weight.data.copy_(old_bn.weight.data[indices])
-    new_bn.bias.data.copy_(old_bn.bias.data[indices])
-    new_bn.running_mean.data.copy_(old_bn.running_mean.data[indices])
-    new_bn.running_var.data.copy_(old_bn.running_var.data[indices])
-
-def validate_keep_indices(keep_indices, model, stages=STAGES):
-    """Validate that keep_indices are within bounds"""
-    for stage_name in stages:
-        orig_channels = stage_orig_channels(model, stage_name)
-        indices = keep_indices[stage_name]
-        if len(indices) == 0:
-            raise ValueError(f"No channels selected for {stage_name}")
-        if max(indices) >= orig_channels:
-            raise ValueError(f"Invalid keep_indices for {stage_name}: max index {max(indices)} >= {orig_channels}")
-        if min(indices) < 0:
-            raise ValueError(f"Invalid keep_indices for {stage_name}: negative indices found")
-    return True
-
 def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indices: dict, num_classes: int):
-    expansion = 4
-    # Validate keep_indices
-    validate_keep_indices(keep_indices, base_model)
-    stage_planes = [len(keep_indices['layer1']), len(keep_indices['layer2']),
-                    len(keep_indices['layer3']), len(keep_indices['layer4'])]
-    new_model = CustomResNet(block=Bottleneck, layers=[3,4,6,3], stage_planes=stage_planes, num_classes=num_classes).to(DEVICE)
-    new_model.eval()
-    base_model = base_model.to(DEVICE)
-    prev_out_idx = torch.arange(base_model.conv1.out_channels, dtype=torch.long, device=DEVICE)
+    """Build a pruned ResNet and copy weights with proper mapping."""
+    # Build new model architecture
+    new_model = build_pruned_or_slim_resnet(keep_indices=keep_indices, num_classes=num_classes, random_init=False)
     
-    for stage_name in ["layer1", "layer2", "layer3", "layer4"]:
-        old_stage = getattr(base_model, stage_name)
-        new_stage = getattr(new_model, stage_name)
-        kept_planes = torch.tensor(keep_indices[stage_name], dtype=torch.long, device=DEVICE)
-        for block_idx, (old_block, new_block) in enumerate(zip(old_stage, new_stage)):
-            in_idx = prev_out_idx
-            out_planes = kept_planes
-            expanded_rows = torch.cat([ (k * expansion + torch.arange(expansion, device=DEVICE)) for k in out_planes ]) if len(out_planes) > 0 else torch.tensor([], dtype=torch.long, device=DEVICE)
+    # Copy conv1, bn1 (unchanged)
+    new_model.conv1.weight.data.copy_(base_model.conv1.weight.data)
+    new_model.bn1.weight.data.copy_(base_model.bn1.weight.data)
+    new_model.bn1.bias.data.copy_(base_model.bn1.bias.data)
+    new_model.bn1.running_mean.copy_(base_model.bn1.running_mean)
+    new_model.bn1.running_var.copy_(base_model.bn1.running_var)
+    
+    prev_kept = torch.arange(64, dtype=torch.long, device=DEVICE)  # Initial feature maps from conv1
+    
+    for stage_idx, stage in enumerate(['layer1', 'layer2', 'layer3', 'layer4']):
+        kept = torch.tensor(keep_indices[stage], dtype=torch.long, device=DEVICE)
+        base_stage = getattr(base_model, stage)
+        new_stage = getattr(new_model, stage)
+        
+        print(f"    Copying weights for {stage}: keeping {len(kept)} out of {stage_orig_channels(base_model, stage)} channels")
+        
+        # Get expanded indices for bottleneck blocks (each plane -> 4 output channels)
+        expanded_rows = torch.cat([torch.arange(p * 4, (p + 1) * 4, dtype=torch.long, device=DEVICE) for p in kept])
+        
+        for block_idx, (base_block, new_block) in enumerate(zip(base_stage.children(), new_stage.children())):
+            # Conv1: input from prev_kept, output to kept channels
+            in_idx = prev_kept if stage_idx == 0 or block_idx > 0 else prev_kept
+            out_idx = kept
+            new_block.conv1.weight.data.copy_(base_block.conv1.weight.data[out_idx][:, in_idx])
             
-            old_w = old_block.conv1.weight.data
-            if out_planes.numel() > 0 and in_idx.numel() > 0:
-                new_block.conv1.weight.data.copy_(old_w[out_planes][:, in_idx, :, :])
-            if getattr(old_block.conv1, 'bias', None) is not None and out_planes.numel() > 0:
-                new_block.conv1.bias.data.copy_(old_block.conv1.bias.data[out_planes])
-            if out_planes.numel() > 0:
-                copy_bn_params(new_block.bn1, old_block.bn1, out_planes)
+            # BN1
+            new_block.bn1.weight.data.copy_(base_block.bn1.weight.data[out_idx])
+            new_block.bn1.bias.data.copy_(base_block.bn1.bias.data[out_idx])
+            new_block.bn1.running_mean.copy_(base_block.bn1.running_mean[out_idx])
+            new_block.bn1.running_var.copy_(base_block.bn1.running_var[out_idx])
             
-            if out_planes.numel() > 0:
-                new_block.conv2.weight.data.copy_(old_block.conv2.weight.data[out_planes][:, out_planes, :, :])
-            if getattr(old_block.conv2, 'bias', None) is not None and out_planes.numel() > 0:
-                new_block.conv2.bias.data.copy_(old_block.conv2.bias.data[out_planes])
-            if out_planes.numel() > 0:
-                copy_bn_params(new_block.bn2, old_block.bn2, out_planes)
+            # Conv2: kept -> kept
+            new_block.conv2.weight.data.copy_(base_block.conv2.weight.data[out_idx][:, out_idx])
+            new_block.bn2.weight.data.copy_(base_block.bn2.weight.data[out_idx])
+            new_block.bn2.bias.data.copy_(base_block.bn2.bias.data[out_idx])
+            new_block.bn2.running_mean.copy_(base_block.bn2.running_mean[out_idx])
+            new_block.bn2.running_var.copy_(base_block.bn2.running_var[out_idx])
             
-            if expanded_rows.numel() > 0 and out_planes.numel() > 0:
-                new_block.conv3.weight.data.copy_(old_block.conv3.weight.data[expanded_rows][:, out_planes, :, :])
-            if getattr(old_block.conv3, 'bias', None) is not None and expanded_rows.numel() > 0:
-                new_block.conv3.bias.data.copy_(old_block.conv3.bias.data[expanded_rows])
-            if expanded_rows.numel() > 0:
-                copy_bn_params(new_block.bn3, old_block.bn3, expanded_rows)
+            # Conv3: kept -> expanded (4x kept channels)
+            new_block.conv3.weight.data.copy_(base_block.conv3.weight.data[expanded_rows][:, out_idx])
+            new_block.bn3.weight.data.copy_(base_block.bn3.weight.data[expanded_rows])
+            new_block.bn3.bias.data.copy_(base_block.bn3.bias.data[expanded_rows])
+            new_block.bn3.running_mean.copy_(base_block.bn3.running_mean[expanded_rows])
+            new_block.bn3.running_var.copy_(base_block.bn3.running_var[expanded_rows])
             
-            if old_block.downsample is not None:
-                ds_conv = old_block.downsample[0]
-                ds_bn = old_block.downsample[1]
-                if expanded_rows.numel() > 0 and in_idx.numel() > 0:
-                    new_block.downsample[0].weight.data.copy_(ds_conv.weight.data[expanded_rows][:, in_idx, :, :])
-                if expanded_rows.numel() > 0:
-                    copy_bn_params(new_block.downsample[1], ds_bn, expanded_rows)
+            # Downsample (if exists)
+            if base_block.downsample is not None and new_block.downsample is not None:
+                # Downsample conv: prev_kept -> expanded
+                new_block.downsample[0].weight.data.copy_(base_block.downsample[0].weight.data[expanded_rows][:, prev_kept])
+                new_block.downsample[1].weight.data.copy_(base_block.downsample[1].weight.data[expanded_rows])
+                new_block.downsample[1].bias.data.copy_(base_block.downsample[1].bias.data[expanded_rows])
+                new_block.downsample[1].running_mean.copy_(base_block.downsample[1].running_mean[expanded_rows])
+                new_block.downsample[1].running_var.copy_(base_block.downsample[1].running_var[expanded_rows])
+            elif base_block.downsample is not None:
+                print(f"      Warning: Base block has downsample but new block doesn't for {stage} block {block_idx}")
             
-            prev_out_idx = expanded_rows
-            
+        prev_kept = expanded_rows
+    
+    # Copy final FC layer
     last_kept = torch.tensor(keep_indices['layer4'], dtype=torch.long, device=DEVICE)
     if last_kept.numel() > 0:
         fc_in_idx = torch.cat([torch.arange(p * 4, (p + 1) * 4, dtype=torch.long, device=DEVICE) for p in last_kept])
         if fc_in_idx.numel() > 0:
             new_model.fc.weight.data.copy_(base_model.fc.weight.data[:, fc_in_idx])
     new_model.fc.bias.data.copy_(base_model.fc.bias.data)
+    
     return new_model
 
 # -------------------------
@@ -667,7 +661,7 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
             opt.step()
             running_loss += float(loss.item()) * imgs.size(0)
             _, preds = s_logits.max(1)
-            total += labels.size(0); correct = int(preds.eq(labels).sum().item())
+            total += labels.size(0); correct += int(preds.eq(labels).sum().item())
             if bidx % LOG_INTERVAL == 0:
                 print(f"      KD ep{ep+1} batch{bidx} - loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
     student.eval()
@@ -1249,7 +1243,10 @@ def process_dataset_safely(dataset_name, cfg):
 # -------------------------
 # Main loop
 # -------------------------
-for dataset_name, cfg in DATASETS.items():
-    process_dataset_safely(dataset_name, cfg)
-
-print(f"All datasets processed successfully on {time.strftime('%Y-%m-%d %H:%M:%S')}.")
+if __name__ == "__main__":
+    for dataset_name, cfg in DATASETS.items():
+        success = process_dataset_safely(dataset_name, cfg)
+        if not success:
+            print(f"Failed to process {dataset_name}. Continuing with next dataset...")
+    
+    print(f"All datasets processed on {time.strftime('%Y-%m-%d %H:%M:%S')}.")
