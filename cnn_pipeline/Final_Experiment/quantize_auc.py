@@ -41,7 +41,10 @@ class NumpyMemmapDataset(Dataset):
             T.Resize((img_size, img_size)),
             T.ToTensor(),
         ])
-        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.normalize = T.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
     
     def __len__(self):
         return len(self.labels)
@@ -50,7 +53,7 @@ class NumpyMemmapDataset(Dataset):
         img = self.imgs[idx]
         label = int(self.labels[idx])
         x = self.base_tfms(img)
-        if x.shape[0] == 1:
+        if x.shape[0] == 1:  # grayscale → RGB
             x = x.repeat(3, 1, 1)
         x = self.normalize(x)
         return x, label
@@ -60,14 +63,15 @@ def load_model(model_path, num_classes):
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     
     try:
-        state_dict = torch.load(model_path, map_location=DEVICE, weights_only=True)
+        state_dict = torch.load(model_path, map_location=DEVICE)
         model.load_state_dict(state_dict)
         print(f"Successfully loaded model from {model_path}")
         
         dtype = next(iter(state_dict.values())).dtype
         print(f"State dictionary dtype: {dtype}")
         
-        if dtype == torch.float16:
+        # Only halfify if CUDA is available
+        if dtype == torch.float16 and DEVICE.type == "cuda":
             model = model.half()
     except Exception as e:
         print(f"Error loading model: {e}")
@@ -98,22 +102,21 @@ def evaluate_model_basic(model, loader, num_classes, dataset_name):
             if outputs.device != labels.device:
                 outputs = outputs.to(labels.device)
             
-            # CRITICAL FIX: Convert to FP32 before softmax for numerical stability
+            # Convert to FP32 for stability
             if outputs.dtype == torch.half:
                 outputs = outputs.float()
             
-            # Clamp logits to prevent overflow
+            # Clamp logits
             outputs = torch.clamp(outputs, min=-100, max=100)
             
             # Compute softmax in FP32
             probs = torch.softmax(outputs, dim=1)
             probs_np = probs.cpu().numpy()
             
-            # Ensure probabilities sum to 1.0 (normalize if needed)
+            # Normalize if necessary
             prob_sums = np.sum(probs_np, axis=1, keepdims=True)
             probs_np = probs_np / prob_sums
             
-            # Verify no invalid values
             if np.any(np.isnan(probs_np)) or np.any(np.isinf(probs_np)):
                 print(f"Warning: Batch {batch_idx} has invalid probabilities, skipping")
                 continue
@@ -130,18 +133,20 @@ def evaluate_model_basic(model, loader, num_classes, dataset_name):
     prob_sums = np.sum(all_probs, axis=1)
     print(f"{dataset_name}: Probability sums - min={prob_sums.min():.6f}, max={prob_sums.max():.6f}, mean={prob_sums.mean():.6f}")
     
-    # Check label distribution
+    # Label distribution
     unique_labels, counts = np.unique(all_labels, return_counts=True)
     label_dist = dict(zip(unique_labels, counts))
     print(f"{dataset_name} test set label distribution: {label_dist}")
     
     auc = float("nan")
     try:
-        if len(unique_labels) == num_classes:
-            auc = roc_auc_score(all_labels, all_probs, multi_class="ovr")
-            print(f"{dataset_name}: AUC = {auc:.4f}")
-        else:
-            print(f"{dataset_name}: Cannot compute AUC: Found {len(unique_labels)}/{num_classes} classes")
+        auc = roc_auc_score(
+            all_labels,
+            all_probs,
+            multi_class="ovr",
+            labels=list(range(num_classes))  # enforce full class set
+        )
+        print(f"{dataset_name}: AUC = {auc:.4f}")
     except Exception as e:
         print(f"{dataset_name}: AUC calculation failed: {e}")
     
@@ -155,11 +160,17 @@ for dataset_name in ["pathmnist", "dermamnist", "bloodmnist"]:
     print('='*60)
     
     data_path = DATASET_PATHS[dataset_name]
-    data = np.load(data_path)
+    data = np.load(data_path, mmap_mode="r")
     X_test, y_test = data["test_images"], data["test_labels"].flatten()
     
     test_ds = NumpyMemmapDataset(X_test, y_test)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
     
     model = load_model(MODEL_PATHS[dataset_name], NUM_CLASSES[dataset_name])
     auc = evaluate_model_basic(model, test_loader, NUM_CLASSES[dataset_name], dataset_name)
