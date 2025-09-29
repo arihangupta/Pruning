@@ -56,7 +56,7 @@ PREDICTION_IMAGES = 50  # Number of images for prediction energy measurement
 TARGET_COMPRESS_RATIOS = [0.5, 0.75, 0.875]  # FP32 to FP16 (50%), INT8 (75%), INT4 (87.5%)
 
 # Methods: pruning + slim_kd + quantization
-METHODS = ["regional_gradients", "slim_kd", "quantization"]
+METHODS = ["quantization", "regional_gradients", "slim_kd"]
 
 CAL_EPOCHS = 1
 CAL_MAX_BATCHES = 150
