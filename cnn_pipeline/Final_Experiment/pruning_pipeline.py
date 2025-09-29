@@ -56,7 +56,7 @@ PREDICTION_IMAGES = 50  # Number of images for prediction energy measurement
 TARGET_COMPRESS_RATIOS = [0.5, 0.75, 0.875]  # FP32 to FP16 (50%), INT8 (75%), INT4 (87.5%)
 
 # Methods: pruning + slim_kd + quantization
-METHODS = ["regional_gradients", "slim_kd", "quantization"]
+METHODS = ["quantization", "regional_gradients", "slim_kd"]
 
 CAL_EPOCHS = 1
 CAL_MAX_BATCHES = 150
@@ -462,9 +462,18 @@ def evaluate_model_basic(model, loader):
     model.eval()
     loss_total = 0.0; correct = 0; total = 0
     probs_list = []; labels_list = []
+    
+    # Check if model is in half precision
+    model_dtype = next(model.parameters()).dtype
+    
     with torch.no_grad():
         for images, labels in loader:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
+            
+            # Convert images to match model dtype
+            if model_dtype == torch.half:
+                images = images.half()
+            
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss_total += float(loss.item()) * images.size(0)
@@ -499,9 +508,12 @@ def model_size_bytes(model):
 
 def compute_flops(model):
     model.eval()
+    # Check if model is in half precision
+    model_dtype = next(model.parameters()).dtype
+    
     try:
         inputs = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(DEVICE)
-        if next(model.parameters()).dtype == torch.half:
+        if model_dtype == torch.half:
             inputs = inputs.half()
         macs = profile_macs(model, inputs)
         flops = macs * 2
