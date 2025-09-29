@@ -463,18 +463,34 @@ def evaluate_model_basic(model, loader):
     loss_total = 0.0; correct = 0; total = 0
     probs_list = []; labels_list = []
     
-    # Check if model is in half precision
-    model_dtype = next(model.parameters()).dtype
+    # Check if model is in half precision or quantized
+    try:
+        model_dtype = next(model.parameters()).dtype
+    except StopIteration:
+        model_dtype = torch.float32
+    
+    # Check if model is on CPU (for quantized models)
+    try:
+        model_device = next(model.parameters()).device
+    except StopIteration:
+        model_device = DEVICE
     
     with torch.no_grad():
         for images, labels in loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            # Move data to model's device
+            images = images.to(model_device)
+            labels = labels.to(model_device)
             
-            # Convert images to match model dtype
+            # Convert images to match model dtype if needed
             if model_dtype == torch.half:
                 images = images.half()
             
             outputs = model(images)
+            
+            # Move outputs back to same device as labels for loss computation
+            if outputs.device != labels.device:
+                outputs = outputs.to(labels.device)
+            
             loss = criterion(outputs, labels)
             loss_total += float(loss.item()) * images.size(0)
             _, predicted = outputs.max(1)
@@ -508,11 +524,16 @@ def model_size_bytes(model):
 
 def compute_flops(model):
     model.eval()
-    # Check if model is in half precision
-    model_dtype = next(model.parameters()).dtype
+    # Check if model is in half precision and get device
+    try:
+        model_dtype = next(model.parameters()).dtype
+        model_device = next(model.parameters()).device
+    except StopIteration:
+        model_dtype = torch.float32
+        model_device = DEVICE
     
     try:
-        inputs = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(DEVICE)
+        inputs = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(model_device)
         if model_dtype == torch.half:
             inputs = inputs.half()
         macs = profile_macs(model, inputs)
@@ -524,18 +545,29 @@ def compute_flops(model):
 
 def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES):
     model.eval()
-    use_cuda = DEVICE.type == "cuda"
+    
+    # Get model device and dtype
+    try:
+        model_device = next(model.parameters()).device
+        model_dtype = next(model.parameters()).dtype
+    except StopIteration:
+        model_device = DEVICE
+        model_dtype = torch.float32
+    
+    use_cuda = model_device.type == "cuda"
     it = iter(loader)
+    
     try:
         for _ in range(warmup):
             imgs, _ = next(it)
-            imgs = imgs.to(DEVICE)
-            if next(model.parameters()).dtype == torch.half:
+            imgs = imgs.to(model_device)
+            if model_dtype == torch.half:
                 imgs = imgs.half()
             with torch.no_grad(): _ = model(imgs)
             if use_cuda: torch.cuda.synchronize()
     except StopIteration:
         pass
+    
     if use_cuda: torch.cuda.reset_peak_memory_stats()
     start = time.time()
     batches_done = 0
@@ -543,8 +575,8 @@ def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES)
     try:
         for _ in range(timed):
             imgs, _ = next(it)
-            imgs = imgs.to(DEVICE)
-            if next(model.parameters()).dtype == torch.half:
+            imgs = imgs.to(model_device)
+            if model_dtype == torch.half:
                 imgs = imgs.half()
             with torch.no_grad(): _ = model(imgs)
             if use_cuda: torch.cuda.synchronize()
@@ -841,18 +873,21 @@ def symmetric_quantize_model(model, train_loader, bit_width=8):
         quantized_model = quantized_model.to(DEVICE)
         print("Applied FP16 quantization.")
     elif bit_width == 8:
-        model = fuse_resnet(model)
-        model.qconfig = get_default_qconfig('fbgemm')
-        model_prepared = prepare(model, inplace=False)
-        model_prepared.eval()
-        with torch.no_grad():
-            for i, (data, _) in enumerate(train_loader):
-                if i >= 100:
-                    break
-                data = data.to(DEVICE)
-                model_prepared(data)
-        quantized_model = convert(model_prepared, inplace=False)
-        print("Applied INT8 static quantization with calibration.")
+        # Use dynamic quantization which is simpler and more compatible
+        # This quantizes weights to INT8 and uses INT8 computations where possible
+        quantized_model = copy.deepcopy(model)
+        quantized_model = quantized_model.cpu()  # Quantization works on CPU
+        
+        # Dynamic quantization - quantizes weights and activations dynamically
+        quantized_model = torch.quantization.quantize_dynamic(
+            quantized_model,
+            {nn.Conv2d, nn.Linear},  # Quantize these layer types
+            dtype=torch.qint8
+        )
+        
+        print("Applied INT8 dynamic quantization.")
+        # Keep on CPU for quantized inference
+        return quantized_model
     elif bit_width == 4:
         quantized_model = copy.deepcopy(model)
         for name, module in quantized_model.named_modules():
