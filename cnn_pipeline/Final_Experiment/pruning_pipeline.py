@@ -794,14 +794,40 @@ def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCH
 # Quantization
 # -------------------------
 def fuse_resnet(model):
+    """Fuse Conv+BN+ReLU layers for quantization. Handle cases where ReLU might be shared."""
     for m in model.modules():
         if type(m) == Bottleneck:
-            fuse_modules(m, ['conv1', 'bn1', 'relu'], inplace=True)
-            fuse_modules(m, ['conv2', 'bn2', 'relu'], inplace=True)
-            fuse_modules(m, ['conv3', 'bn3'], inplace=True)
+            # Try to fuse conv1+bn1 (ReLU is inplace and shared, can't fuse easily)
+            try:
+                fuse_modules(m, ['conv1', 'bn1'], inplace=True)
+            except Exception as e:
+                print(f"      Warning: Could not fuse conv1+bn1: {e}")
+            
+            # Try to fuse conv2+bn2
+            try:
+                fuse_modules(m, ['conv2', 'bn2'], inplace=True)
+            except Exception as e:
+                print(f"      Warning: Could not fuse conv2+bn2: {e}")
+            
+            # Try to fuse conv3+bn3
+            try:
+                fuse_modules(m, ['conv3', 'bn3'], inplace=True)
+            except Exception as e:
+                print(f"      Warning: Could not fuse conv3+bn3: {e}")
+            
+            # Try to fuse downsample if it exists
             if m.downsample is not None:
-                fuse_modules(m.downsample, ['0', '1'], inplace=True)
-    fuse_modules(model, ['conv1', 'bn1', 'relu'], inplace=True)
+                try:
+                    fuse_modules(m.downsample, ['0', '1'], inplace=True)
+                except Exception as e:
+                    print(f"      Warning: Could not fuse downsample: {e}")
+    
+    # Fuse the initial conv1+bn1 (again, ReLU is separate)
+    try:
+        fuse_modules(model, ['conv1', 'bn1'], inplace=True)
+    except Exception as e:
+        print(f"      Warning: Could not fuse model conv1+bn1: {e}")
+    
     return model
 
 def symmetric_quantize_model(model, train_loader, bit_width=8):
