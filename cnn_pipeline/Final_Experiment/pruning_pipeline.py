@@ -393,9 +393,18 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
         expanded_rows = torch.cat([torch.arange(p * 4, (p + 1) * 4, dtype=torch.long, device=DEVICE) for p in kept])
         
         for block_idx, (base_block, new_block) in enumerate(zip(base_stage.children(), new_stage.children())):
-            # Conv1: input from prev_kept, output to kept channels
-            in_idx = prev_kept if stage_idx == 0 or block_idx > 0 else prev_kept
+            # For the first block of each stage, input comes from previous stage
+            # For subsequent blocks, input comes from within the same stage
+            if block_idx == 0:
+                # First block: input from prev_kept (previous stage output or conv1)
+                in_idx = prev_kept
+            else:
+                # Subsequent blocks: input from expanded_rows of current stage
+                in_idx = expanded_rows
+            
             out_idx = kept
+            
+            # Conv1: input channels depend on block position
             new_block.conv1.weight.data.copy_(base_block.conv1.weight.data[out_idx][:, in_idx])
             
             # BN1
@@ -418,17 +427,20 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
             new_block.bn3.running_mean.copy_(base_block.bn3.running_mean[expanded_rows])
             new_block.bn3.running_var.copy_(base_block.bn3.running_var[expanded_rows])
             
-            # Downsample (if exists)
+            # Downsample (if exists) - only in first block
             if base_block.downsample is not None and new_block.downsample is not None:
                 # Downsample conv: prev_kept -> expanded
-                new_block.downsample[0].weight.data.copy_(base_block.downsample[0].weight.data[expanded_rows][:, prev_kept])
+                # For first block, this projects from previous stage to current stage
+                downsample_in_idx = prev_kept if block_idx == 0 else expanded_rows
+                new_block.downsample[0].weight.data.copy_(base_block.downsample[0].weight.data[expanded_rows][:, downsample_in_idx])
                 new_block.downsample[1].weight.data.copy_(base_block.downsample[1].weight.data[expanded_rows])
                 new_block.downsample[1].bias.data.copy_(base_block.downsample[1].bias.data[expanded_rows])
                 new_block.downsample[1].running_mean.copy_(base_block.downsample[1].running_mean[expanded_rows])
                 new_block.downsample[1].running_var.copy_(base_block.downsample[1].running_var[expanded_rows])
             elif base_block.downsample is not None:
                 print(f"      Warning: Base block has downsample but new block doesn't for {stage} block {block_idx}")
-            
+        
+        # Update prev_kept for next stage
         prev_kept = expanded_rows
     
     # Copy final FC layer
