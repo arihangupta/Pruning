@@ -743,18 +743,22 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
     return student
 
 # -------------------------
-# Global finetune with AMP support for FP16
+# Global finetune with FP16 support
 # -------------------------
 def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR):
     model.train()
-    opt = optim.Adam(model.parameters(), lr=lr)
     
     # Check model dtype
     model_dtype = next(model.parameters()).dtype
-    use_amp = (model_dtype == torch.half)
+    is_fp16 = (model_dtype == torch.half)
     
-    # Create GradScaler for mixed precision training
-    scaler = torch.cuda.amp.GradScaler() if use_amp and torch.cuda.is_available() else None
+    # For FP16 models, convert back to FP32 for training stability
+    if is_fp16:
+        print("    Converting FP16 model to FP32 for stable finetuning...")
+        model = model.float()
+        model_dtype = torch.float32
+    
+    opt = optim.Adam(model.parameters(), lr=lr)
     
     for ep in range(epochs):
         running_loss = 0.0; total = 0; correct = 0
@@ -763,30 +767,10 @@ def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCH
             labels = labels.to(DEVICE)
             
             opt.zero_grad()
-            
-            if use_amp and scaler is not None:
-                # Use automatic mixed precision for FP16
-                with torch.cuda.amp.autocast():
-                    # Keep model in FP16, but autocast handles the ops
-                    out = model(imgs)
-                    # Loss computation in FP32 automatically
-                    loss = criterion(out.float(), labels)
-                
-                # Scale loss and backward
-                scaler.scale(loss).backward()
-                scaler.step(opt)
-                scaler.update()
-            else:
-                # Standard training for FP32 models
-                if model_dtype == torch.half:
-                    imgs = imgs.half()
-                    out = model(imgs).float()
-                else:
-                    out = model(imgs)
-                
-                loss = criterion(out, labels)
-                loss.backward()
-                opt.step()
+            out = model(imgs)
+            loss = criterion(out, labels)
+            loss.backward()
+            opt.step()
             
             running_loss += float(loss.item()) * imgs.size(0)
             _, preds = out.max(1)
@@ -797,6 +781,11 @@ def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCH
         
         vloss, vacc, vauc = evaluate_model_basic(model, val_loader)
         print(f"    Global FT epoch {ep+1}: ValLoss {vloss:.4f}, ValAcc {vacc:.4f}, ValAUC {vauc:.4f}")
+    
+    # Convert back to FP16 after training if it was originally FP16
+    if is_fp16:
+        print("    Converting model back to FP16 after finetuning...")
+        model = model.half()
     
     model.eval()
     return model
