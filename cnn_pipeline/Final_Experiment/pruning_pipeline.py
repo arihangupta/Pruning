@@ -56,7 +56,7 @@ PREDICTION_IMAGES = 50  # Number of images for prediction energy measurement
 TARGET_COMPRESS_RATIOS = [0.5, 0.75, 0.875]  # FP32 to FP16 (50%), INT8 (75%), INT4 (87.5%)
 
 # Methods: pruning + slim_kd + quantization
-METHODS = ["quantization", "regional_gradients", "slim_kd"]
+METHODS = ["quantization", "slim_kd", "regional_gradients"]
 
 CAL_EPOCHS = 1
 CAL_MAX_BATCHES = 150
@@ -662,18 +662,38 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
     opt = optim.Adam(student.parameters(), lr=lr)
     kl_loss = nn.KLDivLoss(reduction='batchmean')
     device = DEVICE
+    
+    # Check dtypes for student and teacher
+    student_dtype = next(student.parameters()).dtype
+    teacher_dtype = next(teacher.parameters()).dtype
+    
     for ep in range(epochs):
         running_loss = 0.0; total = 0; correct = 0
         for bidx, (imgs, labels) in enumerate(train_loader, 1):
             if max_batches is not None and bidx > max_batches:
                 break
             imgs = imgs.to(device)
-            if next(student.parameters()).dtype == torch.half:
-                imgs = imgs.half()
             labels = labels.to(device)
+            
+            # Get teacher outputs with appropriate dtype
             with torch.no_grad():
-                t_logits = teacher(imgs)
-            s_logits = student(imgs)
+                if teacher_dtype == torch.half:
+                    t_logits = teacher(imgs.half())
+                else:
+                    t_logits = teacher(imgs)
+                # Convert teacher logits to float32 for loss computation
+                if t_logits.dtype == torch.half:
+                    t_logits = t_logits.float()
+            
+            # Get student outputs with appropriate dtype
+            if student_dtype == torch.half:
+                s_logits = student(imgs.half())
+                # Convert student logits to float32 for loss computation
+                if s_logits.dtype == torch.half:
+                    s_logits = s_logits.float()
+            else:
+                s_logits = student(imgs)
+            
             loss_ce = criterion(s_logits, labels)
             s_log_soft = F.log_softmax(s_logits / T, dim=1)
             with torch.no_grad():
@@ -697,15 +717,27 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
 def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR):
     model.train()
     opt = optim.Adam(model.parameters(), lr=lr)
+    
+    # Check model dtype
+    model_dtype = next(model.parameters()).dtype
+    
     for ep in range(epochs):
         running_loss = 0.0; total = 0; correct = 0
         for bidx, (imgs, labels) in enumerate(train_loader, 1):
             imgs = imgs.to(DEVICE)
-            if next(model.parameters()).dtype == torch.half:
-                imgs = imgs.half()
             labels = labels.to(DEVICE)
+            
+            # Convert images to match model dtype
+            if model_dtype == torch.half:
+                imgs = imgs.half()
+            
             opt.zero_grad()
             out = model(imgs)
+            
+            # Convert output to float32 for loss computation if needed
+            if out.dtype == torch.half:
+                out = out.float()
+            
             loss = criterion(out, labels)
             loss.backward(); opt.step()
             running_loss += float(loss.item()) * imgs.size(0)
