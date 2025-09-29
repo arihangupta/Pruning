@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Complete script to run the full factorial benchmarking experiment on available MedMNIST datasets.
@@ -127,23 +128,10 @@ class CustomResNet(nn.Module):
         x = self.fc(x)
         return x
 
-def build_model(num_classes: int, pruning_ratio=None):
+def build_model(num_classes: int, stage_planes=[64, 128, 256, 512]):
     """
-    Build a ResNet-50 model with the right classifier head and optional pruning.
-    Always use in_channels=3 to match pruning code's expectation.
-    pruning_ratio: None for baseline, or 0.5, 0.6, 0.7 for pruned models.
+    Build a ResNet-50 model with the right classifier head and specified stage planes.
     """
-    if pruning_ratio is None:
-        # Baseline ResNet-50
-        stage_planes = [64, 128, 256, 512]
-    else:
-        # Pruned model with reduced channels
-        stage_planes = [
-            max(1, int(math.floor(64 * (1.0 - pruning_ratio)))),
-            max(1, int(math.floor(128 * (1.0 - pruning_ratio)))),
-            max(1, int(math.floor(256 * (1.0 - pruning_ratio)))),
-            max(1, int(math.floor(512 * (1.0 - pruning_ratio))))
-        ]
     model = CustomResNet(
         block=Bottleneck,
         layers=[3, 4, 6, 3],
@@ -239,23 +227,38 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
     if not os.path.exists(model_path):
         raise ValueError(f"Model path does not exist: {model_path}")
     
-    model = build_model(num_classes, pruning_ratio)
     state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
     
-    # Check if model is quantized (FP16) or INT8
-    sample_param = next(iter(state_dict.values()))
+    # Infer stage_planes from state_dict
+    stage_planes = []
+    for i in range(4):
+        key = f'layer{i+1}.0.conv1.weight'
+        if key in state_dict:
+            planes = state_dict[key].shape[0]
+            stage_planes.append(planes)
+        else:
+            raise ValueError(f"Cannot find {key} to infer stage_planes")
     
-    if sample_param.dtype == torch.float16:
-        # FP16 quantized model - load normally then convert
-        model.load_state_dict(state_dict)
+    # Build model with inferred stage_planes
+    model = build_model(num_classes, stage_planes=stage_planes)
+    
+    # Check dtype for fp16
+    sample_param = next(iter(state_dict.values()))
+    is_fp16 = sample_param.dtype == torch.float16
+    
+    if is_fp16:
         model = model.half()
-    elif "quantization" in model_name and sample_param.dtype == torch.qint8:
-        # INT8 quantized - this is complex, may not work
-        # INT8 models should stay on CPU
+    
+    # Load state_dict
+    try:
         model.load_state_dict(state_dict)
-    else:
-        # Regular FP32 model
-        model.load_state_dict(state_dict)
+    except Exception as e:
+        raise RuntimeError(f"Error loading state_dict: {e}")
+    
+    # For int8, if detected
+    if "quantization" in model_name and hasattr(sample_param, 'dtype') and sample_param.dtype == torch.qint8:
+        print("Warning: INT8 model detected. Ensuring CPU mode if necessary.")
+        # Additional handling if needed, but assume load succeeded
     
     return model
 
