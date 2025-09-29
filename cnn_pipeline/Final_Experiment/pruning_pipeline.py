@@ -662,27 +662,38 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
     opt = optim.Adam(student.parameters(), lr=lr)
     kl_loss = nn.KLDivLoss(reduction='batchmean')
     device = DEVICE
+    student_dtype = next(student.parameters()).dtype
+    teacher_dtype = next(teacher.parameters()).dtype
+
     for ep in range(epochs):
         running_loss = 0.0; total = 0; correct = 0
         for bidx, (imgs, labels) in enumerate(train_loader, 1):
             if max_batches is not None and bidx > max_batches:
                 break
+            # Move images and labels to device
             imgs = imgs.to(device)
             labels = labels.to(device)
+            
+            # Ensure teacher input is FP32
+            imgs_teacher = imgs.float()  # Teacher expects FP32
             with torch.no_grad():
-                t_logits = teacher(imgs)
-            if next(student.parameters()).dtype == torch.half:
-                imgs = imgs.half()
-            s_logits = student(imgs)
+                t_logits = teacher(imgs_teacher)
+            
+            # Convert images to student’s dtype if necessary
+            imgs_student = imgs.half() if student_dtype == torch.float16 else imgs.float()
+            s_logits = student(imgs_student)
+            
             loss_ce = criterion(s_logits, labels)
             s_log_soft = F.log_softmax(s_logits / T, dim=1)
             with torch.no_grad():
                 t_soft = F.softmax(t_logits / T, dim=1)
             loss_kd = kl_loss(s_log_soft, t_soft) * (T * T)
             loss = alpha * loss_ce + (1.0 - alpha) * loss_kd
+            
             opt.zero_grad()
             loss.backward()
             opt.step()
+            
             running_loss += float(loss.item()) * imgs.size(0)
             _, preds = s_logits.max(1)
             total += labels.size(0); correct += int(preds.eq(labels).sum().item())
