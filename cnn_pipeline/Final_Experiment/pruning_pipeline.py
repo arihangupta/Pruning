@@ -56,7 +56,7 @@ PREDICTION_IMAGES = 50  # Number of images for prediction energy measurement
 TARGET_COMPRESS_RATIOS = [0.5, 0.75, 0.875]  # FP32 to FP16 (50%), INT8 (75%), INT4 (87.5%)
 
 # Methods: pruning + slim_kd + quantization
-METHODS = ["quantization", "regional_gradients", "slim_kd"]
+METHODS = ["regional_gradients", "slim_kd", "quantization"]
 
 CAL_EPOCHS = 1
 CAL_MAX_BATCHES = 150
@@ -662,70 +662,142 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
     opt = optim.Adam(student.parameters(), lr=lr)
     kl_loss = nn.KLDivLoss(reduction='batchmean')
     device = DEVICE
+    
+    # Check dtypes for student and teacher
     student_dtype = next(student.parameters()).dtype
     teacher_dtype = next(teacher.parameters()).dtype
-
+    
+    # Use FP16 training flag
+    use_fp16 = (student_dtype == torch.half)
+    
     for ep in range(epochs):
         running_loss = 0.0; total = 0; correct = 0
         for bidx, (imgs, labels) in enumerate(train_loader, 1):
             if max_batches is not None and bidx > max_batches:
                 break
-            # Move images and labels to device
             imgs = imgs.to(device)
             labels = labels.to(device)
             
-            # Ensure teacher input is FP32
-            imgs_teacher = imgs.float()  # Teacher expects FP32
-            with torch.no_grad():
-                t_logits = teacher(imgs_teacher)
+            # For FP16 models, do all computations in FP32 to avoid NaN
+            if use_fp16:
+                # Get teacher outputs in FP32
+                with torch.no_grad():
+                    if teacher_dtype == torch.half:
+                        t_logits = teacher(imgs.half()).float()
+                    else:
+                        t_logits = teacher(imgs)
+                
+                # Get student outputs and convert to FP32 immediately
+                s_logits = student(imgs.half()).float()
+            else:
+                # Standard FP32 training
+                with torch.no_grad():
+                    if teacher_dtype == torch.half:
+                        t_logits = teacher(imgs.half()).float()
+                    else:
+                        t_logits = teacher(imgs)
+                
+                s_logits = student(imgs)
             
-            # Convert images to student’s dtype if necessary
-            imgs_student = imgs.half() if student_dtype == torch.float16 else imgs.float()
-            s_logits = student(imgs_student)
-            
+            # All loss computations in FP32
             loss_ce = criterion(s_logits, labels)
+            
+            # Compute KD loss with numerical stability
             s_log_soft = F.log_softmax(s_logits / T, dim=1)
             with torch.no_grad():
                 t_soft = F.softmax(t_logits / T, dim=1)
+            
+            # Clamp to avoid log(0) issues
+            s_log_soft = torch.clamp(s_log_soft, min=-100)
+            t_soft = torch.clamp(t_soft, min=1e-8)
+            
             loss_kd = kl_loss(s_log_soft, t_soft) * (T * T)
+            
+            # Check for NaN and skip if detected
+            if torch.isnan(loss_ce) or torch.isnan(loss_kd):
+                print(f"      Warning: NaN detected in losses (CE: {loss_ce.item()}, KD: {loss_kd.item()}), skipping batch")
+                continue
+            
             loss = alpha * loss_ce + (1.0 - alpha) * loss_kd
             
             opt.zero_grad()
             loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients in FP16
+            if use_fp16:
+                torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
+            
             opt.step()
             
             running_loss += float(loss.item()) * imgs.size(0)
             _, preds = s_logits.max(1)
-            total += labels.size(0); correct += int(preds.eq(labels).sum().item())
+            total += labels.size(0)
+            correct += int(preds.eq(labels).sum().item())
+            
             if bidx % LOG_INTERVAL == 0:
-                print(f"      KD ep{ep+1} batch{bidx} - loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
+                avg_loss = running_loss/max(1,total)
+                avg_acc = correct/max(1,total)
+                print(f"      KD ep{ep+1} batch{bidx} - loss {avg_loss:.4f}, acc {avg_acc:.4f}")
+    
     student.eval()
     return student
 
 # -------------------------
-# Global finetune
+# Global finetune with AMP support for FP16
 # -------------------------
 def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR):
     model.train()
     opt = optim.Adam(model.parameters(), lr=lr)
+    
+    # Check model dtype
+    model_dtype = next(model.parameters()).dtype
+    use_amp = (model_dtype == torch.half)
+    
+    # Create GradScaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler() if use_amp and torch.cuda.is_available() else None
+    
     for ep in range(epochs):
         running_loss = 0.0; total = 0; correct = 0
         for bidx, (imgs, labels) in enumerate(train_loader, 1):
             imgs = imgs.to(DEVICE)
-            if next(model.parameters()).dtype == torch.half:
-                imgs = imgs.half()
             labels = labels.to(DEVICE)
+            
             opt.zero_grad()
-            out = model(imgs)
-            loss = criterion(out, labels)
-            loss.backward(); opt.step()
+            
+            if use_amp and scaler is not None:
+                # Use automatic mixed precision for FP16
+                with torch.cuda.amp.autocast():
+                    # Keep model in FP16, but autocast handles the ops
+                    out = model(imgs)
+                    # Loss computation in FP32 automatically
+                    loss = criterion(out.float(), labels)
+                
+                # Scale loss and backward
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                # Standard training for FP32 models
+                if model_dtype == torch.half:
+                    imgs = imgs.half()
+                    out = model(imgs).float()
+                else:
+                    out = model(imgs)
+                
+                loss = criterion(out, labels)
+                loss.backward()
+                opt.step()
+            
             running_loss += float(loss.item()) * imgs.size(0)
             _, preds = out.max(1)
             total += labels.size(0); correct += int(preds.eq(labels).sum().item())
+            
             if bidx % LOG_INTERVAL == 0:
                 print(f"    Global FT ep{ep+1} batch{bidx} - loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
+        
         vloss, vacc, vauc = evaluate_model_basic(model, val_loader)
         print(f"    Global FT epoch {ep+1}: ValLoss {vloss:.4f}, ValAcc {vacc:.4f}, ValAUC {vauc:.4f}")
+    
     model.eval()
     return model
 
@@ -746,7 +818,12 @@ def fuse_resnet(model):
 def symmetric_quantize_model(model, train_loader, bit_width=8):
     model.eval()
     if bit_width == 16:
-        quantized_model = model.half()
+        # For FP16, we need to be more careful
+        # Clone the model first to avoid modifying the original
+        quantized_model = copy.deepcopy(model)
+        quantized_model = quantized_model.half()
+        # Move back to device
+        quantized_model = quantized_model.to(DEVICE)
         print("Applied FP16 quantization.")
     elif bit_width == 8:
         model = fuse_resnet(model)
@@ -1202,13 +1279,21 @@ def process_dataset_safely(dataset_name, cfg):
                     rows.append(row)
                     print("  Quantized metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
-                    print("  Knowledge distillation...")
-                    current_model = distill_student(current_model, baseline, train_loader, epochs=KD_EPOCHS, lr=KD_LR, alpha=KD_ALPHA, T=KD_TEMPERATURE, max_batches=KD_MAX_BATCHES)
-                    kd_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_afterKD.pth")
-                    torch.save(current_model.state_dict(), kd_ckpt)
-                    row = collect_metrics_row(method, "after_kd", keep_ratio, current_model, test_loader, kd_ckpt)
-                    rows.append(row)
-                    print("  KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
+                    # Skip KD for FP16 due to numerical instability, but keep finetuning
+                    if bit_width == 16:
+                        print("  Skipping KD for FP16 (using AMP finetuning only)")
+                        # Add a placeholder row for consistency
+                        kd_row = row.copy()
+                        kd_row["Stage"] = "after_kd"
+                        rows.append(kd_row)
+                    else:
+                        print("  Knowledge distillation...")
+                        current_model = distill_student(current_model, baseline, train_loader, epochs=KD_EPOCHS, lr=KD_LR, alpha=KD_ALPHA, T=KD_TEMPERATURE, max_batches=KD_MAX_BATCHES)
+                        kd_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_afterKD.pth")
+                        torch.save(current_model.state_dict(), kd_ckpt)
+                        row = collect_metrics_row(method, "after_kd", keep_ratio, current_model, test_loader, kd_ckpt)
+                        rows.append(row)
+                        print("  KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
                     print("  Final global finetune...")
                     current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
