@@ -179,11 +179,11 @@ def parse_model_name(filename, dataset):
         return None
     
     # Extract pruning method
-    if "pgto_regional_gradients" in basename:
+    if "pgto_regional_graients" in basename:
         method = "pgto_regional_gradients"
     elif "quantization" in basename:
         method = "quantization"
-    elif "slim_kd" in basename:
+    elif "sli_kd" in basename:
         method = "slim_kd"
     else:
         logger.debug(f"Skipping {basename}: no recognized pruning method")
