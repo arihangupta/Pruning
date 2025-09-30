@@ -32,8 +32,20 @@ import sys
 import subprocess as sp
 import logging
 
-# For quantization
+# For quantization and AMP
 import torch.ao.quantization as ao_quant
+import torch.amp
+
+# Configure debug logging to file only
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/home/arihangupta/Pruning/dinov2/Pruning/time_experiment_debug.log'),
+        # No StreamHandler to avoid console output
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # CodeCarbon
 try:
@@ -158,12 +170,16 @@ def get_dataset_channels(npz_path):
 
 def parse_model_name(filename, dataset):
     basename = os.path.basename(filename)
+    logger.debug(f"Parsing model file: {basename} for dataset: {dataset}")
+    
     if basename == "baseline.pth":
         return {"model_name": "baseline", "pruning_method": "baseline", "sparsity": "0%", "pruning_ratio": None}
     
     if not basename.endswith("_final.pth"):
+        logger.debug(f"Skipping {basename}: does not end with _final.pth")
         return None
     
+    # Extract pruning method
     if "pgto_regional_gradients" in basename:
         method = "pgto_regional_gradients"
     elif "quantization" in basename:
@@ -171,6 +187,7 @@ def parse_model_name(filename, dataset):
     elif "slim_kd" in basename:
         method = "slim_kd"
     else:
+        logger.debug(f"Skipping {basename}: no recognized pruning method")
         return None
 
     sparsity = None
@@ -179,13 +196,15 @@ def parse_model_name(filename, dataset):
     if os.path.exists(metrics_csv):
         try:
             df = pd.read_csv(metrics_csv)
+            logger.debug(f"Loaded metrics CSV: {metrics_csv}, {len(df)} rows")
             model_basename = basename.replace(".pth", "")
-            for _, row in df.iterrows():
+            for idx, row in df.iterrows():
                 model_name = str(row.get("model_name", ""))
                 pruning_method = str(row.get("pruning_method", ""))
                 if (method in model_name.lower() or method in pruning_method.lower() or
                     model_basename in model_name or model_basename in pruning_method):
                     sparsity = row.get("sparsity", None)
+                    logger.debug(f"Match found at row {idx}: model_name={model_name}, pruning_method={pruning_method}, sparsity={sparsity}")
                     if sparsity is not None:
                         if isinstance(sparsity, str) and "%" in sparsity:
                             pruning_ratio = float(sparsity.strip("%")) / 100.0
@@ -194,17 +213,34 @@ def parse_model_name(filename, dataset):
                             pruning_ratio = float(sparsity)
                             sparsity = f"{int(sparsity * 100)}%"
                         break
+            else:
+                logger.debug(f"No matching sparsity found in CSV for {model_basename}")
         except Exception as e:
             print(f"Error reading sparsity from {metrics_csv}: {e}")
+            logger.debug(f"CSV error: {str(e)}")
 
+    # Enhanced filename parsing for sparsity
     if sparsity is None:
-        match = re.search(r'r50compressed_(\d+)', basename)
-        if match:
-            sparsity = f"{match.group(1)}%"
-            pruning_ratio = float(match.group(1)) / 100.0
+        # Try multiple patterns
+        patterns = [
+            r'r50compressed_(\d+)',  # e.g., r50compressed_50
+            r'_(\d+)%',             # e.g., slim_kd_50%
+            r'_sparsity(\d+)',      # e.g., slim_kd_sparsity50
+            r'_(\d+)p',             # e.g., slim_kd_50p
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, basename)
+            if match:
+                sparsity_value = int(match.group(1))
+                sparsity = f"{sparsity_value}%"
+                pruning_ratio = sparsity_value / 100.0
+                logger.debug(f"Sparsity extracted from filename: {sparsity}, pruning_ratio={pruning_ratio}")
+                break
         else:
-            sparsity = "unknown"
-            pruning_ratio = 0.5
+            # Fallback to 0% instead of "unknown" to avoid misleading names
+            sparsity = "0%"
+            pruning_ratio = 0.0
+            logger.debug(f"No sparsity found in filename or CSV for {basename}, defaulting to sparsity=0%")
 
     model_name = f"{method}_{sparsity}"
     return {"model_name": model_name, "pruning_method": method, "sparsity": sparsity, "pruning_ratio": pruning_ratio}
@@ -232,13 +268,12 @@ def discover_models():
     return models
 
 def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None, in_channels=3):
-    """Build model with channel counts inferred from checkpoint. ALWAYS returns (model, device_override) tuple."""
     if not os.path.exists(model_path):
         raise ValueError(f"Model path does not exist: {model_path}")
     
     state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
     
-    # Infer stage_planes from state_dict
+    # Infer stage_planes
     stage_planes = []
     for i in range(4):
         key = f'layer{i+1}.0.conv1.weight'
@@ -248,10 +283,8 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
         else:
             raise ValueError(f"Cannot find {key} to infer stage_planes")
     
-    # Build model with inferred stage_planes
     model = build_model(num_classes, stage_planes=stage_planes)
     
-    # Check dtype
     sample_param = next(iter(state_dict.values()))
     is_fp16 = sample_param.dtype == torch.float16
     is_int8 = hasattr(sample_param, 'dtype') and sample_param.dtype == torch.qint8
@@ -259,18 +292,15 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
     if is_fp16:
         model = model.half()
     
-    # Load state_dict
     try:
         model.load_state_dict(state_dict)
     except Exception as e:
         raise RuntimeError(f"Error loading state_dict: {e}")
     
-    # Handle INT8 quantization - MUST use CPU
     if is_int8:
-        print("Warning: INT8 model detected. Moving to CPU for compatibility.")
+        logger.debug(f"INT8 model detected for {model_path}, using CPU")
         return model, 'cpu'
     
-    # FIXED: Always return tuple
     return model, None
 
 MATRIX_CONFIG["models"] = discover_models()
@@ -337,7 +367,6 @@ def load_model(config, num_classes, dataset_name):
     if not os.path.exists(model_path):
         raise ValueError(f"Model not found: {model_path}")
     
-    # FIXED: Now always receives tuple
     model, override_device = build_model_for_load(
         config.experiment['model_name'],
         num_classes,
@@ -346,7 +375,6 @@ def load_model(config, num_classes, dataset_name):
         in_channels=in_channels
     )
     
-    # Use override_device for INT8 models, otherwise use config device
     device = override_device if override_device else config.experiment['device']
     model = model.to(device).eval()
     
@@ -473,7 +501,7 @@ def bench_fixed_time(config):
             batch = next(iter(test_loader))
             inputs = batch[0].to(device)
             if config.experiment['precision'] == 'amp':
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     _ = model(inputs)
             else:
                 _ = model(inputs)
@@ -500,7 +528,7 @@ def bench_fixed_time(config):
             break
         with torch.no_grad():
             if config.experiment['precision'] == 'amp':
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     _ = model(inputs)
             else:
                 _ = model(inputs)
@@ -718,8 +746,6 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
                     speedup = pr_row['median_throughput'] / bl_row['median_throughput']
                     pct_more = (speedup - 1) * 100
                     energy_saving = (bl_row['median_energy_kWh'] - pr_row['median_energy_kWh']) / bl_row['median_energy_kWh'] * 100 if not math.isnan(bl_row['median_energy_kWh']) else np.nan
-                    
-                    # FIXED: Get matching runs and handle different array lengths
                     bl_tps = df[(df['pruning_method'] == 'baseline') & 
                                (df['batch_size'] == bl_row['batch_size']) & 
                                (df['precision'] == bl_row['precision'])]['throughput_imgs_per_s'].values
@@ -727,8 +753,6 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
                                (df['sparsity'] == sparsity) & 
                                (df['batch_size'] == bl_row['batch_size']) & 
                                (df['precision'] == bl_row['precision'])]['throughput_imgs_per_s'].values
-                    
-                    # Only compute speedup CI if we have paired data
                     if len(bl_tps) == len(pr_tps) and len(bl_tps) > 1:
                         speedup_ratios = pr_tps / bl_tps
                         ci_speedup_low, ci_speedup_high = bootstrap_ci(speedup_ratios)
@@ -736,12 +760,10 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
                     else:
                         ci_speedup_low, ci_speedup_high = np.nan, np.nan
                         pval = np.nan
-                    
                     print(f"{dataset}: {method} ({sparsity}) vs baseline (bs={bl_row['batch_size']}, prec={bl_row['precision']}): "
                           f"speedup={speedup:.2f} ({pct_more:.1f}%), energy_saving_pct={energy_saving:.1f}%, "
                           f"p={pval:.4f}, 95% CI [{ci_speedup_low:.2f}, {ci_speedup_high:.2f}]")
 
-    # Plots
     plt.figure(figsize=(12, 8))
     sns.lineplot(data=summary_df, x='batch_size', y='median_throughput', hue='pruning_method', style='sparsity', markers=True, dashes=False)
     plt.title(f'Throughput vs Batch Size ({dataset})')
@@ -765,7 +787,6 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
     return summary_df
 
 def run_full_analysis(log_base):
-    """Run analysis for all datasets."""
     analysis_dir = log_base / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
     all_summaries = []
@@ -787,4 +808,4 @@ if __name__ == "__main__":
     run_matrix(MATRIX_CONFIG)
     print("All runs complete. Running analysis...")
     run_full_analysis(Path(MATRIX_CONFIG['log_dir']))
-    print("Full process complete! Check time_experiment_results/ for outputs.")
+    print("Full process complete! Check time_experiment_results_2/ for outputs.")
