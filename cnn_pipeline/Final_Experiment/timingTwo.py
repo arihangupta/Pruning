@@ -179,11 +179,11 @@ def parse_model_name(filename, dataset):
         return None
     
     # Extract pruning method
-    if "pgto_regional_graients" in basename:
+    if "pgto_regional_gradients" in basename:
         method = "pgto_regional_gradients"
     elif "quantization" in basename:
         method = "quantization"
-    elif "sli_kd" in basename:
+    elif "slim_kd" in basename:
         method = "slim_kd"
     else:
         logger.debug(f"Skipping {basename}: no recognized pruning method")
@@ -632,7 +632,7 @@ def run_matrix(matrix_config):
     log_base.mkdir(parents=True, exist_ok=True)
 
     batch_sizes = matrix_config['batch_sizes']
-    precisions = matrix_config['precisions']
+    precisions = matrix_config['precisions']  # ["fp32", "amp"]
     repeats = matrix_config['repeats']
     time_budget_s = matrix_config['time_budget_s']
     warmup_batches = matrix_config['warmup_batches']
@@ -650,7 +650,12 @@ def run_matrix(matrix_config):
             print(f"Starting repeat {rep+1}/{repeats} for {dataset}")
             random.seed(seed + rep)
 
-            conditions = list(product(range(len(dataset_models)), batch_sizes, precisions))
+            # Create conditions, restricting quantization to amp
+            conditions = []
+            for midx, model_cfg in enumerate(dataset_models):
+                model_precisions = ['amp'] if model_cfg['pruning_method'] == 'quantization' else precisions
+                for bs, prec in product(batch_sizes, model_precisions):
+                    conditions.append((midx, bs, prec))
             random.shuffle(conditions)
 
             for midx, bs, prec in conditions:
