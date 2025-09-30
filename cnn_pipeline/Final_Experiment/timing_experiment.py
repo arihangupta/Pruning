@@ -1,12 +1,11 @@
-
 #!/usr/bin/env python3
 """
 Complete script to run the full factorial benchmarking experiment on available MedMNIST datasets.
-Dynamically discovers all models ending in '_final.pth' and 'baseline.pth' for each dataset.
-Uses CustomResNet with uniform pruning ratios for layers 1-4, preserving conv1 at 64 channels.
+Dynamically discovers models ending in '_final.pth' and 'baseline.pth' for each dataset.
+Uses CustomResNet with channel counts inferred from checkpoints to avoid size mismatches.
 Handles both RGB and grayscale images by detecting dataset channel count.
-Includes CodeCarbon for power utilization and detailed analysis with pruning method and sparsity.
-Now supports quantized model loading and AMP precision.
+Includes CodeCarbon for power utilization (silently in background) and detailed analysis with pruning method and sparsity.
+Supports quantized model loading and AMP precision.
 """
 
 import os
@@ -31,6 +30,7 @@ import glob
 import re
 import sys
 import subprocess as sp
+import logging
 
 # For quantization
 import torch.ao.quantization as ao_quant
@@ -42,7 +42,13 @@ try:
 except Exception:
     EmissionsTracker = None
     CODECARBON_AVAILABLE = False
-    print("Warning: codecarbon not available. Energy/emissions will be NaN.")
+
+# Suppress CodeCarbon logs
+if CODECARBON_AVAILABLE:
+    logging.getLogger("codecarbon").setLevel(logging.ERROR)
+    for handler in logging.getLogger("codecarbon").handlers[:]:
+        if isinstance(handler, logging.StreamHandler):
+            logging.getLogger("codecarbon").removeHandler(handler)
 
 # Import the proven Bottleneck class from torchvision
 from torchvision.models.resnet import Bottleneck
@@ -58,9 +64,7 @@ DATASETS = {
     "tissuemnist": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/tissuemnist_224.npz",
 }
 SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/CNN_prune"
-# Standard ResNet50 channel counts for each stage
 ORIGINAL_PLANES = [64, 128, 256, 512]
-# Known number of classes for MedMNIST datasets
 DATASET_NUM_CLASSES = {
     "bloodmnist": 8,
     "dermamnist": 7,
@@ -68,21 +72,20 @@ DATASET_NUM_CLASSES = {
     "pathmnist": 9,
     "tissuemnist": 8
 }
-# Hardcoded matrix config (models will be dynamically populated)
 MATRIX_CONFIG = {
-    "datasets": ["bloodmnist", "dermamnist", "pathmnist"],  # Limit to datasets with models
-    "log_dir": "/home/arihangupta/Pruning/dinov2/Pruning/time_experiment_results",
+    "datasets": ["bloodmnist", "dermamnist", "pathmnist"],
+    "log_dir": "/home/arihangupta/Pruning/dinov2/Pruning/time_experiment_results_2",
     "time_budget_s": 300,
     "warmup_batches": 50,
     "seed": 42,
     "num_workers": 4,
     "pin_memory": True,
     "batch_sizes": [1, 8, 32, 128],
-    "precisions": ["fp32", "amp"],  # Added 'amp' to test mixed precision benefits
+    "precisions": ["fp32", "amp"],
     "repeats": 3
 }
 
-# Use the proven CustomResNet class from the first script
+# CustomResNet class
 class CustomResNet(nn.Module):
     def __init__(self, block=Bottleneck, layers=[3, 4, 6, 3], stage_planes=[64, 128, 256, 512], num_classes=1000, in_channels=3):
         super().__init__()
@@ -129,45 +132,38 @@ class CustomResNet(nn.Module):
         return x
 
 def build_model(num_classes: int, stage_planes=[64, 128, 256, 512]):
-    """
-    Build a ResNet-50 model with the right classifier head and specified stage planes.
-    """
     model = CustomResNet(
         block=Bottleneck,
         layers=[3, 4, 6, 3],
         stage_planes=stage_planes,
         num_classes=num_classes,
-        in_channels=3  # Always 3 channels to match pruning code
+        in_channels=3
     )
     return model
 
 def get_dataset_channels(npz_path):
-    """Detect the number of channels in the dataset's test images."""
     try:
         data = np.load(npz_path, mmap_mode="r")
         test_images = data["test_images"]
         sample_img = test_images[0]
         if sample_img.ndim == 3:
-            return sample_img.shape[-1]  # (H, W, C)
+            return sample_img.shape[-1]
         elif sample_img.ndim == 2:
-            return 1  # Grayscale
+            return 1
         else:
             raise ValueError(f"Unexpected image dimensions in {npz_path}: {sample_img.shape}")
     except Exception as e:
         print(f"Error detecting channels for {npz_path}: {e}")
-        return 3  # Fallback to RGB
+        return 3
 
 def parse_model_name(filename, dataset):
-    """Parse model filename to extract pruning method, sparsity, and pruning_ratio."""
     basename = os.path.basename(filename)
     if basename == "baseline.pth":
         return {"model_name": "baseline", "pruning_method": "baseline", "sparsity": "0%", "pruning_ratio": None}
     
-    # Match files ending in _final.pth
     if not basename.endswith("_final.pth"):
         return None
     
-    # Extract pruning method from filename
     if "pgto_regional_gradients" in basename:
         method = "pgto_regional_gradients"
     elif "quantization" in basename:
@@ -177,33 +173,43 @@ def parse_model_name(filename, dataset):
     else:
         return None
 
-    # Try to get sparsity from metrics CSV
     sparsity = None
     pruning_ratio = None
     metrics_csv = os.path.join(SAVE_DIR_BASE, dataset, f"{dataset}_combined_pruning_kd_metrics_with_energy.csv")
     if os.path.exists(metrics_csv):
         try:
             df = pd.read_csv(metrics_csv)
-            # Assume CSV has a column like 'sparsity' or 'pruning_ratio'
+            model_basename = basename.replace(".pth", "")
             for _, row in df.iterrows():
-                if method in str(row.get("model_name", "")) or method in str(row.get("pruning_method", "")):
-                    sparsity = row.get("sparsity", "unknown")
-                    if isinstance(sparsity, str) and "%" in sparsity:
-                        pruning_ratio = float(sparsity.strip("%")) / 100.0
-                    break
+                model_name = str(row.get("model_name", ""))
+                pruning_method = str(row.get("pruning_method", ""))
+                if (method in model_name.lower() or method in pruning_method.lower() or
+                    model_basename in model_name or model_basename in pruning_method):
+                    sparsity = row.get("sparsity", None)
+                    if sparsity is not None:
+                        if isinstance(sparsity, str) and "%" in sparsity:
+                            pruning_ratio = float(sparsity.strip("%")) / 100.0
+                            sparsity = f"{sparsity}"
+                        elif isinstance(sparsity, (int, float)):
+                            pruning_ratio = float(sparsity)
+                            sparsity = f"{int(sparsity * 100)}%"
+                        break
         except Exception as e:
             print(f"Error reading sparsity from {metrics_csv}: {e}")
 
-    # Fallback to default pruning ratio if not found
     if sparsity is None:
-        sparsity = "unknown"
-        pruning_ratio = 0.5  # Default assumption
+        match = re.search(r'r50compressed_(\d+)', basename)
+        if match:
+            sparsity = f"{match.group(1)}%"
+            pruning_ratio = float(match.group(1)) / 100.0
+        else:
+            sparsity = "unknown"
+            pruning_ratio = 0.5
 
     model_name = f"{method}_{sparsity}"
     return {"model_name": model_name, "pruning_method": method, "sparsity": sparsity, "pruning_ratio": pruning_ratio}
 
 def discover_models():
-    """Dynamically discover all models ending in _final.pth and baseline.pth for each dataset."""
     models = []
     for dataset in MATRIX_CONFIG["datasets"]:
         model_dir = os.path.join(SAVE_DIR_BASE, dataset)
@@ -217,6 +223,8 @@ def discover_models():
             if parsed:
                 parsed["model_path"] = model_path
                 dataset_models.append(parsed)
+            else:
+                print(f"Skipping invalid model file: {model_path}")
         if dataset_models:
             models.append({"dataset": dataset, "models": dataset_models})
         else:
@@ -224,6 +232,7 @@ def discover_models():
     return models
 
 def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None, in_channels=3):
+    """Build model with channel counts inferred from checkpoint. ALWAYS returns (model, device_override) tuple."""
     if not os.path.exists(model_path):
         raise ValueError(f"Model path does not exist: {model_path}")
     
@@ -242,9 +251,10 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
     # Build model with inferred stage_planes
     model = build_model(num_classes, stage_planes=stage_planes)
     
-    # Check dtype for fp16
+    # Check dtype
     sample_param = next(iter(state_dict.values()))
     is_fp16 = sample_param.dtype == torch.float16
+    is_int8 = hasattr(sample_param, 'dtype') and sample_param.dtype == torch.qint8
     
     if is_fp16:
         model = model.half()
@@ -255,19 +265,18 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
     except Exception as e:
         raise RuntimeError(f"Error loading state_dict: {e}")
     
-    # For int8, if detected
-    if "quantization" in model_name and hasattr(sample_param, 'dtype') and sample_param.dtype == torch.qint8:
-        print("Warning: INT8 model detected. Ensuring CPU mode if necessary.")
-        # Additional handling if needed, but assume load succeeded
+    # Handle INT8 quantization - MUST use CPU
+    if is_int8:
+        print("Warning: INT8 model detected. Moving to CPU for compatibility.")
+        return model, 'cpu'
     
-    return model
+    # FIXED: Always return tuple
+    return model, None
 
-# Update MATRIX_CONFIG with discovered models
 MATRIX_CONFIG["models"] = discover_models()
 
 @dataclass
 class Config:
-    """Parsed config with separate experiment and log_dir."""
     experiment: Dict[str, Any]
     log_dir: str
 
@@ -298,7 +307,6 @@ class NumpyMemmapDataset(torch.utils.data.Dataset):
             T.Resize((img_size, img_size)),
             T.ToTensor(),
         ])
-        # Always use ImageNet normalization since we convert everything to 3 channels
         self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
     def __len__(self):
@@ -308,11 +316,8 @@ class NumpyMemmapDataset(torch.utils.data.Dataset):
         img = self.imgs[idx]
         label = int(self.labels[idx])
         x = self.base_tfms(img)
-        
-        # Always convert to 3 channels to match model expectation
-        if x.shape[0] == 1:  # Grayscale
+        if x.shape[0] == 1:
             x = x.repeat(3, 1, 1)
-        
         x = self.normalize(x)
         return x, label
 
@@ -331,18 +336,23 @@ def load_model(config, num_classes, dataset_name):
     model_path = config.experiment['model_path']
     if not os.path.exists(model_path):
         raise ValueError(f"Model not found: {model_path}")
-    model = build_model_for_load(
+    
+    # FIXED: Now always receives tuple
+    model, override_device = build_model_for_load(
         config.experiment['model_name'],
         num_classes,
         model_path,
         config.experiment['pruning_ratio'],
-        in_channels=in_channels  # This parameter is not used in the new function, but kept for compatibility
+        in_channels=in_channels
     )
-    model = model.to(config.experiment['device']).eval()
+    
+    # Use override_device for INT8 models, otherwise use config device
+    device = override_device if override_device else config.experiment['device']
+    model = model.to(device).eval()
+    
     return model
 
 def get_num_classes(dataset_name, dataset_path):
-    """Dynamically determine number of classes from info.csv or fallback to known values."""
     info_path = dataset_path.replace('.npz', '_info.csv')
     if os.path.exists(info_path):
         try:
@@ -350,7 +360,7 @@ def get_num_classes(dataset_name, dataset_path):
             return len(df['label'].unique())
         except Exception:
             pass
-    return DATASET_NUM_CLASSES.get(dataset_name, 2)  # Fallback to 2 if unknown
+    return DATASET_NUM_CLASSES.get(dataset_name, 2)
 
 def start_tracker(save_dir: str, project_name: str, output_file: str="emissions.csv", measure_power_secs: int=10):
     if not CODECARBON_AVAILABLE:
@@ -361,7 +371,8 @@ def start_tracker(save_dir: str, project_name: str, output_file: str="emissions.
         output_dir=save_dir,
         output_file=output_file,
         measure_power_secs=measure_power_secs,
-        save_to_file=True
+        save_to_file=True,
+        log_level="ERROR"
     )
     tracker.start()
     return tracker
@@ -417,19 +428,29 @@ def stop_tracker_and_get_metrics(tracker, save_dir: str, project_name: str):
     }
 
 def bench_fixed_time(config):
-    """Run a single benchmark condition."""
     set_seed(config.experiment['seed'])
     set_env_threads(omp_threads=4, mkl_threads=4)
     device = torch.device(config.experiment['device'])
     dataset_name = config.experiment['dataset']
+    batch_size = config.experiment['batch_size']
     dataset_path = DATASETS.get(dataset_name, None)
     if not dataset_path:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    # Load data
-    test_loader, in_channels = make_test_loader(dataset_path, config.experiment['batch_size'])
+    # Validate batch size to prevent OOM
+    if device.type == 'cuda':
+        try:
+            available_mem = torch.cuda.get_device_properties(device).total_memory / (1024**2)
+            approx_mem_per_image = (224 * 224 * 3 * 4) / (1024**2) * 2
+            estimated_mem = batch_size * approx_mem_per_image
+            if estimated_mem > available_mem * 0.8:
+                print(f"Warning: Batch size {batch_size} may exceed GPU memory. Skipping.")
+                return None
+        except Exception as e:
+            print(f"Error checking GPU memory: {e}")
 
-    # Load model
+    test_loader, in_channels = make_test_loader(dataset_path, batch_size)
+
     num_classes = get_num_classes(dataset_name, dataset_path)
     try:
         model = load_model(config, num_classes, dataset_name)
@@ -437,19 +458,15 @@ def bench_fixed_time(config):
         print(f"Failed to load model {config.experiment['model_name']}: {e}")
         raise
 
-    # Logs
     log_dir = Path(config.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    run_id = f"{config.experiment['model_name']}_b{config.experiment['batch_size']}_{config.experiment['precision']}_r{config.experiment.get('rep', 0)}"
+    run_id = f"{config.experiment['model_name']}_b{batch_size}_{config.experiment['precision']}_r{config.experiment.get('rep', 0)}"
     project_name = f"{run_id}_inference"
 
-    # Per-batch logs
     batch_logs = []
 
-    # Start CodeCarbon tracker
     tracker = start_tracker(str(log_dir), project_name, measure_power_secs=10) if CODECARBON_AVAILABLE else None
 
-    # Warmup
     model.eval()
     with torch.no_grad():
         for _ in range(config.experiment['warmup_batches']):
@@ -463,12 +480,10 @@ def bench_fixed_time(config):
             if device.type == 'cuda':
                 torch.cuda.synchronize()
 
-    # Clear cache
     if device.type == 'cuda':
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-    # Timed run
     t0 = time.time()
     images_processed = 0
     batch_idx = 0
@@ -478,11 +493,11 @@ def bench_fixed_time(config):
         try:
             batch = next(loader_iter)
         except StopIteration:
-            loader_iter = iter(test_loader)  # Restart dataset
+            loader_iter = iter(test_loader)
             batch = next(loader_iter)
         inputs = batch[0].to(device)
-        if len(inputs) != config.experiment['batch_size']:
-            break  # End of dataset
+        if len(inputs) != batch_size:
+            break
         with torch.no_grad():
             if config.experiment['precision'] == 'amp':
                 with torch.cuda.amp.autocast():
@@ -492,7 +507,7 @@ def bench_fixed_time(config):
             if device.type == 'cuda':
                 torch.cuda.synchronize()
         batch_end = time.time()
-        batch_elapsed = (batch_end - batch_start) * 1000  # ms
+        batch_elapsed = (batch_end - batch_start) * 1000
         batch_logs.append({
             'batch_idx': batch_idx,
             'batch_size': len(inputs),
@@ -506,10 +521,8 @@ def bench_fixed_time(config):
     elapsed_s = time.time() - t0
     throughput = images_processed / elapsed_s if elapsed_s > 0 else 0
 
-    # Peak mem
     peak_mem = torch.cuda.max_memory_allocated() / (1024**2) if device.type == 'cuda' else 0
 
-    # Stop CodeCarbon and get metrics
     metrics = stop_tracker_and_get_metrics(tracker, str(log_dir), project_name)
     energy_kwh = metrics["energy_kwh"]
     emissions_kg = metrics["emissions_kg"]
@@ -518,18 +531,16 @@ def bench_fixed_time(config):
     ram_power_w = metrics["ram_power_w"]
     avg_power_w = gpu_power_w if not math.isnan(gpu_power_w) else float('nan')
 
-    # Save batch logs
     batch_df = pd.DataFrame(batch_logs)
     batch_log_file = log_dir / f"per_batch_log_{run_id}.csv"
     batch_df.to_csv(batch_log_file, index=False)
 
-    # Metadata
     metadata = {
         'run_id': run_id,
         'model_name': config.experiment['model_name'],
         'pruning_method': config.experiment['pruning_method'],
         'sparsity': config.experiment['sparsity'],
-        'batch_size': config.experiment['batch_size'],
+        'batch_size': batch_size,
         'precision': config.experiment['precision'],
         'rep': config.experiment.get('rep', 0),
         'time_budget_s': config.experiment['time_budget_s'],
@@ -554,12 +565,10 @@ def bench_fixed_time(config):
         'dataset': config.experiment['dataset']
     }
 
-    # Save per-run JSON
     results_file = log_dir / f"results_{run_id}.json"
     with open(results_file, 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    # Append to dataset-specific CSV
     results_csv = log_dir.parent / f"{dataset_name}_results.csv"
     pd.DataFrame([metadata]).to_csv(results_csv, mode='a', header=not os.path.exists(results_csv), index=False)
 
@@ -626,10 +635,11 @@ def run_matrix(matrix_config):
                 print(f"Running: {exp_cfg['model_name']}, bs={bs}, prec={prec}, rep={rep}")
                 try:
                     result = bench_fixed_time(config)
-                    print(f"  Throughput: {result['throughput_imgs_per_s']:.2f} imgs/s, energy_kWh={result['energy_kWh_total']:.6f}")
+                    if result:
+                        print(f"  Throughput: {result['throughput_imgs_per_s']:.2f} imgs/s, energy_kWh={result['energy_kWh_total']:.6f}")
                 except Exception as e:
                     print(f"  Error: {e}")
-                time.sleep(30)  # Stabilize
+                time.sleep(30)
 
 def bootstrap_ci(data, n_bootstrap=1000, ci=0.95):
     if len(data) < 2:
@@ -708,15 +718,32 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
                     speedup = pr_row['median_throughput'] / bl_row['median_throughput']
                     pct_more = (speedup - 1) * 100
                     energy_saving = (bl_row['median_energy_kWh'] - pr_row['median_energy_kWh']) / bl_row['median_energy_kWh'] * 100 if not math.isnan(bl_row['median_energy_kWh']) else np.nan
-                    bl_tps = df[(df['pruning_method'] == 'baseline') & (df['batch_size'] == bl_row['batch_size']) & (df['precision'] == bl_row['precision'])]['throughput_imgs_per_s']
-                    pr_tps = df[(df['pruning_method'] == method) & (df['sparsity'] == sparsity) & (df['batch_size'] == bl_row['batch_size']) & (df['precision'] == bl_row['precision'])]['throughput_imgs_per_s']
-                    pval = paired_wilcoxon(bl_tps.values, pr_tps.values)
-                    ci_speedup_low, ci_speedup_high = bootstrap_ci(pr_tps.values / bl_tps.values)
-                    print(f"{dataset}: {method} ({sparsity}) vs baseline (bs={bl_row['batch_size']}, prec={bl_row['precision']}): speedup={speedup:.2f} ({pct_more:.1f}%), energy_saving_pct={energy_saving:.1f}%, p={pval:.4f}, 95% CI [{ci_speedup_low:.2f}, {ci_speedup_high:.2f}]")
+                    
+                    # FIXED: Get matching runs and handle different array lengths
+                    bl_tps = df[(df['pruning_method'] == 'baseline') & 
+                               (df['batch_size'] == bl_row['batch_size']) & 
+                               (df['precision'] == bl_row['precision'])]['throughput_imgs_per_s'].values
+                    pr_tps = df[(df['pruning_method'] == method) & 
+                               (df['sparsity'] == sparsity) & 
+                               (df['batch_size'] == bl_row['batch_size']) & 
+                               (df['precision'] == bl_row['precision'])]['throughput_imgs_per_s'].values
+                    
+                    # Only compute speedup CI if we have paired data
+                    if len(bl_tps) == len(pr_tps) and len(bl_tps) > 1:
+                        speedup_ratios = pr_tps / bl_tps
+                        ci_speedup_low, ci_speedup_high = bootstrap_ci(speedup_ratios)
+                        pval = paired_wilcoxon(bl_tps, pr_tps)
+                    else:
+                        ci_speedup_low, ci_speedup_high = np.nan, np.nan
+                        pval = np.nan
+                    
+                    print(f"{dataset}: {method} ({sparsity}) vs baseline (bs={bl_row['batch_size']}, prec={bl_row['precision']}): "
+                          f"speedup={speedup:.2f} ({pct_more:.1f}%), energy_saving_pct={energy_saving:.1f}%, "
+                          f"p={pval:.4f}, 95% CI [{ci_speedup_low:.2f}, {ci_speedup_high:.2f}]")
 
     # Plots
     plt.figure(figsize=(12, 8))
-    sns.lineplot(data=summary_df, x='batch_size', y='median_throughput', hue='pruning_method', style='sparsity', markers=True, dashes=False, errorbar=None)
+    sns.lineplot(data=summary_df, x='batch_size', y='median_throughput', hue='pruning_method', style='sparsity', markers=True, dashes=False)
     plt.title(f'Throughput vs Batch Size ({dataset})')
     plt.savefig(output_dir / 'throughput_vs_bs.png')
     plt.close()
@@ -729,7 +756,7 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
     plt.close()
 
     plt.figure(figsize=(10, 6))
-    sns.barplot(data=summary_df, x='batch_size', y='median_energy_kWh', hue='pruning_method', style='sparsity')
+    sns.barplot(data=summary_df, x='batch_size', y='median_energy_kWh', hue='pruning_method')
     plt.title(f'Energy Consumption (kWh) by Model and Batch Size ({dataset})')
     plt.savefig(output_dir / 'energy_bar.png')
     plt.close()
