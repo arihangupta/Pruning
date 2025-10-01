@@ -6,6 +6,7 @@ Uses CustomResNet with channel counts inferred from checkpoints to avoid size mi
 Handles both RGB and grayscale images by detecting dataset channel count.
 Includes CodeCarbon for power utilization (silently in background) and detailed analysis with pruning method and sparsity.
 Supports quantized model loading and AMP precision.
+Calculates top-1 accuracy for each run.
 """
 
 import os
@@ -506,6 +507,8 @@ def bench_fixed_time(config):
     project_name = f"{run_id}_inference"
 
     batch_logs = []
+    correct_predictions = 0
+    total_predictions = 0
 
     tracker = start_tracker(str(log_dir), project_name, measure_power_secs=10) if CODECARBON_AVAILABLE else None
 
@@ -537,17 +540,21 @@ def bench_fixed_time(config):
         except StopIteration:
             loader_iter = iter(test_loader)
             batch = next(loader_iter)
-        inputs = batch[0].to(device)
+        inputs, labels = batch[0].to(device), batch[1].to(device)
         if len(inputs) != batch_size:
             break
         with torch.no_grad():
             if config.experiment['precision'] == 'amp':
                 with torch.amp.autocast('cuda'):
-                    _ = model(inputs)
+                    outputs = model(inputs)
             else:
-                _ = model(inputs)
+                outputs = model(inputs)
             if device.type == 'cuda':
                 torch.cuda.synchronize()
+            # Calculate accuracy
+            _, preds = torch.max(outputs, 1)
+            correct_predictions += torch.sum(preds == labels).item()
+            total_predictions += labels.size(0)
         batch_end = time.time()
         batch_elapsed = (batch_end - batch_start) * 1000
         batch_logs.append({
@@ -562,6 +569,7 @@ def bench_fixed_time(config):
 
     elapsed_s = time.time() - t0
     throughput = images_processed / elapsed_s if elapsed_s > 0 else 0
+    accuracy = (correct_predictions / total_predictions * 100) if total_predictions > 0 else float('nan')
 
     peak_mem = torch.cuda.max_memory_allocated() / (1024**2) if device.type == 'cuda' else 0
 
@@ -589,6 +597,7 @@ def bench_fixed_time(config):
         'images_processed': images_processed,
         'elapsed_s': elapsed_s,
         'throughput_imgs_per_s': throughput,
+        'accuracy_percent': accuracy,
         'median_batch_ms': batch_df['batch_elapsed_ms'].median() if not batch_df.empty else float('nan'),
         'p50_ms': batch_df['batch_elapsed_ms'].quantile(0.5) if not batch_df.empty else float('nan'),
         'p90_ms': batch_df['batch_elapsed_ms'].quantile(0.9) if not batch_df.empty else float('nan'),
@@ -683,7 +692,9 @@ def run_matrix(matrix_config):
                 try:
                     result = bench_fixed_time(config)
                     if result:
-                        print(f"  Throughput: {result['throughput_imgs_per_s']:.2f} imgs/s, energy_kWh={result['energy_kWh_total']:.6f}")
+                        print(f"  Throughput: {result['throughput_imgs_per_s']:.2f} imgs/s, "
+                              f"accuracy: {result['accuracy_percent']:.2f}%, "
+                              f"energy_kWh={result['energy_kWh_total']:.6f}")
                 except Exception as e:
                     print(f"  Error: {e}")
                 time.sleep(30)
@@ -712,6 +723,7 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
     summary = []
     for (method, sparsity, bs, prec), gdf in groups:
         throughputs = gdf['throughput_imgs_per_s'].values
+        accuracies = gdf['accuracy_percent'].dropna()
         energies = gdf['energy_kWh_total'].dropna()
         emissions = gdf['emissions_kg_total'].dropna()
         powers = gdf['gpu_power_w'].dropna()
@@ -720,7 +732,10 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
         mean_tp = np.mean(throughputs)
         std_tp = np.std(throughputs)
         ci_low, ci_high = bootstrap_ci(throughputs)
-
+        median_acc = np.median(accuracies) if len(accuracies) > 0 else np.nan
+        mean_acc = np.mean(accuracies) if len(accuracies) > 0 else np.nan
+        std_acc = np.std(accuracies) if len(accuracies) > 0 else np.nan
+        acc_ci_low, acc_ci_high = bootstrap_ci(accuracies) if len(accuracies) > 1 else (np.nan, np.nan)
         median_energy = np.median(energies) if len(energies) > 0 else np.nan
         median_emissions = np.median(emissions) if len(emissions) > 0 else np.nan
         median_power = np.median(powers) if len(powers) > 0 else np.nan
@@ -741,6 +756,11 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
             'iqr_high': iqr_high,
             'ci_low': ci_low,
             'ci_high': ci_high,
+            'median_accuracy': median_acc,
+            'mean_accuracy': mean_acc,
+            'std_accuracy': std_acc,
+            'accuracy_ci_low': acc_ci_low,
+            'accuracy_ci_high': acc_ci_high,
             'median_power_gpu_w': median_power,
             'median_energy_kWh': median_energy,
             'median_emissions_kg': median_emissions,
@@ -765,6 +785,7 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
                     speedup = pr_row['median_throughput'] / bl_row['median_throughput']
                     pct_more = (speedup - 1) * 100
                     energy_saving = (bl_row['median_energy_kWh'] - pr_row['median_energy_kWh']) / bl_row['median_energy_kWh'] * 100 if not math.isnan(bl_row['median_energy_kWh']) else np.nan
+                    acc_diff = pr_row['median_accuracy'] - bl_row['median_accuracy'] if not (math.isnan(pr_row['median_accuracy']) or math.isnan(bl_row['median_accuracy'])) else np.nan
                     bl_tps = df[(df['pruning_method'] == 'baseline') & 
                                (df['batch_size'] == bl_row['batch_size']) & 
                                (df['precision'] == bl_row['precision'])]['throughput_imgs_per_s'].values
@@ -772,6 +793,13 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
                                (df['sparsity'] == sparsity) & 
                                (df['batch_size'] == bl_row['batch_size']) & 
                                (df['precision'] == bl_row['precision'])]['throughput_imgs_per_s'].values
+                    bl_accs = df[(df['pruning_method'] == 'baseline') & 
+                                (df['batch_size'] == bl_row['batch_size']) & 
+                                (df['precision'] == bl_row['precision'])]['accuracy_percent'].values
+                    pr_accs = df[(df['pruning_method'] == method) & 
+                                (df['sparsity'] == sparsity) & 
+                                (df['batch_size'] == bl_row['batch_size']) & 
+                                (df['precision'] == bl_row['precision'])]['accuracy_percent'].values
                     if len(bl_tps) == len(pr_tps) and len(bl_tps) > 1:
                         speedup_ratios = pr_tps / bl_tps
                         ci_speedup_low, ci_speedup_high = bootstrap_ci(speedup_ratios)
@@ -779,9 +807,14 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
                     else:
                         ci_speedup_low, ci_speedup_high = np.nan, np.nan
                         pval = np.nan
+                    if len(bl_accs) == len(pr_accs) and len(bl_accs) > 1:
+                        acc_pval = paired_wilcoxon(bl_accs, pr_accs)
+                    else:
+                        acc_pval = np.nan
                     print(f"{dataset}: {method} ({sparsity}) vs baseline (bs={bl_row['batch_size']}, prec={bl_row['precision']}): "
                           f"speedup={speedup:.2f} ({pct_more:.1f}%), energy_saving_pct={energy_saving:.1f}%, "
-                          f"p={pval:.4f}, 95% CI [{ci_speedup_low:.2f}, {ci_speedup_high:.2f}]")
+                          f"accuracy_diff={acc_diff:.1f}%, acc_pval={acc_pval:.4f}, "
+                          f"throughput_pval={pval:.4f}, 95% CI throughput [{ci_speedup_low:.2f}, {ci_speedup_high:.2f}]")
 
     plt.figure(figsize=(12, 8))
     sns.lineplot(data=summary_df, x='batch_size', y='median_throughput', hue='pruning_method', style='sparsity', markers=True, dashes=False)
@@ -800,6 +833,13 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
     sns.barplot(data=summary_df, x='batch_size', y='median_energy_kWh', hue='pruning_method')
     plt.title(f'Energy Consumption (kWh) by Model and Batch Size ({dataset})')
     plt.savefig(output_dir / 'energy_bar.png')
+    plt.close()
+
+    plt.figure(figsize=(12, 8))
+    sns.lineplot(data=summary_df, x='batch_size', y='median_accuracy', hue='pruning_method', style='sparsity', markers=True, dashes=False)
+    plt.title(f'Accuracy vs Batch Size ({dataset})')
+    plt.ylabel('Median Accuracy (%)')
+    plt.savefig(output_dir / 'accuracy_vs_bs.png')
     plt.close()
 
     print(f"Analysis complete for {dataset}. Outputs in: {output_dir}")
@@ -827,4 +867,4 @@ if __name__ == "__main__":
     run_matrix(MATRIX_CONFIG)
     print("All runs complete. Running analysis...")
     run_full_analysis(Path(MATRIX_CONFIG['log_dir']))
-    print("Full process complete! Check time_experiment_results_2/ for outputs.")
+    print("Full process complete! Check time_experiment_results_3/ for outputs.")
