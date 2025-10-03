@@ -1,51 +1,44 @@
 import pandas as pd
+import numpy as np
 import os
-import medmnist
-from medmnist import INFO
 
 # Define paths
 base_dir = "/home/arihangupta/Pruning/dinov2/Pruning/CNN_prune"
 dataset_dir = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 datasets = {
-    "bloodmnist": "bloodmnist_combined_pruning_kd_metrics_with_energy.csv",
-    "dermamnist": "dermamnist_combined_pruning_kd_metrics_with_energy.csv",
-    "pathmnist": "pathmnist_combined_pruning_kd_metrics_with_energy.csv"
+    "bloodmnist": {"csv_file": "bloodmnist_combined_pruning_kd_metrics_with_energy.csv", "npz_file": "bloodmnist_224.npz"},
+    "dermamnist": {"csv_file": "dermamnist_combined_pruning_kd_metrics_with_energy.csv", "npz_file": "dermamnist_224.npz"},
+    "pathmnist": {"csv_file": "pathmnist_combined_pruning_kd_metrics_with_energy.csv", "npz_file": "pathmnist_224.npz"}
 }
 
 # Energy column name in the CSV (adjust if different)
 energy_column = "total_energy"  # Replace with the actual column name if different
 
-# Function to get the number of training images for a MedMNIST dataset
-def get_num_training_images(dataset_name):
+# Function to get the number of training images from an .npz file
+def get_num_training_images(npz_path):
     try:
-        # Map directory names to MedMNIST dataset classes
-        dataset_map = {
-            "bloodmnist": medmnist.BloodMNIST,
-            "dermamnist": medmnist.DermaMNIST,
-            "pathmnist": medmnist.PathMNIST
-        }
+        # Load the .npz file
+        data = np.load(npz_path)
         
-        if dataset_name not in dataset_map:
-            raise ValueError(f"Unknown dataset: {dataset_name}")
-        
-        # Load the dataset
-        dataset_class = dataset_map[dataset_name]
-        dataset = dataset_class(split="train", download=False, root=dataset_dir)
+        # Check for the 'train_images' key
+        if "train_images" not in data:
+            raise ValueError(f"'train_images' key not found in {npz_path}. Available keys: {list(data.keys())}")
         
         # Get the number of training images
-        num_images = len(dataset)
+        num_images = len(data["train_images"])
         return num_images
     
     except Exception as e:
-        print(f"Error loading dataset {dataset_name}: {str(e)}")
+        print(f"Error loading {npz_path}: {str(e)}")
         return None
 
 # Process each dataset
-for dataset, csv_file in datasets.items():
-    csv_path = os.path.join(base_dir, dataset, csv_file)
+for dataset, info in datasets.items():
+    csv_path = os.path.join(base_dir, dataset, info["csv_file"])
+    npz_path = os.path.join(dataset_dir, info["npz_file"])
     
     # Get the number of training images
-    num_images = get_num_training_images(dataset)
+    num_images = get_num_training_images(npz_path)
     if num_images is None:
         print(f"Skipping {csv_path} due to dataset loading error.")
         continue
