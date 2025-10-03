@@ -12,7 +12,7 @@ datasets = {
 }
 
 # Energy column name in the CSV (adjust if different)
-energy_column = "total_energy"  # Replace with the actual column name if different
+energy_column = "RetrainEnergy_kWh"  # Replace with the actual column name if different
 
 # Function to get the number of training images from an .npz file
 def get_num_training_images(npz_path):
