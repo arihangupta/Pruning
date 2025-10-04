@@ -92,7 +92,7 @@ MATRIX_CONFIG = {
     "seed": 42,
     "num_workers": 4,
     "pin_memory": True,
-    "batch_sizes": [1, 8, 32, 128],
+    "batch_sizes": [8, 32],
     "precisions": ["fp32", "amp"],
     "repeats": 3
 }
