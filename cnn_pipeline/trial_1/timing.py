@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Complete script to run the full factorial benchmarking experiment on available MedMNIST datasets.
-Dynamically discovers models ending in '_final.pth' and 'baseline.pth' for each dataset.
+Dynamically discovers models ending in '_final.pth' and '_final_amp.pth' for each dataset.
 Uses CustomResNet with channel counts inferred from checkpoints to avoid size mismatches.
 Handles both RGB and grayscale images by detecting dataset channel count.
 Includes CodeCarbon for power utilization (silently in background) and detailed analysis with pruning method and sparsity.
@@ -182,19 +182,19 @@ def parse_model_name(filename, dataset):
         return None
     
     # Extract pruning method
-    if "pgto_regional_gradients" in basename:
+    if basename == "slim_kd_amp_r50compressed_final_amp.pth":
+        method = "slim_kd_fp16"
+    elif basename == "pgto_regional_gradients_amp_r50compressed_final_amp.pth":
+        method = "pgto_regional_gradients_fp16"
+    elif "pgto_regional_gradients" in basename and "_amp" not in basename:
         method = "pgto_regional_gradients"
     elif "quantization" in basename:
         method = "quantization"
-    elif "slim_kd" in basename:
+    elif "slim_kd" in basename and "_amp" not in basename:
         method = "slim_kd"
     else:
         logger.debug(f"Skipping {basename}: no recognized pruning method")
         return None
-
-    # Detect fp16 variant
-    if "_amp" in basename:
-        method += "_fp16"
 
     sparsity = None
     pruning_ratio = None
@@ -220,7 +220,6 @@ def parse_model_name(filename, dataset):
             pruning_ratio = 0.5
             logger.debug(f"Defaulting to 50% sparsity for r50compressed in {basename}")
         else:
-            # Fallback if no pattern matches
             sparsity = "0%"
             pruning_ratio = 0.0
             logger.debug(f"No sparsity found in filename for {basename}, defaulting to sparsity=0%")
