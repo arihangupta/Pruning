@@ -1,14 +1,3 @@
-"""
-Fixed script with consistent quantization (AMP/FP16) for all methods.
-Outputs 6 model variants per dataset:
-1. baseline (FP32)
-2. quantized (FP16 from baseline)
-3. regional_gradients (FP32, pruned)
-4. regional_gradients_fp16 (FP16 from regional_gradients)
-5. slim_kd (FP32, slim student)
-6. slim_kd_fp16 (FP16 from slim_kd)
-"""
-
 import os
 import time
 import math
@@ -322,6 +311,12 @@ def compute_stage_importance_and_keeps_regional(model: nn.Module, stage_name: st
 # Weight copying for pruned ResNet
 # -------------------------
 def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indices: dict, num_classes: int):
+    # Ensure at least one channel is kept per stage
+    for stage in keep_indices:
+        if len(keep_indices[stage]) == 0:
+            keep_indices[stage] = np.array([0])
+            print(f"    Warning: {stage} has no channels kept, forcing one channel to prevent errors")
+    
     new_model = build_pruned_or_slim_resnet(keep_indices=keep_indices, num_classes=num_classes, random_init=False)
     
     new_model.conv1.weight.data.copy_(base_model.conv1.weight.data)
@@ -426,7 +421,6 @@ def evaluate_model_basic(model, loader, dataset_name="", variant=""):
             _, predicted = outputs.max(1)
             total += labels.size(0); correct += int(predicted.eq(labels).sum().item())
             
-            # Clamp logits to prevent overflow in softmax for FP16
             outputs = torch.clamp(outputs, min=-100, max=100)
             probs = torch.softmax(outputs, dim=1)
             
@@ -440,29 +434,31 @@ def evaluate_model_basic(model, loader, dataset_name="", variant=""):
     loss_avg = loss_total / max(1, total)
     acc = correct / max(1, total)
     
-    # Log predicted class distribution
     if variant and len(predicted_classes) > 0:
         predicted_classes = np.concatenate(predicted_classes)
         unique_preds, pred_counts = np.unique(predicted_classes, return_counts=True)
         print(f"    {variant} predicted class distribution: {dict(zip(unique_preds, pred_counts))}")
     
-    # Improved AUC calculation per class
     labels = np.concatenate(labels_list)
     probs = np.concatenate(probs_list)
     try:
         auc_scores = []
-        for class_idx in np.unique(labels):
-            if np.sum(labels == class_idx) == 0:
-                continue
-            binary_labels = (labels == class_idx).astype(int)
-            binary_probs = probs[:, class_idx]
-            if len(np.unique(binary_labels)) < 2:
-                continue
-            auc = roc_auc_score(binary_labels, binary_probs)
-            auc_scores.append(auc)
-        auc = np.mean(auc_scores) if auc_scores else float("nan")
-        if variant and auc_scores:
-            print(f"    {variant} per-class AUCs: {[f'{a:.4f}' for a in auc_scores]}, mean: {auc:.4f}")
+        unique_labels = np.unique(labels)
+        if len(unique_labels) < 2:
+            print(f"    Warning: Only {len(unique_labels)} class(es) found in {variant} for {dataset_name}, AUC set to NaN")
+            auc = float("nan")
+        else:
+            for class_idx in unique_labels:
+                binary_labels = (labels == class_idx).astype(int)
+                binary_probs = probs[:, class_idx]
+                if len(np.unique(binary_labels)) < 2:
+                    print(f"    Warning: Class {class_idx} has only one label type, skipping AUC")
+                    continue
+                auc = roc_auc_score(binary_labels, binary_probs)
+                auc_scores.append(auc)
+            auc = np.mean(auc_scores) if auc_scores else float("nan")
+            if variant and auc_scores:
+                print(f"    {variant} per-class AUCs: {[f'{a:.4f}' for a in auc_scores]}, mean: {auc:.4f}")
     except Exception as e:
         print(f"    AUC calculation failed for {variant}: {e}")
         auc = float("nan")
@@ -508,7 +504,6 @@ def compute_flops(model):
 
 def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES):
     model.eval()
-    
     try:
         model_device = next(model.parameters()).device
         model_dtype = next(model.parameters()).dtype
@@ -528,7 +523,8 @@ def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES)
             with torch.no_grad(): _ = model(imgs)
             if use_cuda: torch.cuda.synchronize()
     except StopIteration:
-        pass
+        print("    Warning: Iterator exhausted during warmup, resetting iterator")
+        it = iter(loader)
     
     if use_cuda: torch.cuda.reset_peak_memory_stats()
     start = time.time()
@@ -545,7 +541,7 @@ def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES)
             batches_done += 1
             images_processed += imgs.size(0)
     except StopIteration:
-        pass
+        print(f"    Warning: Only {batches_done} batches processed due to dataset size")
     elapsed = time.time() - start
     avg_batch = elapsed / max(1, batches_done)
     peak_mb = torch.cuda.max_memory_allocated() / (1024**2) if use_cuda else params_count(model)*4.0/(1024**2)
@@ -594,16 +590,21 @@ def measure_prediction_energy(model, test_loader, save_dir, project_name, num_im
 
 def collect_metrics_row(variant, stage, ratio, model, test_loader, path_hint, dataset_name=""):
     loss, acc, auc = evaluate_model_basic(model, test_loader, dataset_name, variant)
-    zeros, total = count_zeros_and_total(model) if "slim" not in variant and "quantization" not in variant and "fp16" not in variant else (0, params_count(model))
+    zeros, total = count_zeros_and_total(model) if "quantization" not in variant and "fp16" not in variant else (0, params_count(model))
     params = params_count(model)
     flops = compute_flops(model)
     flops_m = flops / 1e6 if not math.isnan(flops) else float("nan")
     avg_time, peak_ram, images_processed = inference_time_per_batch(model, test_loader, timed=TIMING_BATCHES)
     if path_hint is not None and os.path.exists(path_hint):
-        size_mb = os.path.getsize(path_hint)/(1024**2)
+        try:
+            size_mb = os.path.getsize(path_hint)/(1024**2)
+        except Exception as e:
+            print(f"    Warning: Failed to get size of {path_hint}: {e}, falling back to model_size_bytes")
+            size_mb = model_size_bytes(model)/(1024**2)
     else:
+        print(f"    Warning: Checkpoint {path_hint} does not exist, using model_size_bytes")
         size_mb = model_size_bytes(model)/(1024**2)
-    power_m = (flops * ((total - zeros)/total)) / 1e6 if not math.isnan(flops) and total>0 and "slim" not in variant else float("nan")
+    power_m = (flops * ((total - zeros)/total)) / 1e6 if not math.isnan(flops) and total > 0 else float("nan")
     return {
         "Variant": variant, "Stage": stage, "Ratio": ratio,
         "Acc": acc, "AUC": auc, "Loss": loss,
@@ -665,7 +666,6 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
     
     student_dtype = next(student.parameters()).dtype
     teacher_dtype = next(teacher.parameters()).dtype
-    
     use_fp16 = (student_dtype == torch.half)
     
     for ep in range(epochs):
@@ -676,32 +676,19 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
             imgs = imgs.to(device)
             labels = labels.to(device)
             
-            if use_fp16:
-                with torch.no_grad():
-                    if teacher_dtype == torch.half:
-                        t_logits = teacher(imgs.half()).float()
-                    else:
-                        t_logits = teacher(imgs)
-                
-                s_logits = student(imgs.half()).float()
-            else:
-                with torch.no_grad():
-                    if teacher_dtype == torch.half:
-                        t_logits = teacher(imgs.half()).float()
-                    else:
-                        t_logits = teacher(imgs)
-                
-                s_logits = student(imgs)
+            with torch.no_grad():
+                teacher_imgs = imgs.half() if teacher_dtype == torch.half else imgs
+                t_logits = teacher(teacher_imgs).float()
+            
+            student_imgs = imgs.half() if use_fp16 else imgs
+            s_logits = student(student_imgs).float()
             
             loss_ce = criterion(s_logits, labels)
-            
             s_log_soft = F.log_softmax(s_logits / T, dim=1)
             with torch.no_grad():
                 t_soft = F.softmax(t_logits / T, dim=1)
-            
             s_log_soft = torch.clamp(s_log_soft, min=-100)
             t_soft = torch.clamp(t_soft, min=1e-8)
-            
             loss_kd = kl_loss(s_log_soft, t_soft) * (T * T)
             
             if torch.isnan(loss_ce) or torch.isnan(loss_kd):
@@ -709,20 +696,15 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
                 continue
             
             loss = alpha * loss_ce + (1.0 - alpha) * loss_kd
-            
             opt.zero_grad()
             loss.backward()
-            
             if use_fp16:
                 torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
-            
             opt.step()
-            
             running_loss += float(loss.item()) * imgs.size(0)
             _, preds = s_logits.max(1)
-            total += labels.size(0)
+            total = labels.size(0)
             correct += int(preds.eq(labels).sum().item())
-            
             if bidx % LOG_INTERVAL == 0:
                 avg_loss = running_loss/max(1,total)
                 avg_acc = correct/max(1,total)
@@ -736,7 +718,6 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
 # -------------------------
 def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR):
     model.train()
-    
     model_dtype = next(model.parameters()).dtype
     is_fp16 = (model_dtype == torch.half)
     
@@ -752,26 +733,32 @@ def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCH
         for bidx, (imgs, labels) in enumerate(train_loader, 1):
             imgs = imgs.to(DEVICE)
             labels = labels.to(DEVICE)
-            
             opt.zero_grad()
             out = model(imgs)
             loss = criterion(out, labels)
             loss.backward()
             opt.step()
-            
             running_loss += float(loss.item()) * imgs.size(0)
             _, preds = out.max(1)
             total += labels.size(0); correct += int(preds.eq(labels).sum().item())
-            
             if bidx % LOG_INTERVAL == 0:
                 print(f"    Global FT ep{ep+1} batch{bidx} - loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
-        
         vloss, vacc, vauc = evaluate_model_basic(model, val_loader)
         print(f"    Global FT epoch {ep+1}: ValLoss {vloss:.4f}, ValAcc {vacc:.4f}, ValAUC {vauc:.4f}")
     
     if is_fp16:
         print("    Converting model back to FP16 after finetuning...")
         model = model.half()
+        print("    Calibrating batch norms after FP16 conversion...")
+        with torch.no_grad():
+            for module in model.modules():
+                if isinstance(module, nn.BatchNorm2d):
+                    module.reset_running_stats()
+                    module.eval()
+            for imgs, _ in train_loader:
+                imgs = imgs.to(DEVICE).half()
+                model(imgs)
+                break
     
     model.eval()
     return model
@@ -780,7 +767,6 @@ def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCH
 # Quantization (FP16/AMP only)
 # -------------------------
 def create_amp_quantized_version(model, save_dir, project_name):
-    """Create an FP16 (AMP) quantized version and measure conversion energy."""
     if not CODECARBON_AVAILABLE:
         print("  Warning: Cannot measure conversion energy without codecarbon")
         conversion_energy_kwh = float("nan")
@@ -849,8 +835,19 @@ def stop_tracker_and_get_metrics(tracker, save_dir: str, project_name: str):
     except Exception as e:
         print(f"Error stopping CodeCarbon tracker: {e}")
         emissions_val = None
+    
+    csv_path = os.path.join(save_dir, "emissions.csv")
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            df = df[df["project_name"] != project_name]
+            df.to_csv(csv_path, index=False)
+        except Exception as e:
+            print(f"Error cleaning emissions.csv: {e}")
+    
     raw = _read_latest_tracker_row(save_dir, project_name)
     if raw is None:
+        print(f"Warning: No valid tracker data for {project_name}")
         return {
             "emissions_kg": float(emissions_val) if emissions_val is not None else float("nan"),
             "energy_kwh": float("nan"),
@@ -974,6 +971,9 @@ def load_baseline_ckpt_safe(path, num_classes):
 # -------------------------
 # Dataset processing with error handling
 # -------------------------
+# -------------------------
+# Dataset processing with error handling
+# -------------------------
 def process_dataset_safely(dataset_name, cfg):
     try:
         print(f"\n\n===================== DATASET: {dataset_name.upper()} =====================")
@@ -1024,7 +1024,6 @@ def process_dataset_safely(dataset_name, cfg):
         print("  Baseline energy summary:", energy_row)
 
         for method in METHODS:
-            # QUANTIZATION: FP16 from baseline
             if method == "quantization":
                 print(f"\n=== QUANTIZATION (FP16 from baseline) ===")
                 for compress_ratio in TARGET_COMPRESS_RATIOS:
@@ -1068,7 +1067,6 @@ def process_dataset_safely(dataset_name, cfg):
                     del quantized_model
                     cleanup_memory()
 
-            # REGIONAL GRADIENTS: FP32 pruned model
             elif method == "regional_gradients":
                 print(f"\n=== REGIONAL GRADIENTS (FP32 pruned) ===")
                 for compress_ratio in TARGET_COMPRESS_RATIOS:
@@ -1166,7 +1164,6 @@ def process_dataset_safely(dataset_name, cfg):
                     rows.append(energy_row)
                     print("  Energy summary:", energy_row)
 
-                    # REGIONAL GRADIENTS FP16
                     if "regional_gradients_fp16" in METHODS:
                         fp16_method = "regional_gradients_fp16"
                         print(f"\n=== {fp16_method.upper()} (FP16 of regional_gradients) ===")
@@ -1210,7 +1207,6 @@ def process_dataset_safely(dataset_name, cfg):
                     del current_model
                     cleanup_memory()
 
-            # SLIM KD: FP32 slim student
             elif method == "slim_kd":
                 print(f"\n=== SLIM KD (FP32 slim student) ===")
                 for compress_ratio in TARGET_COMPRESS_RATIOS:
@@ -1275,7 +1271,6 @@ def process_dataset_safely(dataset_name, cfg):
                     rows.append(energy_row)
                     print("  Energy summary:", energy_row)
 
-                    # SLIM KD FP16
                     if "slim_kd_fp16" in METHODS:
                         fp16_method = "slim_kd_fp16"
                         print(f"\n=== {fp16_method.upper()} (FP16 of slim_kd) ===")
@@ -1319,7 +1314,6 @@ def process_dataset_safely(dataset_name, cfg):
                     del current_model
                     cleanup_memory()
 
-            # SKIP FP16-only methods in main loop since handled above
             elif method in ["regional_gradients_fp16", "slim_kd_fp16"]:
                 continue
 
@@ -1347,3 +1341,33 @@ def process_dataset_safely(dataset_name, cfg):
         traceback.print_exc()
         cleanup_memory()
         return False
+
+# -------------------------
+# Main execution
+# -------------------------
+if __name__ == "__main__":
+    print("Starting pruning and evaluation script...")
+    print(f"Using device: {DEVICE}")
+    print(f"Datasets to process: {list(DATASETS.keys())}")
+    print(f"Methods to apply: {METHODS}")
+    print(f"Compression ratios: {TARGET_COMPRESS_RATIOS}")
+
+    successful_datasets = []
+    failed_datasets = []
+
+    for dataset_name, cfg in DATASETS.items():
+        print(f"\nProcessing {dataset_name}...")
+        success = process_dataset_safely(dataset_name, cfg)
+        if success:
+            successful_datasets.append(dataset_name)
+        else:
+            failed_datasets.append(dataset_name)
+
+    print("\n\n===================== SUMMARY =====================")
+    print(f"Successfully processed datasets: {successful_datasets}")
+    if failed_datasets:
+        print(f"Failed datasets: {failed_datasets}")
+        print("Please address the errors above and retry.")
+    else:
+        print("All datasets processed successfully!")
+    print("Script completed.")
