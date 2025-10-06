@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Calculates AUC for final models (baseline, quantization, slim_kd, slim_kd_amp, regional_gradients, regional_gradients_amp)
-for bloodmnist, dermamnist, and pathmnist datasets. Updates existing CSVs with AUC values for final models.
+Calculates AUC for final models (baseline, quantization, slim_kd, slim_kd_fp16, regional_gradients, regional_gradients_fp16)
+for bloodmnist, dermamnist, and pathmnist datasets. Fixes nan AUC issues and updates existing CSVs.
 """
 
 import os
@@ -109,10 +109,12 @@ def make_loaders(npz_path, batch_size):
     data = np.load(npz_path, mmap_mode="r")
     X_test, y_test = data["test_images"], data["test_labels"].flatten()
     n_test = len(y_test)
+    unique_labels, counts = np.unique(y_test, return_counts=True)
     print(f"Test dataset size: {n_test}")
+    print(f"Class distribution: {dict(zip(unique_labels, counts))}")
     test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    num_classes = int(len(np.unique(y_test)))
+    num_classes = int(len(unique_labels))
     return test_loader, num_classes
 
 # -------------------------
@@ -186,10 +188,11 @@ def build_pruned_or_slim_resnet(stage_planes=None, num_classes=1000, random_init
 # -------------------------
 criterion = nn.CrossEntropyLoss()
 
-def evaluate_model_basic(model, loader):
+def evaluate_model_basic(model, loader, dataset_name, variant):
     model.eval()
     loss_total = 0.0; correct = 0; total = 0
     probs_list = []; labels_list = []
+    predicted_classes = []
     try:
         model_dtype = next(model.parameters()).dtype
     except StopIteration:
@@ -211,13 +214,41 @@ def evaluate_model_basic(model, loader):
             loss_total += float(loss.item()) * images.size(0)
             _, predicted = outputs.max(1)
             total += labels.size(0); correct += int(predicted.eq(labels).sum().item())
-            probs_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
+            # Clamp logits to prevent overflow in softmax for FP16
+            outputs = torch.clamp(outputs, min=-100, max=100)
+            probs = torch.softmax(outputs, dim=1)
+            if torch.any(torch.isnan(probs)):
+                print(f"    Warning: NaN probabilities detected in {variant} for {dataset_name}")
+            probs_list.append(probs.cpu().numpy())
             labels_list.append(labels.cpu().numpy())
+            predicted_classes.append(predicted.cpu().numpy())
     loss_avg = loss_total / max(1, total)
     acc = correct / max(1, total)
+    # Log predicted class distribution
+    predicted_classes = np.concatenate(predicted_classes)
+    unique_preds, pred_counts = np.unique(predicted_classes, return_counts=True)
+    print(f"    {variant} predicted class distribution: {dict(zip(unique_preds, pred_counts))}")
+    # Compute AUC per class and average
+    labels = np.concatenate(labels_list)
+    probs = np.concatenate(probs_list)
     try:
-        auc = roc_auc_score(np.concatenate(labels_list), np.concatenate(probs_list), multi_class="ovr")
-    except Exception:
+        auc_scores = []
+        for class_idx in np.unique(labels):
+            # Skip classes with no positive samples
+            if np.sum(labels == class_idx) == 0:
+                print(f"    Skipping class {class_idx} in AUC calculation: no positive samples")
+                continue
+            binary_labels = (labels == class_idx).astype(int)
+            binary_probs = probs[:, class_idx]
+            if len(np.unique(binary_labels)) < 2:
+                print(f"    Skipping class {class_idx} in AUC calculation: only one class present")
+                continue
+            auc = roc_auc_score(binary_labels, binary_probs)
+            auc_scores.append(auc)
+        auc = np.mean(auc_scores) if auc_scores else float("nan")
+        print(f"    {variant} per-class AUCs: {auc_scores}")
+    except Exception as e:
+        print(f"    AUC calculation failed for {variant}: {e}")
         auc = float("nan")
     return loss_avg, acc, auc
 
@@ -283,7 +314,7 @@ def process_dataset(dataset_name, cfg):
             log_memory_usage(f"    After loading {variant}: ")
 
             # Compute AUC
-            _, acc, auc = evaluate_model_basic(model, test_loader)
+            _, acc, auc = evaluate_model_basic(model, test_loader, dataset_name, variant)
             print(f"    {variant} AUC: {auc:.4f}, Accuracy: {acc:.4f}")
 
             # Update or append row
