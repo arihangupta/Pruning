@@ -793,15 +793,25 @@ def create_amp_quantized_version(model, save_dir, project_name):
 # -------------------------
 # CodeCarbon helpers
 # -------------------------
-def start_tracker(save_dir: str, project_name: str, output_file: str="emissions.csv", measure_power_secs: int=10):
+def start_tracker(save_dir: str, project_name: str, output_file: str="emissions.csv", measure_power_secs: int=30):
     if not CODECARBON_AVAILABLE:
         return None
     os.makedirs(save_dir, exist_ok=True)
-    tracker = EmissionsTracker(project_name=project_name,
-                              output_dir=save_dir,
-                              output_file=output_file,
-                              measure_power_secs=measure_power_secs,
-                              save_to_file=True)
+    # Remove existing emissions.csv to prevent stale data
+    csv_path = os.path.join(save_dir, output_file)
+    if os.path.exists(csv_path):
+        try:
+            os.remove(csv_path)
+            print(f"  Removed existing {csv_path} to ensure fresh data")
+        except Exception as e:
+            print(f"  Warning: Failed to remove {csv_path}: {e}")
+    tracker = EmissionsTracker(
+        project_name=project_name,
+        output_dir=save_dir,
+        output_file=output_file,
+        measure_power_secs=measure_power_secs,
+        save_to_file=True
+    )
     tracker.start()
     return tracker
 
@@ -827,27 +837,34 @@ def _read_latest_tracker_row(save_dir: str, project_name: str):
 
 def stop_tracker_and_get_metrics(tracker, save_dir: str, project_name: str):
     if tracker is None:
-        return {"emissions_kg": float("nan"), "energy_kwh": float("nan"),
-                "cpu_power_w": float("nan"), "gpu_power_w": float("nan"), "ram_power_w": float("nan"),
-                "raw_row": None}
+        return {
+            "emissions_kg": float("nan"),
+            "energy_kwh": float("nan"),
+            "cpu_power_w": float("nan"),
+            "gpu_power_w": float("nan"),
+            "ram_power_w": float("nan"),
+            "raw_row": None
+        }
     try:
         emissions_val = tracker.stop()
     except Exception as e:
-        print(f"Error stopping CodeCarbon tracker: {e}")
+        print(f"  Error stopping CodeCarbon tracker: {e}")
         emissions_val = None
     
     csv_path = os.path.join(save_dir, "emissions.csv")
-    if os.path.exists(csv_path):
-        try:
-            df = pd.read_csv(csv_path)
-            df = df[df["project_name"] != project_name]
-            df.to_csv(csv_path, index=False)
-        except Exception as e:
-            print(f"Error cleaning emissions.csv: {e}")
-    
     raw = _read_latest_tracker_row(save_dir, project_name)
+    
     if raw is None:
-        print(f"Warning: No valid tracker data for {project_name}")
+        print(f"  Warning: No valid tracker data for {project_name} (CSV may be empty or missing)")
+        if os.path.exists(csv_path):
+            try:
+                file_size = os.path.getsize(csv_path)
+                print(f"  CSV file size: {file_size} bytes")
+                with open(csv_path, 'r') as f:
+                    lines = f.readlines()
+                    print(f"  CSV content: {lines[:2]}")
+            except Exception as e:
+                print(f"  Error inspecting {csv_path}: {e}")
         return {
             "emissions_kg": float(emissions_val) if emissions_val is not None else float("nan"),
             "energy_kwh": float("nan"),
@@ -856,11 +873,24 @@ def stop_tracker_and_get_metrics(tracker, save_dir: str, project_name: str):
             "ram_power_w": float("nan"),
             "raw_row": None
         }
+    
     energy_kwh = float(raw.get("energy_consumed", float("nan")))
     cpu_power = float(raw.get("cpu_power", float("nan")))
     gpu_power = float(raw.get("gpu_power", float("nan")))
     ram_power = float(raw.get("ram_power", float("nan")))
-    emissions_kg = float(raw.get("emissions", float("nan"))) if raw.get("emissions") is not None else (float(emissions_val) if emissions_val is not None else float("nan"))
+    emissions_kg = float(raw.get("emissions", float("nan"))) if raw.get("emissions") is not None else (
+        float(emissions_val) if emissions_val is not None else float("nan")
+    )
+    
+    # Clean up CSV to remove entries for this project
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            df = df[df["project_name"] != project_name]
+            df.to_csv(csv_path, index=False)
+        except Exception as e:
+            print(f"  Error cleaning emissions.csv: {e}")
+    
     return {
         "emissions_kg": emissions_kg,
         "energy_kwh": energy_kwh,
@@ -1061,10 +1091,10 @@ def process_dataset_safely(dataset_name, cfg):
 
                     break_even = calculate_break_even_safe(conversion_energy_kwh, baseline_energy_per_pred_kwh, quantized_energy_per_pred_kwh)
 
-                    energy_row = create_energy_row(method, compress_ratio, keep_ratio, conversion_energy_kwh, conversion_emissions_kg,
-                                                   baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
-                                                   quantized_energy_kwh, quantized_energy_per_pred_kwh, quantized_emissions_kg,
-                                                   pred_energy_per_image_kwh, break_even)
+                    energy_row = create_energy_row(method, compress_ratio, keep_ratio, retrain_energy_kwh, retrain_emissions_kg,
+                               baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
+                               pruned_energy_kwh, pruned_energy_per_pred_kwh, pruned_emissions_kg,
+                               pred_energy_per_image_kWh, break_even)
                     rows.append(energy_row)
                     print("  Energy summary:", energy_row)
 
