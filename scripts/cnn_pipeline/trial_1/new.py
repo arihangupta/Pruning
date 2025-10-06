@@ -43,7 +43,6 @@ PREDICTION_IMAGES = 50
 
 TARGET_COMPRESS_RATIOS = [0.5]
 
-# Methods: quantization (FP16 from baseline), regional_gradients (FP32), regional_gradients_fp16, slim_kd (FP32), slim_kd_fp16
 METHODS = ["quantization", "regional_gradients", "regional_gradients_fp16", "slim_kd", "slim_kd_fp16"]
 
 CAL_EPOCHS = 1
@@ -311,7 +310,6 @@ def compute_stage_importance_and_keeps_regional(model: nn.Module, stage_name: st
 # Weight copying for pruned ResNet
 # -------------------------
 def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indices: dict, num_classes: int):
-    # Ensure at least one channel is kept per stage
     for stage in keep_indices:
         if len(keep_indices[stage]) == 0:
             keep_indices[stage] = np.array([0])
@@ -345,7 +343,6 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
             out_idx = kept
             
             new_block.conv1.weight.data.copy_(base_block.conv1.weight.data[out_idx][:, in_idx])
-            
             new_block.bn1.weight.data.copy_(base_block.bn1.weight.data[out_idx])
             new_block.bn1.bias.data.copy_(base_block.bn1.bias.data[out_idx])
             new_block.bn1.running_mean.copy_(base_block.bn1.running_mean[out_idx])
@@ -383,7 +380,7 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
     return new_model
 
 # -------------------------
-# Metrics & eval with IMPROVED AUC CALCULATION
+# Metrics & eval
 # -------------------------
 criterion = nn.CrossEntropyLoss()
 
@@ -551,7 +548,7 @@ def measure_prediction_energy(model, test_loader, save_dir, project_name, num_im
     if not CODECARBON_AVAILABLE:
         return float("nan"), float("nan")
     
-    tracker = start_tracker(save_dir, project_name, measure_power_secs=10)
+    tracker = start_tracker(save_dir, project_name, measure_power_secs=30)
     model.eval()
     images_processed = 0
     it = iter(test_loader)
@@ -772,7 +769,7 @@ def create_amp_quantized_version(model, save_dir, project_name):
         conversion_energy_kwh = float("nan")
         conversion_emissions_kg = float("nan")
     else:
-        conversion_tracker = start_tracker(save_dir, project_name, measure_power_secs=10)
+        conversion_tracker = start_tracker(save_dir, project_name, measure_power_secs=30)
     
     amp_model = copy.deepcopy(model)
     amp_model = amp_model.half()
@@ -797,7 +794,6 @@ def start_tracker(save_dir: str, project_name: str, output_file: str="emissions.
     if not CODECARBON_AVAILABLE:
         return None
     os.makedirs(save_dir, exist_ok=True)
-    # Remove existing emissions.csv to prevent stale data
     csv_path = os.path.join(save_dir, output_file)
     if os.path.exists(csv_path):
         try:
@@ -821,19 +817,14 @@ def _read_latest_tracker_row(save_dir: str, project_name: str):
         return None
     try:
         df = pd.read_csv(csv_path)
-    except Exception:
-        return None
-    try:
+        if df.empty:
+            return None
         df_match = df[df["project_name"] == project_name]
         if df_match.shape[0] == 0:
             return None
-        last = df_match.iloc[-1].to_dict()
-        return last
+        return df_match.iloc[-1].to_dict()
     except Exception:
-        try:
-            return df.iloc[-1].to_dict()
-        except Exception:
-            return None
+        return None
 
 def stop_tracker_and_get_metrics(tracker, save_dir: str, project_name: str):
     if tracker is None:
@@ -851,20 +842,19 @@ def stop_tracker_and_get_metrics(tracker, save_dir: str, project_name: str):
         print(f"  Error stopping CodeCarbon tracker: {e}")
         emissions_val = None
     
-    csv_path = os.path.join(save_dir, "emissions.csv")
     raw = _read_latest_tracker_row(save_dir, project_name)
     
     if raw is None:
         print(f"  Warning: No valid tracker data for {project_name} (CSV may be empty or missing)")
-        if os.path.exists(csv_path):
+        if os.path.exists(os.path.join(save_dir, "emissions.csv")):
             try:
-                file_size = os.path.getsize(csv_path)
+                file_size = os.path.getsize(os.path.join(save_dir, "emissions.csv"))
                 print(f"  CSV file size: {file_size} bytes")
-                with open(csv_path, 'r') as f:
+                with open(os.path.join(save_dir, "emissions.csv"), 'r') as f:
                     lines = f.readlines()
                     print(f"  CSV content: {lines[:2]}")
             except Exception as e:
-                print(f"  Error inspecting {csv_path}: {e}")
+                print(f"  Error inspecting emissions.csv: {e}")
         return {
             "emissions_kg": float(emissions_val) if emissions_val is not None else float("nan"),
             "energy_kwh": float("nan"),
@@ -882,7 +872,7 @@ def stop_tracker_and_get_metrics(tracker, save_dir: str, project_name: str):
         float(emissions_val) if emissions_val is not None else float("nan")
     )
     
-    # Clean up CSV to remove entries for this project
+    csv_path = os.path.join(save_dir, "emissions.csv")
     if os.path.exists(csv_path):
         try:
             df = pd.read_csv(csv_path)
@@ -952,7 +942,7 @@ def measure_baseline_energy_averaged(baseline, test_loader, save_dir, dataset_na
     
     for run in range(NUM_BASELINE_RUNS):
         proj = f"{dataset_name}_baseline_inference_run{run}"
-        tracker = start_tracker(save_dir, proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
+        tracker = start_tracker(save_dir, proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
         avg_time, _, images = inference_time_per_batch(baseline, test_loader, timed=TIMING_BATCHES)
         metrics = stop_tracker_and_get_metrics(tracker, save_dir, proj)
         energy_kwh = metrics["energy_kwh"]
@@ -998,12 +988,6 @@ def load_baseline_ckpt_safe(path, num_classes):
     
     return model.to(DEVICE).eval()
 
-# -------------------------
-# Dataset processing with error handling
-# -------------------------
-# -------------------------
-# Dataset processing with error handling
-# -------------------------
 # -------------------------
 # Dataset processing with error handling
 # -------------------------
@@ -1074,9 +1058,8 @@ def process_dataset_safely(dataset_name, cfg):
                     rows.append(row)
                     print("  Quantized metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
-                    # Measure inference energy for quantized model
                     quantized_inf_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_inference"
-                    quantized_tracker = start_tracker(SAVE_DIR, quantized_inf_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
+                    quantized_tracker = start_tracker(SAVE_DIR, quantized_inf_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
                     _, _, quantized_images = inference_time_per_batch(quantized_model, test_loader, timed=TIMING_BATCHES)
                     quantized_inf_metrics = stop_tracker_and_get_metrics(quantized_tracker, SAVE_DIR, quantized_inf_proj)
                     quantized_energy_kwh = quantized_inf_metrics["energy_kwh"]
@@ -1091,10 +1074,10 @@ def process_dataset_safely(dataset_name, cfg):
 
                     break_even = calculate_break_even_safe(conversion_energy_kwh, baseline_energy_per_pred_kwh, quantized_energy_per_pred_kwh)
 
-                    energy_row = create_energy_row(method, compress_ratio, keep_ratio, retrain_energy_kwh, retrain_emissions_kg,
-                               baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
-                               pruned_energy_kwh, pruned_energy_per_pred_kwh, pruned_emissions_kg,
-                               pred_energy_per_image_kWh, break_even)
+                    energy_row = create_energy_row(method, compress_ratio, keep_ratio, conversion_energy_kwh, conversion_emissions_kg,
+                                                   baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
+                                                   quantized_energy_kwh, quantized_energy_per_pred_kwh, quantized_emissions_kg,
+                                                   pred_energy_per_image_kwh, break_even)
                     rows.append(energy_row)
                     print("  Energy summary:", energy_row)
 
@@ -1108,7 +1091,7 @@ def process_dataset_safely(dataset_name, cfg):
                     print(f"  Compression: {compress_ratio*100}% (keep ratio {keep_ratio})")
 
                     prune_retrain_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_prune_retrain"
-                    prune_retrain_tracker = start_tracker(SAVE_DIR, prune_retrain_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
+                    prune_retrain_tracker = start_tracker(SAVE_DIR, prune_retrain_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
 
                     current_model = copy.deepcopy(baseline).to(DEVICE)
                     keep_indices = {s: np.arange(stage_orig_channels(current_model, s)) for s in STAGES}
@@ -1176,7 +1159,7 @@ def process_dataset_safely(dataset_name, cfg):
                     print(f"  Prune+retrain energy_kWh={retrain_energy_kwh}, emissions_kg={retrain_emissions_kg}")
 
                     pruned_inf_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_inference"
-                    pruned_tracker = start_tracker(SAVE_DIR, pruned_inf_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
+                    pruned_tracker = start_tracker(SAVE_DIR, pruned_inf_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
                     _, _, pruned_images = inference_time_per_batch(current_model, test_loader, timed=TIMING_BATCHES)
                     pruned_inf_metrics = stop_tracker_and_get_metrics(pruned_tracker, SAVE_DIR, pruned_inf_proj)
                     pruned_energy_kwh = pruned_inf_metrics["energy_kwh"]
@@ -1194,7 +1177,7 @@ def process_dataset_safely(dataset_name, cfg):
                     energy_row = create_energy_row(method, compress_ratio, keep_ratio, retrain_energy_kwh, retrain_emissions_kg,
                                                    baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
                                                    pruned_energy_kwh, pruned_energy_per_pred_kwh, pruned_emissions_kg,
-                                                   pred_energy_per_image_kWh, break_even)
+                                                   pred_energy_per_image_kwh, break_even)
                     rows.append(energy_row)
                     print("  Energy summary:", energy_row)
 
@@ -1213,7 +1196,7 @@ def process_dataset_safely(dataset_name, cfg):
                         print("  FP16 metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
                         fp16_inf_proj = f"{dataset_name}_{fp16_method}_r{int(compress_ratio*100)}compressed_inference"
-                        fp16_tracker = start_tracker(SAVE_DIR, fp16_inf_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
+                        fp16_tracker = start_tracker(SAVE_DIR, fp16_inf_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
                         _, _, fp16_images = inference_time_per_batch(fp16_model, test_loader, timed=TIMING_BATCHES)
                         fp16_inf_metrics = stop_tracker_and_get_metrics(fp16_tracker, SAVE_DIR, fp16_inf_proj)
                         fp16_energy_kwh = fp16_inf_metrics["energy_kwh"]
@@ -1248,7 +1231,7 @@ def process_dataset_safely(dataset_name, cfg):
                     print(f"  Compression: {compress_ratio*100}% (keep ratio {keep_ratio})")
 
                     prune_retrain_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_prune_retrain"
-                    prune_retrain_tracker = start_tracker(SAVE_DIR, prune_retrain_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
+                    prune_retrain_tracker = start_tracker(SAVE_DIR, prune_retrain_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
 
                     stage_planes = [max(1, int(p * keep_ratio)) for p in ORIGINAL_PLANES]
                     current_model = build_pruned_or_slim_resnet(stage_planes=stage_planes, num_classes=NUM_CLASSES, random_init=True)
@@ -1283,7 +1266,7 @@ def process_dataset_safely(dataset_name, cfg):
                     print(f"  Prune+retrain energy_kWh={retrain_energy_kwh}, emissions_kg={retrain_emissions_kg}")
 
                     pruned_inf_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_inference"
-                    pruned_tracker = start_tracker(SAVE_DIR, pruned_inf_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
+                    pruned_tracker = start_tracker(SAVE_DIR, pruned_inf_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
                     _, _, pruned_images = inference_time_per_batch(current_model, test_loader, timed=TIMING_BATCHES)
                     pruned_inf_metrics = stop_tracker_and_get_metrics(pruned_tracker, SAVE_DIR, pruned_inf_proj)
                     pruned_energy_kwh = pruned_inf_metrics["energy_kwh"]
@@ -1320,7 +1303,7 @@ def process_dataset_safely(dataset_name, cfg):
                         print("  FP16 metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
                         fp16_inf_proj = f"{dataset_name}_{fp16_method}_r{int(compress_ratio*100)}compressed_inference"
-                        fp16_tracker = start_tracker(SAVE_DIR, fp16_inf_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
+                        fp16_tracker = start_tracker(SAVE_DIR, fp16_inf_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
                         _, _, fp16_images = inference_time_per_batch(fp16_model, test_loader, timed=TIMING_BATCHES)
                         fp16_inf_metrics = stop_tracker_and_get_metrics(fp16_tracker, SAVE_DIR, fp16_inf_proj)
                         fp16_energy_kwh = fp16_inf_metrics["energy_kwh"]
@@ -1348,60 +1331,41 @@ def process_dataset_safely(dataset_name, cfg):
                     del current_model
                     cleanup_memory()
 
-            elif method in ["regional_gradients_fp16", "slim_kd_fp16"]:
-                continue
-
         df = pd.DataFrame(rows)
         df.to_csv(csv_path, index=False)
-        print(f"All done for {dataset_name}. CSV saved: {csv_path}")
+        print(f"\nResults saved to {csv_path}")
+        print(f"Dataset {dataset_name} completed successfully.")
+
         del baseline, train_loader, val_loader, test_loader, train_ds
         cleanup_memory()
         log_memory_usage(f"After completing {dataset_name}: ")
         return True
 
-    except FileNotFoundError as e:
-        print(f"File not found error for {dataset_name}: {e}")
-        print("Please check that all required files exist.")
-        cleanup_memory()
-        return False
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"CUDA out of memory for {dataset_name}: {e}")
-        print("Try reducing batch size or model size.")
-        cleanup_memory()
-        return False
     except Exception as e:
-        print(f"Unexpected error processing {dataset_name}: {str(e)}")
+        print(f"\nERROR processing {dataset_name}: {str(e)}")
         import traceback
         traceback.print_exc()
-        cleanup_memory()
         return False
 
 # -------------------------
 # Main execution
 # -------------------------
-if __name__ == "__main__":
-    print("Starting pruning and evaluation script...")
-    print(f"Using device: {DEVICE}")
-    print(f"Datasets to process: {list(DATASETS.keys())}")
-    print(f"Methods to apply: {METHODS}")
-    print(f"Compression ratios: {TARGET_COMPRESS_RATIOS}")
+def main():
+    set_seed(SEED, deterministic=True)
+    print(f"Starting experiment on {DEVICE}. Datasets: {list(DATASETS.keys())}")
+    print(f"Methods: {METHODS}")
+    print(f"Target compression ratios: {TARGET_COMPRESS_RATIOS}")
+    print(f"Output directory: {SAVE_DIR_BASE}")
 
-    successful_datasets = []
-    failed_datasets = []
-
+    success_count = 0
     for dataset_name, cfg in DATASETS.items():
-        print(f"\nProcessing {dataset_name}...")
         success = process_dataset_safely(dataset_name, cfg)
         if success:
-            successful_datasets.append(dataset_name)
+            success_count += 1
         else:
-            failed_datasets.append(dataset_name)
+            print(f"Failed to process {dataset_name}")
+    
+    print(f"\nExperiment completed. Successfully processed {success_count}/{len(DATASETS)} datasets.")
 
-    print("\n\n===================== SUMMARY =====================")
-    print(f"Successfully processed datasets: {successful_datasets}")
-    if failed_datasets:
-        print(f"Failed datasets: {failed_datasets}")
-        print("Please address the errors above and retry.")
-    else:
-        print("All datasets processed successfully!")
-    print("Script completed.")
+if __name__ == "__main__":
+    main()
