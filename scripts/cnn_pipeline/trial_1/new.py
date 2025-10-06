@@ -974,6 +974,9 @@ def load_baseline_ckpt_safe(path, num_classes):
 # -------------------------
 # Dataset processing with error handling
 # -------------------------
+# -------------------------
+# Dataset processing with error handling
+# -------------------------
 def process_dataset_safely(dataset_name, cfg):
     try:
         print(f"\n\n===================== DATASET: {dataset_name.upper()} =====================")
@@ -1041,6 +1044,7 @@ def process_dataset_safely(dataset_name, cfg):
                     rows.append(row)
                     print("  Quantized metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
+                    # Measure inference energy for quantized model
                     quantized_inf_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_inference"
                     quantized_tracker = start_tracker(SAVE_DIR, quantized_inf_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
                     _, _, quantized_images = inference_time_per_batch(quantized_model, test_loader, timed=TIMING_BATCHES)
@@ -1160,7 +1164,7 @@ def process_dataset_safely(dataset_name, cfg):
                     energy_row = create_energy_row(method, compress_ratio, keep_ratio, retrain_energy_kwh, retrain_emissions_kg,
                                                    baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
                                                    pruned_energy_kwh, pruned_energy_per_pred_kwh, pruned_emissions_kg,
-                                                   pred_energy_per_image_kwh, break_even)
+                                                   pred_energy_per_image_kWh, break_even)
                     rows.append(energy_row)
                     print("  Energy summary:", energy_row)
 
