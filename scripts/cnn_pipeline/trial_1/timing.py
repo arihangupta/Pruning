@@ -184,9 +184,9 @@ def parse_model_name(filename, dataset):
     # Extract pruning method
     if basename == "slim_kd_amp_r50compressed_final_amp.pth":
         method = "slim_kd_fp16"
-    elif basename == "pgto_regional_gradients_amp_r50compressed_final_amp.pth":
+    elif basename == "regional_gradients_fp16_r50compressed_final.pth":
         method = "pgto_regional_gradients_fp16"
-    elif "pgto_regional_gradients" in basename and "_amp" not in basename:
+    elif "regional_gradients" in basename and "_amp" not in basename:
         method = "pgto_regional_gradients"
     elif "quantization" in basename:
         method = "quantization"
