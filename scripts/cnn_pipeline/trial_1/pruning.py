@@ -1,23 +1,9 @@
-#!/usr/bin/env python3
-"""
-Outputs:
-- Single CSV per dataset with all variants (Variant column distinguishes).
-- emissions.csv in SAVE_DIR.
-- Corrected to prune 50%, 75%, or 87.5% of bits (keep 50%, 25%, 12.5% from FP32).
-- Measures energy for predictions on 50 test images after training, reports energy per image.
-- Includes AMP (FP16) variants for regional_gradients and slim_kd methods.
-- Total of 6 model variants: baseline, quantization, regional_gradients, regional_gradients_fp16, slim_kd, slim_kd_fp16
-- Fixed: Only saves final FP32 models for non-AMP variants, AMP variants only save FP16 version
-- Fixed: Measures actual conversion energy for AMP quantization
-"""
-
 import os
 import time
 import math
 import random
 import tempfile
 import copy
-import json
 import numpy as np
 import pandas as pd
 import torch
@@ -30,7 +16,6 @@ from torchvision import models, transforms as T
 from sklearn.metrics import roc_auc_score
 from torchprofile import profile_macs
 import psutil
-from torch.quantization import quantize_dynamic, get_default_qconfig, prepare, convert, fuse_modules
 import gc
 
 # CodeCarbon
@@ -45,7 +30,7 @@ except Exception:
 # -------------------------
 # Config
 # -------------------------
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/trial_1/pruned_models"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/trial_1/new"
 CNN_EXP1_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
@@ -58,8 +43,7 @@ PREDICTION_IMAGES = 50
 
 TARGET_COMPRESS_RATIOS = [0.5]
 
-# Methods: quantization, regional_gradients (FP32), regional_gradients_amp (FP16), slim_kd (FP32), slim_kd_amp (FP16)
-METHODS = ["quantization", "regional_gradients", "regional_gradients_amp", "slim_kd", "slim_kd_amp"]
+METHODS = ["quantization", "regional_gradients", "regional_gradients_fp16", "slim_kd", "slim_kd_fp16"]
 
 CAL_EPOCHS = 1
 CAL_MAX_BATCHES = 150
@@ -126,7 +110,6 @@ def log_memory_usage(prefix=""):
     print(f"{prefix}Memory Usage: RSS={mem_info.rss/(1024**2):.2f}MB, GPU={gpu_mem:.2f}MB")
 
 def cleanup_memory():
-    """Force garbage collection and clear CUDA cache"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -323,19 +306,15 @@ def compute_stage_importance_and_keeps_regional(model: nn.Module, stage_name: st
         keep = np.argsort(importance_np)[-keep_k:]
     return np.sort(keep)
 
-def compute_stage_importance_and_keeps(model: nn.Module, stage_name: str, keep_k: int, method: str="regional_gradients", calib_loader: DataLoader=None, max_batches: int=RG_CAL_MAX_BATCHES):
-    if method in ["regional_gradients", "regional_gradients_amp"]:
-        if calib_loader is None:
-            raise ValueError("calib_loader required for regional_gradients method")
-        return compute_stage_importance_and_keeps_regional(model, stage_name, keep_k, calib_loader, max_batches)
-    else:
-        raise ValueError(f"Unknown method: {method}")
-
 # -------------------------
 # Weight copying for pruned ResNet
 # -------------------------
 def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indices: dict, num_classes: int):
-    """Build a pruned ResNet and copy weights with proper mapping."""
+    for stage in keep_indices:
+        if len(keep_indices[stage]) == 0:
+            keep_indices[stage] = np.array([0])
+            print(f"    Warning: {stage} has no channels kept, forcing one channel to prevent errors")
+    
     new_model = build_pruned_or_slim_resnet(keep_indices=keep_indices, num_classes=num_classes, random_init=False)
     
     new_model.conv1.weight.data.copy_(base_model.conv1.weight.data)
@@ -364,7 +343,6 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
             out_idx = kept
             
             new_block.conv1.weight.data.copy_(base_block.conv1.weight.data[out_idx][:, in_idx])
-            
             new_block.bn1.weight.data.copy_(base_block.bn1.weight.data[out_idx])
             new_block.bn1.bias.data.copy_(base_block.bn1.bias.data[out_idx])
             new_block.bn1.running_mean.copy_(base_block.bn1.running_mean[out_idx])
@@ -406,10 +384,11 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
 # -------------------------
 criterion = nn.CrossEntropyLoss()
 
-def evaluate_model_basic(model, loader):
+def evaluate_model_basic(model, loader, dataset_name="", variant=""):
     model.eval()
     loss_total = 0.0; correct = 0; total = 0
     probs_list = []; labels_list = []
+    predicted_classes = []
     
     try:
         model_dtype = next(model.parameters()).dtype
@@ -438,14 +417,49 @@ def evaluate_model_basic(model, loader):
             loss_total += float(loss.item()) * images.size(0)
             _, predicted = outputs.max(1)
             total += labels.size(0); correct += int(predicted.eq(labels).sum().item())
-            probs_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
+            
+            outputs = torch.clamp(outputs, min=-100, max=100)
+            probs = torch.softmax(outputs, dim=1)
+            
+            if torch.any(torch.isnan(probs)):
+                print(f"    Warning: NaN probabilities detected in {variant} for {dataset_name}")
+            
+            probs_list.append(probs.cpu().numpy())
             labels_list.append(labels.cpu().numpy())
+            predicted_classes.append(predicted.cpu().numpy())
+    
     loss_avg = loss_total / max(1, total)
     acc = correct / max(1, total)
+    
+    if variant and len(predicted_classes) > 0:
+        predicted_classes = np.concatenate(predicted_classes)
+        unique_preds, pred_counts = np.unique(predicted_classes, return_counts=True)
+        print(f"    {variant} predicted class distribution: {dict(zip(unique_preds, pred_counts))}")
+    
+    labels = np.concatenate(labels_list)
+    probs = np.concatenate(probs_list)
     try:
-        auc = roc_auc_score(np.concatenate(labels_list), np.concatenate(probs_list), multi_class="ovr")
-    except Exception:
+        auc_scores = []
+        unique_labels = np.unique(labels)
+        if len(unique_labels) < 2:
+            print(f"    Warning: Only {len(unique_labels)} class(es) found in {variant} for {dataset_name}, AUC set to NaN")
+            auc = float("nan")
+        else:
+            for class_idx in unique_labels:
+                binary_labels = (labels == class_idx).astype(int)
+                binary_probs = probs[:, class_idx]
+                if len(np.unique(binary_labels)) < 2:
+                    print(f"    Warning: Class {class_idx} has only one label type, skipping AUC")
+                    continue
+                auc = roc_auc_score(binary_labels, binary_probs)
+                auc_scores.append(auc)
+            auc = np.mean(auc_scores) if auc_scores else float("nan")
+            if variant and auc_scores:
+                print(f"    {variant} per-class AUCs: {[f'{a:.4f}' for a in auc_scores]}, mean: {auc:.4f}")
+    except Exception as e:
+        print(f"    AUC calculation failed for {variant}: {e}")
         auc = float("nan")
+    
     return loss_avg, acc, auc
 
 def count_zeros_and_total(model):
@@ -487,7 +501,6 @@ def compute_flops(model):
 
 def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES):
     model.eval()
-    
     try:
         model_device = next(model.parameters()).device
         model_dtype = next(model.parameters()).dtype
@@ -507,7 +520,8 @@ def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES)
             with torch.no_grad(): _ = model(imgs)
             if use_cuda: torch.cuda.synchronize()
     except StopIteration:
-        pass
+        print("    Warning: Iterator exhausted during warmup, resetting iterator")
+        it = iter(loader)
     
     if use_cuda: torch.cuda.reset_peak_memory_stats()
     start = time.time()
@@ -524,18 +538,17 @@ def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES)
             batches_done += 1
             images_processed += imgs.size(0)
     except StopIteration:
-        pass
+        print(f"    Warning: Only {batches_done} batches processed due to dataset size")
     elapsed = time.time() - start
     avg_batch = elapsed / max(1, batches_done)
     peak_mb = torch.cuda.max_memory_allocated() / (1024**2) if use_cuda else params_count(model)*4.0/(1024**2)
     return avg_batch, peak_mb, images_processed
 
 def measure_prediction_energy(model, test_loader, save_dir, project_name, num_images=PREDICTION_IMAGES):
-    """Measure energy for predicting on exactly num_images from test_loader."""
     if not CODECARBON_AVAILABLE:
         return float("nan"), float("nan")
     
-    tracker = start_tracker(save_dir, project_name, measure_power_secs=10)
+    tracker = start_tracker(save_dir, project_name, measure_power_secs=30)
     model.eval()
     images_processed = 0
     it = iter(test_loader)
@@ -572,18 +585,23 @@ def measure_prediction_energy(model, test_loader, save_dir, project_name, num_im
     print(f"  Prediction energy for {images_processed} images: total_kWh={energy_kwh}, per_image_kWh={energy_per_image_kwh}, emissions_kg={emissions_kg}")
     return energy_per_image_kwh, emissions_kg
 
-def collect_metrics_row(variant, stage, ratio, model, test_loader, path_hint):
-    loss, acc, auc = evaluate_model_basic(model, test_loader)
-    zeros, total = count_zeros_and_total(model) if "slim" not in variant and "quantization" not in variant and "amp" not in variant and "fp16" not in variant else (0, params_count(model))
+def collect_metrics_row(variant, stage, ratio, model, test_loader, path_hint, dataset_name=""):
+    loss, acc, auc = evaluate_model_basic(model, test_loader, dataset_name, variant)
+    zeros, total = count_zeros_and_total(model) if "quantization" not in variant and "fp16" not in variant else (0, params_count(model))
     params = params_count(model)
     flops = compute_flops(model)
     flops_m = flops / 1e6 if not math.isnan(flops) else float("nan")
     avg_time, peak_ram, images_processed = inference_time_per_batch(model, test_loader, timed=TIMING_BATCHES)
     if path_hint is not None and os.path.exists(path_hint):
-        size_mb = os.path.getsize(path_hint)/(1024**2)
+        try:
+            size_mb = os.path.getsize(path_hint)/(1024**2)
+        except Exception as e:
+            print(f"    Warning: Failed to get size of {path_hint}: {e}, falling back to model_size_bytes")
+            size_mb = model_size_bytes(model)/(1024**2)
     else:
+        print(f"    Warning: Checkpoint {path_hint} does not exist, using model_size_bytes")
         size_mb = model_size_bytes(model)/(1024**2)
-    power_m = (flops * ((total - zeros)/total)) / 1e6 if not math.isnan(flops) and total>0 and "slim" not in variant else float("nan")
+    power_m = (flops * ((total - zeros)/total)) / 1e6 if not math.isnan(flops) and total > 0 else float("nan")
     return {
         "Variant": variant, "Stage": stage, "Ratio": ratio,
         "Acc": acc, "AUC": auc, "Loss": loss,
@@ -645,7 +663,6 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
     
     student_dtype = next(student.parameters()).dtype
     teacher_dtype = next(teacher.parameters()).dtype
-    
     use_fp16 = (student_dtype == torch.half)
     
     for ep in range(epochs):
@@ -656,32 +673,19 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
             imgs = imgs.to(device)
             labels = labels.to(device)
             
-            if use_fp16:
-                with torch.no_grad():
-                    if teacher_dtype == torch.half:
-                        t_logits = teacher(imgs.half()).float()
-                    else:
-                        t_logits = teacher(imgs)
-                
-                s_logits = student(imgs.half()).float()
-            else:
-                with torch.no_grad():
-                    if teacher_dtype == torch.half:
-                        t_logits = teacher(imgs.half()).float()
-                    else:
-                        t_logits = teacher(imgs)
-                
-                s_logits = student(imgs)
+            with torch.no_grad():
+                teacher_imgs = imgs.half() if teacher_dtype == torch.half else imgs
+                t_logits = teacher(teacher_imgs).float()
+            
+            student_imgs = imgs.half() if use_fp16 else imgs
+            s_logits = student(student_imgs).float()
             
             loss_ce = criterion(s_logits, labels)
-            
             s_log_soft = F.log_softmax(s_logits / T, dim=1)
             with torch.no_grad():
                 t_soft = F.softmax(t_logits / T, dim=1)
-            
             s_log_soft = torch.clamp(s_log_soft, min=-100)
             t_soft = torch.clamp(t_soft, min=1e-8)
-            
             loss_kd = kl_loss(s_log_soft, t_soft) * (T * T)
             
             if torch.isnan(loss_ce) or torch.isnan(loss_kd):
@@ -689,20 +693,15 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
                 continue
             
             loss = alpha * loss_ce + (1.0 - alpha) * loss_kd
-            
             opt.zero_grad()
             loss.backward()
-            
             if use_fp16:
                 torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
-            
             opt.step()
-            
             running_loss += float(loss.item()) * imgs.size(0)
             _, preds = s_logits.max(1)
-            total += labels.size(0)
+            total = labels.size(0)
             correct += int(preds.eq(labels).sum().item())
-            
             if bidx % LOG_INTERVAL == 0:
                 avg_loss = running_loss/max(1,total)
                 avg_acc = correct/max(1,total)
@@ -716,7 +715,6 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
 # -------------------------
 def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR):
     model.train()
-    
     model_dtype = next(model.parameters()).dtype
     is_fp16 = (model_dtype == torch.half)
     
@@ -732,77 +730,46 @@ def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCH
         for bidx, (imgs, labels) in enumerate(train_loader, 1):
             imgs = imgs.to(DEVICE)
             labels = labels.to(DEVICE)
-            
             opt.zero_grad()
             out = model(imgs)
             loss = criterion(out, labels)
             loss.backward()
             opt.step()
-            
             running_loss += float(loss.item()) * imgs.size(0)
             _, preds = out.max(1)
             total += labels.size(0); correct += int(preds.eq(labels).sum().item())
-            
             if bidx % LOG_INTERVAL == 0:
                 print(f"    Global FT ep{ep+1} batch{bidx} - loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
-        
         vloss, vacc, vauc = evaluate_model_basic(model, val_loader)
         print(f"    Global FT epoch {ep+1}: ValLoss {vloss:.4f}, ValAcc {vacc:.4f}, ValAUC {vauc:.4f}")
     
     if is_fp16:
         print("    Converting model back to FP16 after finetuning...")
         model = model.half()
+        print("    Calibrating batch norms after FP16 conversion...")
+        with torch.no_grad():
+            for module in model.modules():
+                if isinstance(module, nn.BatchNorm2d):
+                    module.reset_running_stats()
+                    module.eval()
+            for imgs, _ in train_loader:
+                imgs = imgs.to(DEVICE).half()
+                model(imgs)
+                break
     
     model.eval()
     return model
 
 # -------------------------
-# Quantization
+# Quantization (FP16/AMP only)
 # -------------------------
-def symmetric_quantize_model(model, train_loader, bit_width=8):
-    model.eval()
-    if bit_width == 16:
-        quantized_model = copy.deepcopy(model)
-        quantized_model = quantized_model.half()
-        quantized_model = quantized_model.to(DEVICE)
-        print("Applied FP16 quantization.")
-    elif bit_width == 8:
-        quantized_model = copy.deepcopy(model)
-        quantized_model = quantized_model.cpu()
-        
-        quantized_model = torch.quantization.quantize_dynamic(
-            quantized_model,
-            {nn.Conv2d, nn.Linear},
-            dtype=torch.qint8
-        )
-        
-        print("Applied INT8 dynamic quantization.")
-        return quantized_model
-    elif bit_width == 4:
-        quantized_model = copy.deepcopy(model)
-        for name, module in quantized_model.named_modules():
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
-                weight = module.weight.data
-                w_max = torch.max(torch.abs(weight))
-                if w_max == 0:
-                    continue
-                scale = w_max / 7.0
-                q_weight = torch.round(weight / scale).clamp(-8, 7)
-                module.weight.data = q_weight * scale
-        print("Applied custom INT4 quantization (simulated).")
-    else:
-        print(f"Warning: {bit_width}-bit quantization not implemented. Using model as-is.")
-        quantized_model = model
-    return quantized_model.to(DEVICE)
-
 def create_amp_quantized_version(model, save_dir, project_name):
-    """Create an FP16 (AMP) quantized version and measure conversion energy."""
     if not CODECARBON_AVAILABLE:
         print("  Warning: Cannot measure conversion energy without codecarbon")
         conversion_energy_kwh = float("nan")
         conversion_emissions_kg = float("nan")
     else:
-        conversion_tracker = start_tracker(save_dir, project_name, measure_power_secs=10)
+        conversion_tracker = start_tracker(save_dir, project_name, measure_power_secs=30)
     
     amp_model = copy.deepcopy(model)
     amp_model = amp_model.half()
@@ -823,15 +790,24 @@ def create_amp_quantized_version(model, save_dir, project_name):
 # -------------------------
 # CodeCarbon helpers
 # -------------------------
-def start_tracker(save_dir: str, project_name: str, output_file: str="emissions.csv", measure_power_secs: int=10):
+def start_tracker(save_dir: str, project_name: str, output_file: str="emissions.csv", measure_power_secs: int=30):
     if not CODECARBON_AVAILABLE:
         return None
     os.makedirs(save_dir, exist_ok=True)
-    tracker = EmissionsTracker(project_name=project_name,
-                              output_dir=save_dir,
-                              output_file=output_file,
-                              measure_power_secs=measure_power_secs,
-                              save_to_file=True)
+    csv_path = os.path.join(save_dir, output_file)
+    if os.path.exists(csv_path):
+        try:
+            os.remove(csv_path)
+            print(f"  Removed existing {csv_path} to ensure fresh data")
+        except Exception as e:
+            print(f"  Warning: Failed to remove {csv_path}: {e}")
+    tracker = EmissionsTracker(
+        project_name=project_name,
+        output_dir=save_dir,
+        output_file=output_file,
+        measure_power_secs=measure_power_secs,
+        save_to_file=True
+    )
     tracker.start()
     return tracker
 
@@ -841,32 +817,44 @@ def _read_latest_tracker_row(save_dir: str, project_name: str):
         return None
     try:
         df = pd.read_csv(csv_path)
-    except Exception:
-        return None
-    try:
+        if df.empty:
+            return None
         df_match = df[df["project_name"] == project_name]
         if df_match.shape[0] == 0:
             return None
-        last = df_match.iloc[-1].to_dict()
-        return last
+        return df_match.iloc[-1].to_dict()
     except Exception:
-        try:
-            return df.iloc[-1].to_dict()
-        except Exception:
-            return None
+        return None
 
 def stop_tracker_and_get_metrics(tracker, save_dir: str, project_name: str):
     if tracker is None:
-        return {"emissions_kg": float("nan"), "energy_kwh": float("nan"),
-                "cpu_power_w": float("nan"), "gpu_power_w": float("nan"), "ram_power_w": float("nan"),
-                "raw_row": None}
+        return {
+            "emissions_kg": float("nan"),
+            "energy_kwh": float("nan"),
+            "cpu_power_w": float("nan"),
+            "gpu_power_w": float("nan"),
+            "ram_power_w": float("nan"),
+            "raw_row": None
+        }
     try:
         emissions_val = tracker.stop()
     except Exception as e:
-        print(f"Error stopping CodeCarbon tracker: {e}")
+        print(f"  Error stopping CodeCarbon tracker: {e}")
         emissions_val = None
+    
     raw = _read_latest_tracker_row(save_dir, project_name)
+    
     if raw is None:
+        print(f"  Warning: No valid tracker data for {project_name} (CSV may be empty or missing)")
+        if os.path.exists(os.path.join(save_dir, "emissions.csv")):
+            try:
+                file_size = os.path.getsize(os.path.join(save_dir, "emissions.csv"))
+                print(f"  CSV file size: {file_size} bytes")
+                with open(os.path.join(save_dir, "emissions.csv"), 'r') as f:
+                    lines = f.readlines()
+                    print(f"  CSV content: {lines[:2]}")
+            except Exception as e:
+                print(f"  Error inspecting emissions.csv: {e}")
         return {
             "emissions_kg": float(emissions_val) if emissions_val is not None else float("nan"),
             "energy_kwh": float("nan"),
@@ -875,11 +863,24 @@ def stop_tracker_and_get_metrics(tracker, save_dir: str, project_name: str):
             "ram_power_w": float("nan"),
             "raw_row": None
         }
+    
     energy_kwh = float(raw.get("energy_consumed", float("nan")))
     cpu_power = float(raw.get("cpu_power", float("nan")))
     gpu_power = float(raw.get("gpu_power", float("nan")))
     ram_power = float(raw.get("ram_power", float("nan")))
-    emissions_kg = float(raw.get("emissions", float("nan"))) if raw.get("emissions") is not None else (float(emissions_val) if emissions_val is not None else float("nan"))
+    emissions_kg = float(raw.get("emissions", float("nan"))) if raw.get("emissions") is not None else (
+        float(emissions_val) if emissions_val is not None else float("nan")
+    )
+    
+    csv_path = os.path.join(save_dir, "emissions.csv")
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            df = df[df["project_name"] != project_name]
+            df.to_csv(csv_path, index=False)
+        except Exception as e:
+            print(f"  Error cleaning emissions.csv: {e}")
+    
     return {
         "emissions_kg": emissions_kg,
         "energy_kwh": energy_kwh,
@@ -893,7 +894,6 @@ def stop_tracker_and_get_metrics(tracker, save_dir: str, project_name: str):
 # Break-even calculation
 # -------------------------
 def calculate_break_even_safe(retrain_energy_kwh, baseline_energy_per_pred_kwh, pruned_energy_per_pred_kwh):
-    """Safely calculate break-even predictions with proper error handling"""
     if (math.isnan(retrain_energy_kwh) or 
         math.isnan(baseline_energy_per_pred_kwh) or 
         math.isnan(pruned_energy_per_pred_kwh)):
@@ -942,7 +942,7 @@ def measure_baseline_energy_averaged(baseline, test_loader, save_dir, dataset_na
     
     for run in range(NUM_BASELINE_RUNS):
         proj = f"{dataset_name}_baseline_inference_run{run}"
-        tracker = start_tracker(save_dir, proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
+        tracker = start_tracker(save_dir, proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
         avg_time, _, images = inference_time_per_batch(baseline, test_loader, timed=TIMING_BATCHES)
         metrics = stop_tracker_and_get_metrics(tracker, save_dir, proj)
         energy_kwh = metrics["energy_kwh"]
@@ -972,7 +972,6 @@ def measure_baseline_energy_averaged(baseline, test_loader, save_dir, dataset_na
 # Load baseline checkpoint
 # -------------------------
 def load_baseline_ckpt_safe(path, num_classes):
-    """Safely load baseline checkpoint with better error handling"""
     model = build_resnet50_for_load(num_classes)
     if not os.path.exists(path):
         print(f"ERROR: Baseline checkpoint not found: {path}")
@@ -993,7 +992,6 @@ def load_baseline_ckpt_safe(path, num_classes):
 # Dataset processing with error handling
 # -------------------------
 def process_dataset_safely(dataset_name, cfg):
-    """Process a single dataset with comprehensive error handling"""
     try:
         print(f"\n\n===================== DATASET: {dataset_name.upper()} =====================")
         log_memory_usage(f"Before loading {dataset_name}: ")
@@ -1020,7 +1018,7 @@ def process_dataset_safely(dataset_name, cfg):
         print("=== EVALUATE BASELINE ===")
         base_ckpt = os.path.join(SAVE_DIR, "baseline.pth")
         torch.save(baseline.state_dict(), base_ckpt)
-        row = collect_metrics_row("baseline", "baseline", 0.0, baseline, test_loader, base_ckpt)
+        row = collect_metrics_row("baseline", "baseline", 1.0, baseline, test_loader, base_ckpt, dataset_name)
         rows.append(row)
         print("Baseline done:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
@@ -1043,147 +1041,57 @@ def process_dataset_safely(dataset_name, cfg):
         print("  Baseline energy summary:", energy_row)
 
         for method in METHODS:
-            if method in ["slim_kd", "slim_kd_amp"]:
-                print(f"\n=== SLIM KD VARIANT: {method} ===")
-                is_amp_variant = method.endswith("_amp")
-                base_method = method.replace("_amp", "") if is_amp_variant else method
-                
+            if method == "quantization":
+                print(f"\n=== QUANTIZATION (FP16 from baseline) ===")
                 for compress_ratio in TARGET_COMPRESS_RATIOS:
                     keep_ratio = 1 - compress_ratio
-                    print(f"  Compression: {compress_ratio*100}% (keep ratio {keep_ratio})")
+                    print(f"  Compression: {compress_ratio*100}%")
 
-                    kd_ft_proj = f"{dataset_name}_{base_method}_r{int(compress_ratio*100)}compressed_kd_ft"
-                    kd_ft_tracker = start_tracker(SAVE_DIR, kd_ft_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
-
-                    stage_planes = [max(1, int(p * keep_ratio)) for p in ORIGINAL_PLANES]
-                    current_model = build_pruned_or_slim_resnet(stage_planes=stage_planes, num_classes=NUM_CLASSES, random_init=True)
-                    print(f"  Slim student built (random init, planes: {stage_planes}).")
-
-                    pre_kd_ckpt = os.path.join(SAVE_DIR, f"{base_method}_r{int(compress_ratio*100)}compressed_pre_kd.pth")
-                    torch.save(current_model.state_dict(), pre_kd_ckpt)
-                    row = collect_metrics_row(base_method, "pre_kd", keep_ratio, current_model, test_loader, pre_kd_ckpt)
-                    rows.append(row)
-                    print("  Pre-KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
-
-                    print("  Knowledge distillation...")
-                    current_model = distill_student(current_model, baseline, train_loader, epochs=KD_EPOCHS, lr=KD_LR, alpha=KD_ALPHA, T=KD_TEMPERATURE, max_batches=KD_MAX_BATCHES)
-                    kd_ckpt = os.path.join(SAVE_DIR, f"{base_method}_r{int(compress_ratio*100)}compressed_afterKD.pth")
-                    torch.save(current_model.state_dict(), kd_ckpt)
-                    row = collect_metrics_row(base_method, "after_kd", keep_ratio, current_model, test_loader, kd_ckpt)
-                    rows.append(row)
-                    print("  KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
-
-                    print("  Final global finetune...")
-                    current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
+                    conversion_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_conversion"
+                    quantized_model, conversion_energy_kwh, conversion_emissions_kg = create_amp_quantized_version(
+                        baseline, SAVE_DIR, conversion_proj
+                    )
                     
-                    # Only save FP32 final checkpoint if NOT an AMP variant
-                    if not is_amp_variant:
-                        final_ckpt = os.path.join(SAVE_DIR, f"{base_method}_r{int(compress_ratio*100)}compressed_final.pth")
-                        torch.save(current_model.state_dict(), final_ckpt)
-                        row = collect_metrics_row(base_method, "after_global_finetune", keep_ratio, current_model, test_loader, final_ckpt)
-                        rows.append(row)
-                        print("  Final metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
+                    q_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_final.pth")
+                    torch.save(quantized_model.state_dict(), q_ckpt)
+                    row = collect_metrics_row(method, "quantized", keep_ratio, quantized_model, test_loader, q_ckpt, dataset_name)
+                    rows.append(row)
+                    print("  Quantized metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
-                    kd_ft_metrics = stop_tracker_and_get_metrics(kd_ft_tracker, SAVE_DIR, kd_ft_proj)
-                    retrain_energy_kwh = kd_ft_metrics["energy_kwh"]
-                    retrain_emissions_kg = kd_ft_metrics["emissions_kg"]
-                    print(f"  Retrain energy_kWh={retrain_energy_kwh}, emissions_kg={retrain_emissions_kg}")
+                    quantized_inf_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_inference"
+                    quantized_tracker = start_tracker(SAVE_DIR, quantized_inf_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
+                    _, _, quantized_images = inference_time_per_batch(quantized_model, test_loader, timed=TIMING_BATCHES)
+                    quantized_inf_metrics = stop_tracker_and_get_metrics(quantized_tracker, SAVE_DIR, quantized_inf_proj)
+                    quantized_energy_kwh = quantized_inf_metrics["energy_kwh"]
+                    quantized_emissions_kg = quantized_inf_metrics["emissions_kg"]
+                    quantized_energy_per_pred_kwh = quantized_energy_kwh / quantized_images if quantized_images > 0 and not math.isnan(quantized_energy_kwh) else float("nan")
+                    print(f"  Quantized inference: images={quantized_images}, energy_kWh={quantized_energy_kwh}, emissions_kg={quantized_emissions_kg}")
 
-                    # If NOT AMP variant, measure FP32 inference and save energy row
-                    if not is_amp_variant:
-                        pruned_inf_proj = f"{dataset_name}_{base_method}_r{int(compress_ratio*100)}compressed_inference"
-                        pruned_tracker = start_tracker(SAVE_DIR, pruned_inf_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
-                        _, _, pruned_images = inference_time_per_batch(current_model, test_loader, timed=TIMING_BATCHES)
-                        pruned_inf_metrics = stop_tracker_and_get_metrics(pruned_tracker, SAVE_DIR, pruned_inf_proj)
-                        pruned_energy_kwh = pruned_inf_metrics["energy_kwh"]
-                        pruned_emissions_kg = pruned_inf_metrics["emissions_kg"]
-                        pruned_energy_per_pred_kwh = pruned_energy_kwh / pruned_images if pruned_images > 0 and not math.isnan(pruned_energy_kwh) else float("nan")
-                        print(f"  Pruned inference: images={pruned_images}, energy_kWh={pruned_energy_kwh}, emissions_kg={pruned_emissions_kg}")
+                    pred_energy_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_pred_50images"
+                    pred_energy_per_image_kwh, pred_emissions_kg = measure_prediction_energy(
+                        quantized_model, test_loader, SAVE_DIR, pred_energy_proj
+                    )
 
-                        pred_energy_proj = f"{dataset_name}_{base_method}_r{int(compress_ratio*100)}compressed_pred_50images"
-                        pred_energy_per_image_kwh, pred_emissions_kg = measure_prediction_energy(
-                            current_model, test_loader, SAVE_DIR, pred_energy_proj
-                        )
+                    break_even = calculate_break_even_safe(conversion_energy_kwh, baseline_energy_per_pred_kwh, quantized_energy_per_pred_kwh)
 
-                        break_even = calculate_break_even_safe(retrain_energy_kwh, baseline_energy_per_pred_kwh, pruned_energy_per_pred_kwh)
+                    energy_row = create_energy_row(method, compress_ratio, keep_ratio, conversion_energy_kwh, conversion_emissions_kg,
+                                                   baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
+                                                   quantized_energy_kwh, quantized_energy_per_pred_kwh, quantized_emissions_kg,
+                                                   pred_energy_per_image_kwh, break_even)
+                    rows.append(energy_row)
+                    print("  Energy summary:", energy_row)
 
-                        energy_row = create_energy_row(base_method, compress_ratio, keep_ratio, retrain_energy_kwh, retrain_emissions_kg,
-                                                       baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
-                                                       pruned_energy_kwh, pruned_energy_per_pred_kwh, pruned_emissions_kg,
-                                                       pred_energy_per_image_kwh, break_even)
-                        rows.append(energy_row)
-                        print("  Energy summary:", energy_row)
-                    
-                    # If this IS an AMP variant, create FP16 version and measure its conversion + inference
-                    if is_amp_variant:
-                        print("\n  === Creating AMP (FP16) quantized version ===")
-                        conversion_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_conversion"
-                        amp_model, conversion_energy_kwh, conversion_emissions_kg = create_amp_quantized_version(
-                            current_model, SAVE_DIR, conversion_proj
-                        )
-                        
-                        # Save only the FP16 version
-                        amp_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_final_amp.pth")
-                        torch.save(amp_model.state_dict(), amp_ckpt)
-                        row = collect_metrics_row(f"{base_method}_fp16", "after_global_finetune_amp", keep_ratio, amp_model, test_loader, amp_ckpt)
-                        rows.append(row)
-                        print("  AMP Final metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
-
-                        # Measure AMP inference energy
-                        amp_inf_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_inference"
-                        amp_tracker = start_tracker(SAVE_DIR, amp_inf_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
-                        _, _, amp_images = inference_time_per_batch(amp_model, test_loader, timed=TIMING_BATCHES)
-                        amp_inf_metrics = stop_tracker_and_get_metrics(amp_tracker, SAVE_DIR, amp_inf_proj)
-                        amp_energy_kwh = amp_inf_metrics["energy_kwh"]
-                        amp_emissions_kg = amp_inf_metrics["emissions_kg"]
-                        amp_energy_per_pred_kwh = amp_energy_kwh / amp_images if amp_images > 0 and not math.isnan(amp_energy_kwh) else float("nan")
-                        print(f"  AMP inference: images={amp_images}, energy_kWh={amp_energy_kwh}, emissions_kg={amp_emissions_kg}")
-
-                        amp_pred_energy_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_pred_50images"
-                        amp_pred_energy_per_image_kwh, amp_pred_emissions_kg = measure_prediction_energy(
-                            amp_model, test_loader, SAVE_DIR, amp_pred_energy_proj
-                        )
-
-                        # Use conversion energy as retrain cost for AMP
-                        amp_retrain_energy_kwh = conversion_energy_kwh
-                        amp_retrain_emissions_kg = conversion_emissions_kg
-                        amp_break_even = calculate_break_even_safe(amp_retrain_energy_kwh, baseline_energy_per_pred_kwh, amp_energy_per_pred_kwh)
-
-                        amp_energy_row = create_energy_row(
-                            f"{base_method}_fp16", 
-                            compress_ratio, 
-                            keep_ratio, 
-                            amp_retrain_energy_kwh,
-                            amp_retrain_emissions_kg,
-                            baseline_energy_kwh, 
-                            baseline_energy_per_pred_kwh, 
-                            baseline_emissions_kg,
-                            amp_energy_kwh, 
-                            amp_energy_per_pred_kwh, 
-                            amp_emissions_kg,
-                            amp_pred_energy_per_image_kwh, 
-                            amp_break_even
-                        )
-                        rows.append(amp_energy_row)
-                        print("  AMP Energy summary:", amp_energy_row)
-
-                        del amp_model
-                        cleanup_memory()
-
-                    del current_model
+                    del quantized_model
                     cleanup_memory()
 
-            elif method in ["regional_gradients", "regional_gradients_amp"]:
-                print(f"\n=== PROGRESSIVE PRUNING: method={method} ===")
-                is_amp_variant = method.endswith("_amp")
-                base_method = method.replace("_amp", "") if is_amp_variant else method
-                
+            elif method == "regional_gradients":
+                print(f"\n=== REGIONAL GRADIENTS (FP32 pruned) ===")
                 for compress_ratio in TARGET_COMPRESS_RATIOS:
                     keep_ratio = 1 - compress_ratio
                     print(f"  Compression: {compress_ratio*100}% (keep ratio {keep_ratio})")
 
-                    prune_retrain_proj = f"{dataset_name}_{base_method}_r{int(compress_ratio*100)}compressed_prune_retrain"
-                    prune_retrain_tracker = start_tracker(SAVE_DIR, prune_retrain_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
+                    prune_retrain_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_prune_retrain"
+                    prune_retrain_tracker = start_tracker(SAVE_DIR, prune_retrain_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
 
                     current_model = copy.deepcopy(baseline).to(DEVICE)
                     keep_indices = {s: np.arange(stage_orig_channels(current_model, s)) for s in STAGES}
@@ -1192,7 +1100,7 @@ def process_dataset_safely(dataset_name, cfg):
                     for s in STAGES:
                         orig = stage_orig_channels(current_model, s)
                         keep_k = max(1, int(math.floor(orig * keep_ratio)))
-                        keeps = compute_stage_importance_and_keeps(current_model, s, keep_k, method=base_method, calib_loader=train_loader, max_batches=RG_CAL_MAX_BATCHES)
+                        keeps = compute_stage_importance_and_keeps_regional(current_model, s, keep_k, train_loader, RG_CAL_MAX_BATCHES)
                         keep_indices[s] = keeps
                         print(f"  Stage {s}: keep {len(keeps)}/{orig} ({100*len(keeps)/orig:.1f}% kept)")
                         
@@ -1204,17 +1112,17 @@ def process_dataset_safely(dataset_name, cfg):
                             dummy_input = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(DEVICE)
                             _ = pruned_model(dummy_input)
                         
-                        stage_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{base_method}_r{int(compress_ratio*100)}compressed_{s}_postprune.pth")
+                        stage_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_{s}_postprune.pth")
                         torch.save(pruned_model.state_dict(), stage_pruned_ckpt)
-                        row = collect_metrics_row(base_method, f"{s}_postprune", keep_ratio, pruned_model, test_loader, stage_pruned_ckpt)
+                        row = collect_metrics_row(method, f"{s}_postprune", keep_ratio, pruned_model, test_loader, stage_pruned_ckpt, dataset_name)
                         rows.append(row)
                         print("    Post-prune metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
                         
                         print(f"    Calibrating {s} (local)...")
                         pruned_model = calibrate_stage(pruned_model, s, train_loader, epochs=CAL_EPOCHS, max_batches=CAL_MAX_BATCHES, lr=CAL_LR, allow_fc_bn1=False)
-                        stage_calib_ckpt = os.path.join(SAVE_DIR, f"pgto_{base_method}_r{int(compress_ratio*100)}compressed_{s}_calibrated.pth")
+                        stage_calib_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_{s}_calibrated.pth")
                         torch.save(pruned_model.state_dict(), stage_calib_ckpt)
-                        row = collect_metrics_row(base_method, f"{s}_postcalib", keep_ratio, pruned_model, test_loader, stage_calib_ckpt)
+                        row = collect_metrics_row(method, f"{s}_postcalib", keep_ratio, pruned_model, test_loader, stage_calib_ckpt, dataset_name)
                         rows.append(row)
                         print("    Post-calib metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
                         
@@ -1222,224 +1130,242 @@ def process_dataset_safely(dataset_name, cfg):
                         log_memory_usage(f"After stage {s} for {method}, compress_ratio={compress_ratio}: ")
                         cleanup_memory()
 
-                    all_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{base_method}_r{int(compress_ratio*100)}compressed_allpruned_preKD.pth")
+                    all_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_allpruned_preKD.pth")
                     torch.save(current_model.state_dict(), all_pruned_ckpt)
-                    row = collect_metrics_row(base_method, "all_pruned_preKD", keep_ratio, current_model, test_loader, all_pruned_ckpt)
+                    row = collect_metrics_row(method, "all_pruned_preKD", keep_ratio, current_model, test_loader, all_pruned_ckpt, dataset_name)
                     rows.append(row)
                     print("  All-pruned (pre-KD) metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
                     print("  Knowledge distillation...")
                     current_model = distill_student(current_model, baseline, train_loader, epochs=KD_EPOCHS, lr=KD_LR, alpha=KD_ALPHA, T=KD_TEMPERATURE, max_batches=KD_MAX_BATCHES)
-                    kd_ckpt = os.path.join(SAVE_DIR, f"pgto_{base_method}_r{int(compress_ratio*100)}compressed_afterKD.pth")
+                    kd_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_afterKD.pth")
                     torch.save(current_model.state_dict(), kd_ckpt)
-                    row = collect_metrics_row(base_method, "after_kd", keep_ratio, current_model, test_loader, kd_ckpt)
+                    row = collect_metrics_row(method, "after_kd", keep_ratio, current_model, test_loader, kd_ckpt, dataset_name)
                     rows.append(row)
                     print("  KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
                     print("  Final global finetune...")
                     current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
                     
-                    # Only save FP32 final checkpoint if NOT an AMP variant
-                    if not is_amp_variant:
-                        final_ckpt = os.path.join(SAVE_DIR, f"pgto_{base_method}_r{int(compress_ratio*100)}compressed_final.pth")
-                        torch.save(current_model.state_dict(), final_ckpt)
-                        row = collect_metrics_row(base_method, "after_global_finetune", keep_ratio, current_model, test_loader, final_ckpt)
-                        rows.append(row)
-                        print("  Final metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
+                    final_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_final.pth")
+                    torch.save(current_model.state_dict(), final_ckpt)
+                    row = collect_metrics_row(method, "after_global_finetune", keep_ratio, current_model, test_loader, final_ckpt, dataset_name)
+                    rows.append(row)
+                    print("  Final metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
                     prune_retrain_metrics = stop_tracker_and_get_metrics(prune_retrain_tracker, SAVE_DIR, prune_retrain_proj)
                     retrain_energy_kwh = prune_retrain_metrics["energy_kwh"]
                     retrain_emissions_kg = prune_retrain_metrics["emissions_kg"]
                     print(f"  Prune+retrain energy_kWh={retrain_energy_kwh}, emissions_kg={retrain_emissions_kg}")
 
-                    # If NOT AMP variant, measure FP32 inference and save energy row
-                    if not is_amp_variant:
-                        pruned_inf_proj = f"{dataset_name}_{base_method}_r{int(compress_ratio*100)}compressed_inference"
-                        pruned_tracker = start_tracker(SAVE_DIR, pruned_inf_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
-                        _, _, pruned_images = inference_time_per_batch(current_model, test_loader, timed=TIMING_BATCHES)
-                        pruned_inf_metrics = stop_tracker_and_get_metrics(pruned_tracker, SAVE_DIR, pruned_inf_proj)
-                        pruned_energy_kwh = pruned_inf_metrics["energy_kwh"]
-                        pruned_emissions_kg = pruned_inf_metrics["emissions_kg"]
-                        pruned_energy_per_pred_kwh = pruned_energy_kwh / pruned_images if pruned_images > 0 and not math.isnan(pruned_energy_kwh) else float("nan")
-                        print(f"  Pruned inference: images={pruned_images}, energy_kWh={pruned_energy_kwh}, emissions_kg={pruned_emissions_kg}")
-
-                        pred_energy_proj = f"{dataset_name}_{base_method}_r{int(compress_ratio*100)}compressed_pred_50images"
-                        pred_energy_per_image_kwh, pred_emissions_kg = measure_prediction_energy(
-                            current_model, test_loader, SAVE_DIR, pred_energy_proj
-                        )
-
-                        break_even = calculate_break_even_safe(retrain_energy_kwh, baseline_energy_per_pred_kwh, pruned_energy_per_pred_kwh)
-
-                        energy_row = create_energy_row(base_method, compress_ratio, keep_ratio, retrain_energy_kwh, retrain_emissions_kg,
-                                                       baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
-                                                       pruned_energy_kwh, pruned_energy_per_pred_kwh, pruned_emissions_kg,
-                                                       pred_energy_per_image_kwh, break_even)
-                        rows.append(energy_row)
-                        print("  Energy summary:", energy_row)
-                    
-                    # If this IS an AMP variant, create FP16 version and measure its conversion + inference
-                    if is_amp_variant:
-                        print("\n  === Creating AMP (FP16) quantized version ===")
-                        conversion_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_conversion"
-                        amp_model, conversion_energy_kwh, conversion_emissions_kg = create_amp_quantized_version(
-                            current_model, SAVE_DIR, conversion_proj
-                        )
-                        
-                        # Save only the FP16 version
-                        amp_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_final_amp.pth")
-                        torch.save(amp_model.state_dict(), amp_ckpt)
-                        row = collect_metrics_row(f"{base_method}_fp16", "after_global_finetune_amp", keep_ratio, amp_model, test_loader, amp_ckpt)
-                        rows.append(row)
-                        print("  AMP Final metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
-
-                        # Measure AMP inference energy
-                        amp_inf_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_inference"
-                        amp_tracker = start_tracker(SAVE_DIR, amp_inf_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
-                        _, _, amp_images = inference_time_per_batch(amp_model, test_loader, timed=TIMING_BATCHES)
-                        amp_inf_metrics = stop_tracker_and_get_metrics(amp_tracker, SAVE_DIR, amp_inf_proj)
-                        amp_energy_kwh = amp_inf_metrics["energy_kwh"]
-                        amp_emissions_kg = amp_inf_metrics["emissions_kg"]
-                        amp_energy_per_pred_kwh = amp_energy_kwh / amp_images if amp_images > 0 and not math.isnan(amp_energy_kwh) else float("nan")
-                        print(f"  AMP inference: images={amp_images}, energy_kWh={amp_energy_kwh}, emissions_kg={amp_emissions_kg}")
-
-                        amp_pred_energy_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_pred_50images"
-                        amp_pred_energy_per_image_kwh, amp_pred_emissions_kg = measure_prediction_energy(
-                            amp_model, test_loader, SAVE_DIR, amp_pred_energy_proj
-                        )
-
-                        # Use conversion energy as retrain cost for AMP
-                        amp_retrain_energy_kwh = conversion_energy_kwh
-                        amp_retrain_emissions_kg = conversion_emissions_kg
-                        amp_break_even = calculate_break_even_safe(amp_retrain_energy_kwh, baseline_energy_per_pred_kwh, amp_energy_per_pred_kwh)
-
-                        amp_energy_row = create_energy_row(
-                            f"{base_method}_fp16", 
-                            compress_ratio, 
-                            keep_ratio, 
-                            amp_retrain_energy_kwh,
-                            amp_retrain_emissions_kg,
-                            baseline_energy_kwh, 
-                            baseline_energy_per_pred_kwh, 
-                            baseline_emissions_kg,
-                            amp_energy_kwh, 
-                            amp_energy_per_pred_kwh, 
-                            amp_emissions_kg,
-                            amp_pred_energy_per_image_kwh, 
-                            amp_break_even
-                        )
-                        rows.append(amp_energy_row)
-                        print("  AMP Energy summary:", amp_energy_row)
-
-                        del amp_model
-                        cleanup_memory()
-
-                    del current_model
-                    cleanup_memory()
-
-            elif method == "quantization":
-                print(f"\n=== QUANTIZATION VARIANT ===")
-                for compress_ratio in TARGET_COMPRESS_RATIOS:
-                    keep_ratio = 1 - compress_ratio
-                    bit_width = int(32 * keep_ratio)
-                    print(f"  Quantization: to {bit_width} bits (compression ratio {compress_ratio*100}%)")
-
-                    q_retrain_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_q_retrain"
-                    q_retrain_tracker = start_tracker(SAVE_DIR, q_retrain_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
-
-                    current_model = copy.deepcopy(baseline).to(DEVICE)
-                    current_model = symmetric_quantize_model(current_model, train_loader, bit_width=bit_width)
-                    print(f"  Model quantized to {bit_width} bits.")
-
-                    q_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_quantized.pth")
-                    torch.save(current_model.state_dict(), q_ckpt)
-                    row = collect_metrics_row(method, "quantized", keep_ratio, current_model, test_loader, q_ckpt)
-                    rows.append(row)
-                    print("  Quantized metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
-
-                    if bit_width == 16:
-                        print("  Skipping KD for FP16 (using AMP finetuning only)")
-                        kd_row = row.copy()
-                        kd_row["Stage"] = "after_kd"
-                        rows.append(kd_row)
-                    else:
-                        print("  Knowledge distillation...")
-                        current_model = distill_student(current_model, baseline, train_loader, epochs=KD_EPOCHS, lr=KD_LR, alpha=KD_ALPHA, T=KD_TEMPERATURE, max_batches=KD_MAX_BATCHES)
-                        kd_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_afterKD.pth")
-                        torch.save(current_model.state_dict(), kd_ckpt)
-                        row = collect_metrics_row(method, "after_kd", keep_ratio, current_model, test_loader, kd_ckpt)
-                        rows.append(row)
-                        print("  KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
-
-                    print("  Final global finetune...")
-                    current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
-                    final_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_final.pth")
-                    torch.save(current_model.state_dict(), final_ckpt)
-                    row = collect_metrics_row(method, "after_global_finetune", keep_ratio, current_model, test_loader, final_ckpt)
-                    rows.append(row)
-                    print("  Final metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
-
-                    q_retrain_metrics = stop_tracker_and_get_metrics(q_retrain_tracker, SAVE_DIR, q_retrain_proj)
-                    retrain_energy_kwh = q_retrain_metrics["energy_kwh"]
-                    retrain_emissions_kg = q_retrain_metrics["emissions_kg"]
-                    print(f"  Quant+retrain energy_kWh={retrain_energy_kwh}, emissions_kg={retrain_emissions_kg}")
-
-                    quantized_inf_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_inference"
-                    quantized_tracker = start_tracker(SAVE_DIR, quantized_inf_proj, measure_power_secs=10) if CODECARBON_AVAILABLE else None
-                    _, _, quantized_images = inference_time_per_batch(current_model, test_loader, timed=TIMING_BATCHES)
-                    quantized_inf_metrics = stop_tracker_and_get_metrics(quantized_tracker, SAVE_DIR, quantized_inf_proj)
-                    quantized_energy_kwh = quantized_inf_metrics["energy_kwh"]
-                    quantized_emissions_kg = quantized_inf_metrics["emissions_kg"]
-                    quantized_energy_per_pred_kwh = quantized_energy_kwh / quantized_images if quantized_images > 0 and not math.isnan(quantized_energy_kwh) else float("nan")
-                    print(f"  Quantized inference: images={quantized_images}, energy_kWh={quantized_energy_kwh}, emissions_kg={quantized_emissions_kg}")
+                    pruned_inf_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_inference"
+                    pruned_tracker = start_tracker(SAVE_DIR, pruned_inf_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
+                    _, _, pruned_images = inference_time_per_batch(current_model, test_loader, timed=TIMING_BATCHES)
+                    pruned_inf_metrics = stop_tracker_and_get_metrics(pruned_tracker, SAVE_DIR, pruned_inf_proj)
+                    pruned_energy_kwh = pruned_inf_metrics["energy_kwh"]
+                    pruned_emissions_kg = pruned_inf_metrics["emissions_kg"]
+                    pruned_energy_per_pred_kwh = pruned_energy_kwh / pruned_images if pruned_images > 0 and not math.isnan(pruned_energy_kwh) else float("nan")
+                    print(f"  Pruned inference: images={pruned_images}, energy_kWh={pruned_energy_kwh}, emissions_kg={pruned_emissions_kg}")
 
                     pred_energy_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_pred_50images"
                     pred_energy_per_image_kwh, pred_emissions_kg = measure_prediction_energy(
                         current_model, test_loader, SAVE_DIR, pred_energy_proj
                     )
 
-                    break_even = calculate_break_even_safe(retrain_energy_kwh, baseline_energy_per_pred_kwh, quantized_energy_per_pred_kwh)
+                    break_even = calculate_break_even_safe(retrain_energy_kwh, baseline_energy_per_pred_kwh, pruned_energy_per_pred_kwh)
 
                     energy_row = create_energy_row(method, compress_ratio, keep_ratio, retrain_energy_kwh, retrain_emissions_kg,
                                                    baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
-                                                   quantized_energy_kwh, quantized_energy_per_pred_kwh, quantized_emissions_kg,
+                                                   pruned_energy_kwh, pruned_energy_per_pred_kwh, pruned_emissions_kg,
                                                    pred_energy_per_image_kwh, break_even)
                     rows.append(energy_row)
                     print("  Energy summary:", energy_row)
+
+                    if "regional_gradients_fp16" in METHODS:
+                        fp16_method = "regional_gradients_fp16"
+                        print(f"\n=== {fp16_method.upper()} (FP16 of regional_gradients) ===")
+                        conversion_proj = f"{dataset_name}_{fp16_method}_r{int(compress_ratio*100)}compressed_conversion"
+                        fp16_model, conversion_energy_kwh, conversion_emissions_kg = create_amp_quantized_version(
+                            current_model, SAVE_DIR, conversion_proj
+                        )
+                        
+                        fp16_ckpt = os.path.join(SAVE_DIR, f"{fp16_method}_r{int(compress_ratio*100)}compressed_final.pth")
+                        torch.save(fp16_model.state_dict(), fp16_ckpt)
+                        row = collect_metrics_row(fp16_method, "after_global_finetune_amp", keep_ratio, fp16_model, test_loader, fp16_ckpt, dataset_name)
+                        rows.append(row)
+                        print("  FP16 metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
+
+                        fp16_inf_proj = f"{dataset_name}_{fp16_method}_r{int(compress_ratio*100)}compressed_inference"
+                        fp16_tracker = start_tracker(SAVE_DIR, fp16_inf_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
+                        _, _, fp16_images = inference_time_per_batch(fp16_model, test_loader, timed=TIMING_BATCHES)
+                        fp16_inf_metrics = stop_tracker_and_get_metrics(fp16_tracker, SAVE_DIR, fp16_inf_proj)
+                        fp16_energy_kwh = fp16_inf_metrics["energy_kwh"]
+                        fp16_emissions_kg = fp16_inf_metrics["emissions_kg"]
+                        fp16_energy_per_pred_kwh = fp16_energy_kwh / fp16_images if fp16_images > 0 and not math.isnan(fp16_energy_kwh) else float("nan")
+                        print(f"  FP16 inference: images={fp16_images}, energy_kWh={fp16_energy_kwh}, emissions_kg={fp16_emissions_kg}")
+
+                        pred_energy_proj = f"{dataset_name}_{fp16_method}_r{int(compress_ratio*100)}compressed_pred_50images"
+                        pred_energy_per_image_kwh, pred_emissions_kg = measure_prediction_energy(
+                            fp16_model, test_loader, SAVE_DIR, pred_energy_proj
+                        )
+
+                        break_even = calculate_break_even_safe(conversion_energy_kwh, baseline_energy_per_pred_kwh, fp16_energy_per_pred_kwh)
+
+                        energy_row = create_energy_row(fp16_method, compress_ratio, keep_ratio, conversion_energy_kwh, conversion_emissions_kg,
+                                                       baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
+                                                       fp16_energy_kwh, fp16_energy_per_pred_kwh, fp16_emissions_kg,
+                                                       pred_energy_per_image_kwh, break_even)
+                        rows.append(energy_row)
+                        print("  FP16 Energy summary:", energy_row)
+
+                        del fp16_model
+                        cleanup_memory()
+
+                    del current_model
+                    cleanup_memory()
+
+            elif method == "slim_kd":
+                print(f"\n=== SLIM KD (FP32 slim student) ===")
+                for compress_ratio in TARGET_COMPRESS_RATIOS:
+                    keep_ratio = 1 - compress_ratio
+                    print(f"  Compression: {compress_ratio*100}% (keep ratio {keep_ratio})")
+
+                    prune_retrain_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_prune_retrain"
+                    prune_retrain_tracker = start_tracker(SAVE_DIR, prune_retrain_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
+
+                    stage_planes = [max(1, int(p * keep_ratio)) for p in ORIGINAL_PLANES]
+                    current_model = build_pruned_or_slim_resnet(stage_planes=stage_planes, num_classes=NUM_CLASSES, random_init=True)
+                    print(f"  Slim student built (random init, planes: {stage_planes}).")
+
+                    pre_kd_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_pre_kd.pth")
+                    torch.save(current_model.state_dict(), pre_kd_ckpt)
+                    row = collect_metrics_row(method, "pre_kd", keep_ratio, current_model, test_loader, pre_kd_ckpt, dataset_name)
+                    rows.append(row)
+                    print("  Pre-KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
+
+                    print("  Knowledge distillation...")
+                    current_model = distill_student(current_model, baseline, train_loader, epochs=KD_EPOCHS, lr=KD_LR, alpha=KD_ALPHA, T=KD_TEMPERATURE, max_batches=KD_MAX_BATCHES)
+                    kd_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_afterKD.pth")
+                    torch.save(current_model.state_dict(), kd_ckpt)
+                    row = collect_metrics_row(method, "after_kd", keep_ratio, current_model, test_loader, kd_ckpt, dataset_name)
+                    rows.append(row)
+                    print("  KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
+
+                    print("  Final global finetune...")
+                    current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
+                    
+                    final_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_final.pth")
+                    torch.save(current_model.state_dict(), final_ckpt)
+                    row = collect_metrics_row(method, "after_global_finetune", keep_ratio, current_model, test_loader, final_ckpt, dataset_name)
+                    rows.append(row)
+                    print("  Final metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
+
+                    prune_retrain_metrics = stop_tracker_and_get_metrics(prune_retrain_tracker, SAVE_DIR, prune_retrain_proj)
+                    retrain_energy_kwh = prune_retrain_metrics["energy_kwh"]
+                    retrain_emissions_kg = prune_retrain_metrics["emissions_kg"]
+                    print(f"  Prune+retrain energy_kWh={retrain_energy_kwh}, emissions_kg={retrain_emissions_kg}")
+
+                    pruned_inf_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_inference"
+                    pruned_tracker = start_tracker(SAVE_DIR, pruned_inf_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
+                    _, _, pruned_images = inference_time_per_batch(current_model, test_loader, timed=TIMING_BATCHES)
+                    pruned_inf_metrics = stop_tracker_and_get_metrics(pruned_tracker, SAVE_DIR, pruned_inf_proj)
+                    pruned_energy_kwh = pruned_inf_metrics["energy_kwh"]
+                    pruned_emissions_kg = pruned_inf_metrics["emissions_kg"]
+                    pruned_energy_per_pred_kwh = pruned_energy_kwh / pruned_images if pruned_images > 0 and not math.isnan(pruned_energy_kwh) else float("nan")
+                    print(f"  Pruned inference: images={pruned_images}, energy_kWh={pruned_energy_kwh}, emissions_kg={pruned_emissions_kg}")
+
+                    pred_energy_proj = f"{dataset_name}_{method}_r{int(compress_ratio*100)}compressed_pred_50images"
+                    pred_energy_per_image_kwh, pred_emissions_kg = measure_prediction_energy(
+                        current_model, test_loader, SAVE_DIR, pred_energy_proj
+                    )
+
+                    break_even = calculate_break_even_safe(retrain_energy_kwh, baseline_energy_per_pred_kwh, pruned_energy_per_pred_kwh)
+
+                    energy_row = create_energy_row(method, compress_ratio, keep_ratio, retrain_energy_kwh, retrain_emissions_kg,
+                                                   baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
+                                                   pruned_energy_kwh, pruned_energy_per_pred_kwh, pruned_emissions_kg,
+                                                   pred_energy_per_image_kwh, break_even)
+                    rows.append(energy_row)
+                    print("  Energy summary:", energy_row)
+
+                    if "slim_kd_fp16" in METHODS:
+                        fp16_method = "slim_kd_fp16"
+                        print(f"\n=== {fp16_method.upper()} (FP16 of slim_kd) ===")
+                        conversion_proj = f"{dataset_name}_{fp16_method}_r{int(compress_ratio*100)}compressed_conversion"
+                        fp16_model, conversion_energy_kwh, conversion_emissions_kg = create_amp_quantized_version(
+                            current_model, SAVE_DIR, conversion_proj
+                        )
+                        
+                        fp16_ckpt = os.path.join(SAVE_DIR, f"{fp16_method}_r{int(compress_ratio*100)}compressed_final.pth")
+                        torch.save(fp16_model.state_dict(), fp16_ckpt)
+                        row = collect_metrics_row(fp16_method, "after_global_finetune_amp", keep_ratio, fp16_model, test_loader, fp16_ckpt, dataset_name)
+                        rows.append(row)
+                        print("  FP16 metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
+
+                        fp16_inf_proj = f"{dataset_name}_{fp16_method}_r{int(compress_ratio*100)}compressed_inference"
+                        fp16_tracker = start_tracker(SAVE_DIR, fp16_inf_proj, measure_power_secs=30) if CODECARBON_AVAILABLE else None
+                        _, _, fp16_images = inference_time_per_batch(fp16_model, test_loader, timed=TIMING_BATCHES)
+                        fp16_inf_metrics = stop_tracker_and_get_metrics(fp16_tracker, SAVE_DIR, fp16_inf_proj)
+                        fp16_energy_kwh = fp16_inf_metrics["energy_kwh"]
+                        fp16_emissions_kg = fp16_inf_metrics["emissions_kg"]
+                        fp16_energy_per_pred_kwh = fp16_energy_kwh / fp16_images if fp16_images > 0 and not math.isnan(fp16_energy_kwh) else float("nan")
+                        print(f"  FP16 inference: images={fp16_images}, energy_kWh={fp16_energy_kwh}, emissions_kg={fp16_emissions_kg}")
+
+                        pred_energy_proj = f"{dataset_name}_{fp16_method}_r{int(compress_ratio*100)}compressed_pred_50images"
+                        pred_energy_per_image_kwh, pred_emissions_kg = measure_prediction_energy(
+                            fp16_model, test_loader, SAVE_DIR, pred_energy_proj
+                        )
+
+                        break_even = calculate_break_even_safe(conversion_energy_kwh, baseline_energy_per_pred_kwh, fp16_energy_per_pred_kwh)
+
+                        energy_row = create_energy_row(fp16_method, compress_ratio, keep_ratio, conversion_energy_kwh, conversion_emissions_kg,
+                                                       baseline_energy_kwh, baseline_energy_per_pred_kwh, baseline_emissions_kg,
+                                                       fp16_energy_kwh, fp16_energy_per_pred_kwh, fp16_emissions_kg,
+                                                       pred_energy_per_image_kwh, break_even)
+                        rows.append(energy_row)
+                        print("  FP16 Energy summary:", energy_row)
+
+                        del fp16_model
+                        cleanup_memory()
 
                     del current_model
                     cleanup_memory()
 
         df = pd.DataFrame(rows)
         df.to_csv(csv_path, index=False)
-        print(f"All done for {dataset_name}. CSV saved: {csv_path}")
+        print(f"\nResults saved to {csv_path}")
+        print(f"Dataset {dataset_name} completed successfully.")
+
         del baseline, train_loader, val_loader, test_loader, train_ds
         cleanup_memory()
         log_memory_usage(f"After completing {dataset_name}: ")
         return True
-    except FileNotFoundError as e:
-        print(f"File not found error for {dataset_name}: {e}")
-        print("Please check that all required files exist.")
-        cleanup_memory()
-        return False
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"CUDA out of memory for {dataset_name}: {e}")
-        print("Try reducing batch size or model size.")
-        cleanup_memory()
-        return False
+
     except Exception as e:
-        print(f"Unexpected error processing {dataset_name}: {str(e)}")
+        print(f"\nERROR processing {dataset_name}: {str(e)}")
         import traceback
         traceback.print_exc()
-        cleanup_memory()
         return False
 
 # -------------------------
-# Main loop
+# Main execution
 # -------------------------
-if __name__ == "__main__":
+def main():
+    set_seed(SEED, deterministic=True)
+    print(f"Starting experiment on {DEVICE}. Datasets: {list(DATASETS.keys())}")
+    print(f"Methods: {METHODS}")
+    print(f"Target compression ratios: {TARGET_COMPRESS_RATIOS}")
+    print(f"Output directory: {SAVE_DIR_BASE}")
+
+    success_count = 0
     for dataset_name, cfg in DATASETS.items():
         success = process_dataset_safely(dataset_name, cfg)
-        if not success:
-            print(f"Failed to process {dataset_name}. Continuing with next dataset...")
+        if success:
+            success_count += 1
+        else:
+            print(f"Failed to process {dataset_name}")
     
-    print(f"All datasets processed on {time.strftime('%Y-%m-%d %H:%M:%S')}.")
+    print(f"\nExperiment completed. Successfully processed {success_count}/{len(DATASETS)} datasets.")
+
+if __name__ == "__main__":
+    main()
