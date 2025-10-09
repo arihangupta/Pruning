@@ -181,16 +181,17 @@ def parse_model_name(filename, dataset):
         logger.debug(f"Skipping {basename}: does not end with _final.pth or _final_amp.pth")
         return None
     
-    # Extract pruning method
-    if basename == "slim_kd_amp_r50compressed_final_amp.pth":
-        method = "slim_kd_fp16"
-    elif basename == "regional_gradients_fp16_r50compressed_final.pth":
-        method = "pgto_regional_gradients_fp16"
-    elif "regional_gradients" in basename and "_amp" not in basename:
+    # Extract pruning method and storage precision
+    storage_precision = "fp32" if basename.endswith("_final.pth") else "amp" if basename.endswith("_final_amp.pth") else "unknown"
+    if basename == "slim_kd_amp_r50compressed_final_amp.pth" or ("slim_kd" in basename and storage_precision == "amp"):
+        method = f"slim_kd_{storage_precision}"
+    elif basename == "regional_gradients_fp16_r50compressed_final.pth" or ("regional_gradients" in basename and storage_precision == "amp"):
+        method = f"pgto_regional_gradients_{storage_precision}"
+    elif "regional_gradients" in basename and storage_precision == "fp32":
         method = "pgto_regional_gradients"
     elif "quantization" in basename:
         method = "quantization"
-    elif "slim_kd" in basename and "_amp" not in basename:
+    elif "slim_kd" in basename and storage_precision == "fp32":
         method = "slim_kd"
     else:
         logger.debug(f"Skipping {basename}: no recognized pruning method")
@@ -253,7 +254,7 @@ def parse_model_name(filename, dataset):
             logger.debug(f"CSV error: {str(e)}")
 
     model_name = f"{method}_{sparsity}"
-    return {"model_name": model_name, "pruning_method": method, "sparsity": sparsity, "pruning_ratio": pruning_ratio}
+    return {"model_name": model_name, "pruning_method": method, "sparsity": sparsity, "pruning_ratio": pruning_ratio, "storage_precision": storage_precision}
 
 def discover_models():
     models = []
@@ -295,12 +296,12 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
     
     model = build_model(num_classes, stage_planes=stage_planes)
     
-    # Check dtype
+    # Check dtype and storage precision
     sample_param = next(iter(state_dict.values()))
     is_fp16 = sample_param.dtype == torch.float16
     is_int8 = hasattr(sample_param, 'dtype') and sample_param.dtype == torch.qint8
-    
-    logger.debug(f"Model {model_name} at {model_path}: is_fp16={is_fp16}, is_int8={is_int8}, requested_precision={precision}")
+    stored_precision = "fp16" if is_fp16 else "int8" if is_int8 else "fp32"
+    logger.debug(f"Model {model_name} at {model_path}: stored_precision={stored_precision}, is_fp16={is_fp16}, is_int8={is_int8}, requested_precision={precision}")
     
     # Handle dtype based on requested precision
     if is_fp16 and precision == "fp32":
@@ -320,7 +321,7 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
     except Exception as e:
         raise RuntimeError(f"Error loading state_dict: {e}")
     
-    return model, None
+    return model, None, stored_precision
 
 MATRIX_CONFIG["models"] = discover_models()
 
