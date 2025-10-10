@@ -184,8 +184,9 @@ def parse_model_name(filename, dataset):
             "stored_precision": "fp32"
         }
     
-    if not (basename.endswith("_final.pth") or basename.endswith("_final_amp.pth")):
-        logger.debug(f"Skipping {basename}: does not end with _final.pth or _final_amp.pth")
+    # Only process files ending in _final.pth
+    if not basename.endswith("_final.pth"):
+        logger.debug(f"Skipping {basename}: does not end with _final.pth")
         return None
     
     # Detect stored precision from filename first
@@ -197,17 +198,13 @@ def parse_model_name(filename, dataset):
     
     logger.debug(f"Detected stored_precision={stored_precision} for {basename}")
     
-    # Extract pruning method
-    if "slim_kd_fp16" in basename or "slim_kd_amp" in basename:
-        method = "slim_kd_amp"
-    elif basename == "regional_gradients_fp16_r50compressed_final.pth":
-        method = "pgto_regional_gradients_amp"
-    elif "regional_gradients" in basename and "fp16" not in basename and "_amp" not in basename:
+    # Extract pruning method - simplified logic
+    if "slim_kd" in basename:
+        method = "slim_kd"
+    elif "regional_gradients" in basename:
         method = "pgto_regional_gradients"
     elif "quantization" in basename:
         method = "quantization"
-    elif "slim_kd" in basename:
-        method = "slim_kd"
     else:
         logger.debug(f"Skipping {basename}: no recognized pruning method")
         return None
@@ -289,13 +286,20 @@ def discover_models():
         if not os.path.exists(model_dir):
             print(f"Warning: Model directory for {dataset} does not exist: {model_dir}")
             continue
-        model_files = glob.glob(os.path.join(model_dir, "*_final.pth")) + glob.glob(os.path.join(model_dir, "*_final_amp.pth")) + [os.path.join(model_dir, "baseline.pth")]
+        
+        # Only discover files ending in _final.pth or baseline.pth
+        model_files = glob.glob(os.path.join(model_dir, "*_final.pth"))
+        baseline_path = os.path.join(model_dir, "baseline.pth")
+        if os.path.exists(baseline_path):
+            model_files.append(baseline_path)
+        
         dataset_models = []
         for model_path in model_files:
             parsed = parse_model_name(model_path, dataset)
             if parsed:
                 parsed["model_path"] = model_path
                 dataset_models.append(parsed)
+                print(f"Discovered: {os.path.basename(model_path)} -> {parsed['model_name']}")
             else:
                 print(f"Skipping invalid model file: {model_path}")
         if dataset_models:
