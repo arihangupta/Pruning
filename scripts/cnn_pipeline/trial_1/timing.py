@@ -665,7 +665,7 @@ def bench_fixed_passes(config):
         'sparsity': config.experiment['sparsity'],
         'stored_precision': config.experiment.get('stored_precision', 'unknown'),
         'batch_size': batch_size,
-        'precision': config.experiment['precision'],
+        'runtime_precision': config.experiment['precision'],
         'rep': config.experiment.get('rep', 0),
         'num_passes': num_passes,
         'images_processed': images_processed,
