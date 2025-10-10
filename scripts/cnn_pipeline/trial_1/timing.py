@@ -171,60 +171,46 @@ def get_dataset_channels(npz_path):
         print(f"Error detecting channels for {npz_path}: {e}")
         return 3
 
-def detect_stored_precision(model_path):
-    """Detect the actual stored precision by checking the model's tensor dtype."""
-    try:
-        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-        sample_param = next(iter(state_dict.values()))
-        
-        if hasattr(sample_param, 'dtype'):
-            if sample_param.dtype == torch.float16:
-                return "fp16"
-            elif sample_param.dtype == torch.qint8:
-                return "int8"
-            elif sample_param.dtype == torch.float32:
-                return "fp32"
-        return "fp32"
-    except Exception as e:
-        logger.debug(f"Error detecting precision for {model_path}: {e}")
-        return "unknown"
-
 def parse_model_name(filename, dataset):
     basename = os.path.basename(filename)
     logger.debug(f"Parsing model file: {basename} for dataset: {dataset}")
     
     if basename == "baseline.pth":
-        stored_prec = detect_stored_precision(filename)
         return {
             "model_name": "baseline",
             "pruning_method": "baseline",
             "sparsity": "0%",
             "pruning_ratio": None,
-            "stored_precision": stored_prec
+            "stored_precision": "fp32"
         }
     
     if not (basename.endswith("_final.pth") or basename.endswith("_final_amp.pth")):
         logger.debug(f"Skipping {basename}: does not end with _final.pth or _final_amp.pth")
         return None
     
+    # Detect stored precision from filename first
+    # If it has fp16, amp, or quantization in the name, it's stored as amp
+    # Otherwise it's fp32
+    stored_precision = "fp32"  # default
+    if "fp16" in basename.lower() or "_amp" in basename or "quantization" in basename:
+        stored_precision = "amp"
+    
+    logger.debug(f"Detected stored_precision={stored_precision} for {basename}")
+    
     # Extract pruning method
-    if basename == "slim_kd_amp_r50compressed_final_amp.pth":
-        method = "slim_kd_fp16"
+    if "slim_kd_fp16" in basename or "slim_kd_amp" in basename:
+        method = "slim_kd_amp"
     elif basename == "regional_gradients_fp16_r50compressed_final.pth":
-        method = "pgto_regional_gradients_fp16"
-    elif "regional_gradients" in basename and "_amp" not in basename:
+        method = "pgto_regional_gradients_amp"
+    elif "regional_gradients" in basename and "fp16" not in basename and "_amp" not in basename:
         method = "pgto_regional_gradients"
     elif "quantization" in basename:
         method = "quantization"
-    elif "slim_kd" in basename and "_amp" not in basename:
+    elif "slim_kd" in basename:
         method = "slim_kd"
     else:
         logger.debug(f"Skipping {basename}: no recognized pruning method")
         return None
-
-    # Detect stored precision by actually checking the file
-    stored_precision = detect_stored_precision(filename)
-    logger.debug(f"Detected stored_precision={stored_precision} for {basename}")
 
     sparsity = None
     pruning_ratio = None
@@ -282,7 +268,12 @@ def parse_model_name(filename, dataset):
             print(f"Error reading sparsity from {metrics_csv}: {e}")
             logger.debug(f"CSV error: {str(e)}")
 
-    model_name = f"{method}_{sparsity}"
+    # Create unique model name that includes stored precision if it's AMP
+    if stored_precision == "amp":
+        model_name = f"{method}_{sparsity}_stored_amp"
+    else:
+        model_name = f"{method}_{sparsity}"
+    
     return {
         "model_name": model_name,
         "pruning_method": method,
