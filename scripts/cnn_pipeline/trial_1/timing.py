@@ -8,6 +8,7 @@ Includes CodeCarbon for power utilization (silently in background) and detailed 
 Supports quantized model loading and AMP precision.
 Calculates AUC for each run and processes the test dataset three times.
 Calculates energy metrics per batch, per image, and for the full test dataset.
+Tracks stored precision (fp32/fp16/int8) separately from runtime precision.
 """
 
 import os
@@ -175,27 +176,41 @@ def parse_model_name(filename, dataset):
     logger.debug(f"Parsing model file: {basename} for dataset: {dataset}")
     
     if basename == "baseline.pth":
-        return {"model_name": "baseline", "pruning_method": "baseline", "sparsity": "0%", "pruning_ratio": None}
+        return {
+            "model_name": "baseline",
+            "pruning_method": "baseline",
+            "sparsity": "0%",
+            "pruning_ratio": None,
+            "stored_precision": "fp32"
+        }
     
     if not (basename.endswith("_final.pth") or basename.endswith("_final_amp.pth")):
         logger.debug(f"Skipping {basename}: does not end with _final.pth or _final_amp.pth")
         return None
     
-    # Extract pruning method and storage precision
-    storage_precision = "fp32" if basename.endswith("_final.pth") else "amp" if basename.endswith("_final_amp.pth") else "unknown"
-    if basename == "slim_kd_amp_r50compressed_final_amp.pth" or ("slim_kd" in basename and storage_precision == "amp"):
-        method = f"slim_kd_{storage_precision}"
-    elif basename == "regional_gradients_fp16_r50compressed_final.pth" or ("regional_gradients" in basename and storage_precision == "amp"):
-        method = f"pgto_regional_gradients_{storage_precision}"
-    elif "regional_gradients" in basename and storage_precision == "fp32":
+    # Extract pruning method
+    if basename == "slim_kd_amp_r50compressed_final_amp.pth":
+        method = "slim_kd_fp16"
+    elif basename == "regional_gradients_fp16_r50compressed_final.pth":
+        method = "pgto_regional_gradients_fp16"
+    elif "regional_gradients" in basename and "_amp" not in basename:
         method = "pgto_regional_gradients"
     elif "quantization" in basename:
         method = "quantization"
-    elif "slim_kd" in basename and storage_precision == "fp32":
+    elif "slim_kd" in basename and "_amp" not in basename:
         method = "slim_kd"
     else:
         logger.debug(f"Skipping {basename}: no recognized pruning method")
         return None
+
+    # Detect stored precision from filename
+    stored_precision = "fp32"  # default
+    if "_amp.pth" in basename or "_fp16" in basename or "slim_kd_fp16" in basename:
+        stored_precision = "fp16"
+    elif "quantization" in basename:
+        stored_precision = "int8"
+    
+    logger.debug(f"Detected stored_precision={stored_precision} for {basename}")
 
     sparsity = None
     pruning_ratio = None
@@ -254,7 +269,13 @@ def parse_model_name(filename, dataset):
             logger.debug(f"CSV error: {str(e)}")
 
     model_name = f"{method}_{sparsity}"
-    return {"model_name": model_name, "pruning_method": method, "sparsity": sparsity, "pruning_ratio": pruning_ratio, "storage_precision": storage_precision}
+    return {
+        "model_name": model_name,
+        "pruning_method": method,
+        "sparsity": sparsity,
+        "pruning_ratio": pruning_ratio,
+        "stored_precision": stored_precision
+    }
 
 def discover_models():
     models = []
@@ -296,12 +317,12 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
     
     model = build_model(num_classes, stage_planes=stage_planes)
     
-    # Check dtype and storage precision
+    # Check dtype
     sample_param = next(iter(state_dict.values()))
     is_fp16 = sample_param.dtype == torch.float16
     is_int8 = hasattr(sample_param, 'dtype') and sample_param.dtype == torch.qint8
-    stored_precision = "fp16" if is_fp16 else "int8" if is_int8 else "fp32"
-    logger.debug(f"Model {model_name} at {model_path}: stored_precision={stored_precision}, is_fp16={is_fp16}, is_int8={is_int8}, requested_precision={precision}")
+    
+    logger.debug(f"Model {model_name} at {model_path}: is_fp16={is_fp16}, is_int8={is_int8}, requested_precision={precision}")
     
     # Handle dtype based on requested precision
     if is_fp16 and precision == "fp32":
@@ -321,7 +342,7 @@ def build_model_for_load(model_name, num_classes, model_path, pruning_ratio=None
     except Exception as e:
         raise RuntimeError(f"Error loading state_dict: {e}")
     
-    return model, None, stored_precision
+    return model, None
 
 MATRIX_CONFIG["models"] = discover_models()
 
@@ -387,7 +408,7 @@ def load_model(config, num_classes, dataset_name):
     if not os.path.exists(model_path):
         raise ValueError(f"Model not found: {model_path}")
     
-    model, override_device = build_model_for_load(
+    result = build_model_for_load(
         config.experiment['model_name'],
         num_classes,
         model_path,
@@ -395,6 +416,13 @@ def load_model(config, num_classes, dataset_name):
         in_channels=in_channels,
         precision=config.experiment['precision']
     )
+    
+    # Handle both tuple and single return value for backward compatibility
+    if isinstance(result, tuple):
+        model, override_device = result
+    else:
+        model = result
+        override_device = None
     
     device = override_device if override_device else config.experiment['device']
     model = model.to(device).eval()
@@ -626,6 +654,7 @@ def bench_fixed_passes(config):
         'model_name': config.experiment['model_name'],
         'pruning_method': config.experiment['pruning_method'],
         'sparsity': config.experiment['sparsity'],
+        'stored_precision': config.experiment.get('stored_precision', 'unknown'),
         'batch_size': batch_size,
         'precision': config.experiment['precision'],
         'rep': config.experiment.get('rep', 0),
@@ -715,6 +744,7 @@ def run_matrix(matrix_config):
                     'pruning_method': model_cfg['pruning_method'],
                     'sparsity': model_cfg['sparsity'],
                     'pruning_ratio': model_cfg['pruning_ratio'],
+                    'stored_precision': model_cfg.get('stored_precision', 'unknown'),
                     'model_path': model_cfg['model_path'],
                     'batch_size': bs,
                     'precision': prec,
@@ -729,12 +759,13 @@ def run_matrix(matrix_config):
                 }
                 config = Config(experiment=exp_cfg, log_dir=str(log_base / f"{dataset}_rep{rep}"))
 
-                print(f"Running: {exp_cfg['model_name']}, bs={bs}, prec={prec}, rep={rep}")
+                print(f"Running: {exp_cfg['model_name']}, bs={bs}, prec={prec}, stored_as={exp_cfg['stored_precision']}, rep={rep}")
                 try:
                     result = bench_fixed_passes(config)
                     if result:
                         print(f"  Throughput: {result['throughput_imgs_per_s']:.2f} imgs/s, "
                               f"auc: {result['auc']:.4f}, "
+                              f"stored_precision: {result['stored_precision']}, "
                               f"energy_kWh_total={result['energy_kWh_total']:.6f}, "
                               f"energy_kWh_per_batch={result['energy_kWh_per_batch']:.6f}, "
                               f"energy_kWh_per_image={result['energy_kWh_per_image']:.6f}")
@@ -772,6 +803,8 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
         energies_per_image = gdf['energy_kWh_per_image'].dropna()
         emissions = gdf['emissions_kg_total'].dropna()
         powers = gdf['gpu_power_w'].dropna()
+        stored_precisions = gdf['stored_precision'].mode()[0] if 'stored_precision' in gdf.columns and len(gdf['stored_precision'].mode()) > 0 else 'unknown'
+        
         median_tp = np.median(throughputs)
         iqr_low, iqr_high = np.percentile(throughputs, [25, 75])
         mean_tp = np.mean(throughputs)
@@ -793,6 +826,7 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
             'dataset': dataset,
             'pruning_method': method,
             'sparsity': sparsity,
+            'stored_precision': stored_precisions,
             'batch_size': bs,
             'precision': prec,
             'n_runs': len(throughputs),
@@ -860,7 +894,7 @@ def analyze_results(results_csv, log_dir, output_dir, dataset):
                         auc_pval = paired_wilcoxon(bl_aucs, pr_aucs)
                     else:
                         auc_pval = np.nan
-                    print(f"{dataset}: {method} ({sparsity}) vs baseline (bs={bl_row['batch_size']}, prec={bl_row['precision']}): "
+                    print(f"{dataset}: {method} ({sparsity}, stored_as={pr_row['stored_precision']}) vs baseline (bs={bl_row['batch_size']}, prec={bl_row['precision']}): "
                           f"speedup={speedup:.2f} ({pct_more:.1f}%), energy_saving_pct={energy_saving:.1f}%, "
                           f"auc_diff={auc_diff:.4f}, auc_pval={auc_pval:.4f}, "
                           f"throughput_pval={pval:.4f}, 95% CI throughput [{ci_speedup_low:.2f}, {ci_speedup_high:.2f}]")
