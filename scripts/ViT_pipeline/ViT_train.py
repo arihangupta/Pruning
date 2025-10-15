@@ -33,11 +33,11 @@ except Exception:
 # -------------------------
 # Config
 # -------------------------
-DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
-SAVE_DIR    = "/home/arihangupta/Pruning/dinov2/Pruning/exp2_saved_models"
+DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
+SAVE_DIR    = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/baseline_models"
 
 PRETRAIN_EPOCHS = 50  # Reduced for practicality
-FINETUNE_EPOCHS = 50
+FINETUNE_EPOCHS = 10
 BATCH_SIZE = 32
 LR = 5e-4
 IMG_SIZE = 224

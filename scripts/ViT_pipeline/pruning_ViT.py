@@ -41,7 +41,7 @@ DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
 TRIALS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/exp2_saved_models"
 
 PRUNE_ITERATIONS = 5
-PRUNE_RATIO = 0.1
+PRUNE_RATIO = 0.5
 FINETUNE_EPOCHS = 3
 FINETUNE_EPOCHS_PER_PRUNE = 2
 BATCH_SIZE = 32
