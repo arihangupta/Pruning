@@ -48,6 +48,9 @@ TEMPERATURE = 0.1  # DINO temperature
 CENTER_MOMENTUM = 0.9
 PROJ_OUT_DIM = 65536  # projection head output dim (large; reduce if memory is tight)
 
+# Filter for specific datasets
+ALLOWED_DATASETS = ["derma", "path", "blood"]
+
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # -------------------------
@@ -427,8 +430,14 @@ if __name__ == "__main__":
     print("Running on device:", DEVICE)
     print("SKLEARN available for AUC:", SKLEARN)
 
-    npz_files = [os.path.join(DATASET_DIR, f) for f in os.listdir(DATASET_DIR) if f.endswith("_224.npz")]
-    print("\nFound datasets:", npz_files)
+    # Find all NPZ files in the dataset directory
+    all_npz_files = [os.path.join(DATASET_DIR, f) for f in os.listdir(DATASET_DIR) if f.endswith("_224.npz")]
+    
+    # Filter for only derma, path, and blood datasets
+    npz_files = [f for f in all_npz_files if any(ds in os.path.basename(f).lower() for ds in ALLOWED_DATASETS)]
+    
+    print(f"\nFiltering for datasets containing: {ALLOWED_DATASETS}")
+    print(f"Found {len(npz_files)} matching datasets:", npz_files)
 
     # Run with full fine-tuning (default)
     for npz_path in npz_files:
