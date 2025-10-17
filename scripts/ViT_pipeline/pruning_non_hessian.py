@@ -3,7 +3,7 @@
 dgmr_prune_and_fine_tune.py
 
 Loads the DINO pretrained model from the trials directory, applies Diversity-Guided MLP Reduction (DGMR) from the arXiv paper,
-fine-tunes the pruned model for 10 epochs, and reports test accuracy, AUC, etc.
+fine-tunes the pruned model for a few epochs, and reports test accuracy, AUC, etc.
 Mimics the provided CNN script structure.
 Reduces MLP hidden dimensions while preserving diversity.
 
@@ -49,6 +49,7 @@ LOG_INTERVAL = 20
 SEED = 42
 
 os.makedirs(TRIALS_DIR, exist_ok=True)
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 # -------------------------
 # Reproducibility
@@ -136,14 +137,51 @@ class ViTClassifier(nn.Module):
     def __init__(self, backbone, num_classes, freeze_backbone=False):
         super().__init__()
         self.backbone = backbone
+        # initialize a head with the standard ViT-S/14 embedding dim (384)
         self.head = nn.Linear(384, num_classes)
         if freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
     def forward(self, x):
-        x = self.backbone(x)[:, 0]  # CLS token
-        x = self.head(x)
+        """
+        Forward pass. Must ensure classifier head matches backbone CLS embedding dim.
+        We dynamically adjust the head if needed (safe re-init with best-effort weight copy).
+        """
+        x = self.backbone(x)
+        # Backbone could return either (B, seq_len, dim) or (B, dim) depending on implementation
+        if x.ndim == 3:
+            cls = x[:, 0]
+        else:
+            cls = x
+
+        # debug prints (can be noisy; keep for now)
+        # print("Backbone output shape:", cls.shape)
+        # print("Head weight shape:", self.head.weight.shape)
+
+        # Dynamic head adjustment: if head expects different in_features, reinit safely
+        head_in = self.head.in_features if hasattr(self.head, "in_features") else None
+        cls_dim = cls.shape[1]
+        if head_in != cls_dim:
+            old_out = self.head.out_features
+            old_w = self.head.weight.data.clone() if hasattr(self.head, "weight") else None
+            old_b = self.head.bias.data.clone() if hasattr(self.head, "bias") and self.head.bias is not None else None
+
+            print(f"[DynamicHead] Reinitializing head: {head_in} -> {cls_dim} (out={old_out})")
+            new_head = nn.Linear(cls_dim, old_out).to(cls.device)
+
+            # if old weights exist, copy compatible slice
+            if old_w is not None:
+                # old_w shape: (out, old_in) ; new_head.weight shape: (out, new_in)
+                min_in = min(old_w.shape[1], new_head.weight.data.shape[1])
+                new_head.weight.data[:, :min_in] = old_w[:, :min_in].to(new_head.weight.data.dtype).clone()
+                # If new head wider than old, remaining weights left as default init
+            if old_b is not None:
+                new_head.bias.data = old_b.to(new_head.bias.data.dtype).clone()
+
+            self.head = new_head
+
+        x = self.head(cls)
         return x
 
 def build_model(num_classes: int, freeze_backbone=False) -> nn.Module:
@@ -160,6 +198,62 @@ def load_dino_pretrained(model: nn.Module, ds_name: str):
     model.backbone.load_state_dict(backbone_dict, strict=False)
     print("Loaded DINO pretrained backbone successfully.")
 
+# -------------------------
+# Helper: conservative attention-head adjustment
+# -------------------------
+def adjust_attention_heads_conservative(model: nn.Module, keep_ratio: float):
+    """
+    Conservative adjustment of attention-related linear projections when overall embedding dim changes.
+    This function only acts when it can deterministically map 3*embed_dim -> 3*new_embed_dim patterns for qkv
+    and when a proj out linear uses the same embed dim. Otherwise it warns and skips.
+    keep_ratio: fraction of channels to keep (e.g., 0.5 keeps half)
+    """
+    print(f"\n[AdjustAttn] Running conservative attention adjustment (keep ratio {keep_ratio:.3f})")
+    # Try to detect typical qkv linear layers that have out_features == 3*embed_dim
+    # We'll search for linears under blocks.*.attn.* that match pattern out == 3 * in_embed
+    adjusted = 0
+    for name, module in model.backbone.named_modules():
+        if isinstance(module, nn.Linear):
+            # Heuristic: qkv in DINO/ViT often implemented as a single linear with out=3*embed_dim
+            outf = module.out_features
+            inf = module.in_features
+            # If outf is exactly 3 * inf (common for qkv projection)
+            if outf == 3 * inf and 'attn' in name and 'qkv' in name:
+                new_inf = int(inf * keep_ratio)
+                new_outf = 3 * new_inf
+                if new_inf < 1:
+                    print(f"  [AdjustAttn] skip {name}: new_inf < 1")
+                    continue
+                print(f"  [AdjustAttn] {name}: {inf}->{new_inf} (out {outf}->{new_outf})")
+                # Build replacement linear safely
+                parent_name = '.'.join(name.split('.')[:-1])
+                child_name = name.split('.')[-1]
+                parent_module = model.backbone.get_submodule(parent_name) if parent_name else model.backbone
+                orig = parent_module._modules.get(child_name, None)
+                if orig is None:
+                    print(f"   [AdjustAttn] WARNING: cannot find parent child to replace for {name}")
+                    continue
+                # create new linear and copy compatible slice
+                new_lin = nn.Linear(new_inf, new_outf).to(next(model.parameters()).device)
+                # orig.weight shape: (outf, inf)
+                min_in = min(inf, new_inf)
+                min_out = min(outf, new_outf)
+                try:
+                    new_lin.weight.data[:min_out, :min_in] = orig.weight.data[:min_out, :min_in].clone().to(new_lin.weight.data.dtype)
+                    if orig.bias is not None:
+                        new_lin.bias.data[:min_out] = orig.bias.data[:min_out].clone().to(new_lin.bias.data.dtype)
+                    parent_module._modules[child_name] = new_lin
+                    adjusted += 1
+                except Exception as e:
+                    print(f"   [AdjustAttn] WARNING: failed to replace {name}: {e}")
+                    # revert skip (do nothing)
+                    continue
+    print(f"[AdjustAttn] Completed. Adjusted {adjusted} attention projection layers (conservative).")
+    return adjusted
+
+# -------------------------
+# DGMR pruning (robust)
+# -------------------------
 def dgmr_prune_mlp(model: nn.Module, target_r: int = 1):
     """
     Apply DGMR pruning to MLP expansion (fc1) layers in the ViT backbone.
@@ -257,21 +351,25 @@ def dgmr_prune_mlp(model: nn.Module, target_r: int = 1):
 
         # Find corresponding fc2 inside same block/base_name by searching for linear with in_features == M
         base_name = name.rsplit('.', 1)[0]  # e.g., blocks.0.mlp
-        base_module = model.backbone.get_submodule(base_name)
+        try:
+            base_module = model.backbone.get_submodule(base_name)
+        except Exception:
+            base_module = None
         fc2_module = None
         fc2_name_full = None
 
         # search through direct child modules under base_module
-        for sub_name, sub_mod in base_module.named_modules():
-            # sub_name is relative path e.g. 'fc2' or 'linear'
-            # avoid base_module itself
-            if sub_name == '':
-                continue
-            if isinstance(sub_mod, nn.Linear) and sub_mod.in_features == M:
-                # heuristics: choose the linear whose in_features equals the original hidden M
-                fc2_module = sub_mod
-                fc2_name_full = f"{base_name}.{sub_name}"
-                break
+        if base_module is not None:
+            for sub_name, sub_mod in base_module.named_modules():
+                # sub_name is relative path e.g. 'fc2' or 'linear'
+                # avoid base_module itself
+                if sub_name == '':
+                    continue
+                if isinstance(sub_mod, nn.Linear) and sub_mod.in_features == M:
+                    # heuristics: choose the linear whose in_features equals the original hidden M
+                    fc2_module = sub_mod
+                    fc2_name_full = f"{base_name}.{sub_name}"
+                    break
 
         if fc2_module is None:
             # fallback: search all named_modules in backbone for a linear in same block with in_features == M
@@ -338,14 +436,13 @@ def dgmr_prune_mlp(model: nn.Module, target_r: int = 1):
             if hasattr(model, 'head'):
                 head = model.head
                 print("  head weight shape:", tuple(head.weight.shape))
-                _ = head(cls)
+                _ = head(cls)  # might reinit head in ViTClassifier.forward if mismatch
             print("  Test forward pass successful.")
     except Exception as e:
         print(f"  ERROR in test forward pass after pruning: {e}")
         raise
 
     return pruned_pairs
-
 
 def make_optimizer(model: nn.Module):
     return optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
@@ -457,7 +554,21 @@ def run_dataset(npz_path: str, freeze_backbone=False):
     print(f"Original MACs: {orig_macs}M, Params: {orig_params}M")
 
     # Apply DGMR pruning
-    dgmr_prune_mlp(model, TARGET_EXPANSION_RATIO)
+    pruned_pairs = dgmr_prune_mlp(model, TARGET_EXPANSION_RATIO)
+
+    # After pruning: conservative attention adjustment (optional, best-effort)
+    keep_ratio = 1.0 if TARGET_EXPANSION_RATIO is None else (1.0 * TARGET_EXPANSION_RATIO / 1.0)
+    # keep_ratio computed as target_r * (N / N) ; here it's 1 but keep for API compatibility
+    adjust_attention_heads_conservative(model, keep_ratio)
+
+    # Ensure classifier head matches backbone CLS embedding dimension (will re-init head if needed)
+    # We attempt one dummy forward through backbone and let ViTClassifier.forward reinit head if mismatch
+    try:
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(DEVICE)
+            _ = model(dummy)  # ViTClassifier.forward will reinitialize head if required (safe)
+    except Exception as e:
+        print(f"[run_dataset] Warning: dummy forward after pruning failed: {e}")
 
     # Fine-tuning
     print("\n--- Fine-tuning ---")
