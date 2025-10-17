@@ -599,6 +599,55 @@ def run_dataset(npz_path: str, freeze_backbone=False):
             "auc": final_auc
         })
 
+def get_available_datasets():
+    """
+    Determine which datasets to process based on available baseline models.
+    Returns a list of (dataset_name, npz_path) tuples.
+    """
+    print("\n--- Scanning for available baseline models ---")
+    
+    # Find all baseline model files
+    baseline_files = [f for f in os.listdir(TRIALS_DIR) if f.endswith("_dino_pretrained.pth")]
+    
+    if not baseline_files:
+        print(f"WARNING: No baseline models found in {TRIALS_DIR}")
+        return []
+    
+    print(f"Found {len(baseline_files)} baseline model(s):")
+    for bf in baseline_files:
+        print(f"  - {bf}")
+    
+    # Extract dataset names from baseline filenames
+    # Expected format: {dataset_name}_dino_pretrained.pth
+    dataset_names = []
+    for bf in baseline_files:
+        ds_name = bf.replace("_dino_pretrained.pth", "")
+        dataset_names.append(ds_name)
+    
+    # Match dataset names to NPZ files
+    available_datasets = []
+    for ds_name in dataset_names:
+        # Try to find matching NPZ file
+        # Common patterns: {ds_name}_224.npz or {ds_name}.npz
+        npz_candidates = [
+            os.path.join(DATASET_DIR, f"{ds_name}_224.npz"),
+            os.path.join(DATASET_DIR, f"{ds_name}.npz"),
+        ]
+        
+        found = False
+        for npz_path in npz_candidates:
+            if os.path.exists(npz_path):
+                available_datasets.append((ds_name, npz_path))
+                print(f"  ✓ Matched '{ds_name}' -> {npz_path}")
+                found = True
+                break
+        
+        if not found:
+            print(f"  ✗ WARNING: Could not find NPZ file for '{ds_name}' in {DATASET_DIR}")
+    
+    print(f"\nTotal datasets to process: {len(available_datasets)}")
+    return available_datasets
+
 # -------------------------
 # Main
 # -------------------------
@@ -607,10 +656,14 @@ if __name__ == "__main__":
     print("Running on device:", DEVICE)
     print("SKLEARN available for AUC:", SKLEARN)
 
-    npz_files = [os.path.join(DATASET_DIR, f) for f in os.listdir(DATASET_DIR) if f.endswith("_224.npz")]
-    print("\nFound datasets:", npz_files)
+    # Get datasets based on available baseline models
+    available_datasets = get_available_datasets()
+    
+    if not available_datasets:
+        print("\nERROR: No datasets to process. Exiting.")
+        exit(1)
 
-    for npz_path in npz_files:
+    for ds_name, npz_path in available_datasets:
         run_dataset(npz_path, freeze_backbone=False)
 
     print("\nAll done.")
