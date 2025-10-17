@@ -137,10 +137,16 @@ class ViTClassifier(nn.Module):
     def __init__(self, backbone, num_classes, freeze_backbone=False):
         super().__init__()
         self.backbone = backbone.to(DEVICE)  # Move backbone to DEVICE
+        # Hardcode feature dimension for DINOv2 ViT-S/14
+        feature_dim = 384
+        # Verify backbone output shape for debugging
         with torch.no_grad():
             test_input = torch.randn(1, 3, 224, 224).to(DEVICE)
             test_output = self.backbone(test_input)[:, 0]
-            feature_dim = test_output.shape[-1]
+            actual_dim = test_output.shape[-1]
+            print(f"Backbone CLS token output dimension: {actual_dim}")
+            if actual_dim != feature_dim:
+                print(f"Warning: Expected feature_dim={feature_dim}, but got {actual_dim}")
         self.head = nn.Linear(feature_dim, num_classes)
         print(f"Linear head: in_features={self.head.in_features}, out_features={self.head.out_features}")
         if freeze_backbone:
