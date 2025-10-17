@@ -5,7 +5,7 @@ hessian_prune_vit.py
 Loads a DINOv2 pre-trained and fine-tuned ViT model from baseline_models directory,
 applies Hessian-Aware Saliency-based pruning as per CVPR 2023 paper,
 fine-tunes the pruned model for 3 epochs, and reports test accuracy, AUC, FLOPs, etc.
-Adapted from DGMR pruning script structure.
+Processes models based on _baseline.pth files in baseline_models folder.
 
 Requires: torch, torchvision, numpy, thop (for FLOPs), scikit-learn (for AUC)
 Install thop: pip install thop
@@ -136,10 +136,10 @@ def make_loaders(npz_path: str) -> Tuple[DataLoader, DataLoader, DataLoader, int
 class ViTClassifier(nn.Module):
     def __init__(self, backbone, num_classes, freeze_backbone=False):
         super().__init__()
-        self.backbone = backbone
+        self.backbone = backbone.to(DEVICE)  # Move backbone to DEVICE
         with torch.no_grad():
             test_input = torch.randn(1, 3, 224, 224).to(DEVICE)
-            test_output = backbone(test_input)[:, 0]
+            test_output = self.backbone(test_input)[:, 0]
             feature_dim = test_output.shape[-1]
         self.head = nn.Linear(feature_dim, num_classes)
         print(f"Linear head: in_features={self.head.in_features}, out_features={self.head.out_features}")
@@ -337,8 +337,8 @@ def count_params_flops(model: nn.Module, input_size=(1, 3, 224, 224)) -> Tuple[f
 # -------------------------
 # Dataset runner
 # -------------------------
-def run_dataset(npz_path: str, freeze_backbone=False):
-    train_loader, val_loader, test_loader, num_classes, ds_name = make_loaders(npz_path)
+def run_dataset(npz_path: str, ds_name: str, freeze_backbone=False):
+    train_loader, val_loader, test_loader, num_classes, _ = make_loaders(npz_path)
     print(f"\n=== Running dataset: {ds_name} ===\n")
 
     model = build_model(num_classes, freeze_backbone=freeze_backbone)
@@ -393,10 +393,17 @@ if __name__ == "__main__":
     print("Running on device:", DEVICE)
     print("SKLEARN available for AUC:", SKLEARN)
 
-    npz_files = [os.path.join(DATASET_DIR, f) for f in os.listdir(DATASET_DIR) if f.endswith("_224.npz")]
-    print("\nFound datasets:", npz_files)
+    # Collect model files from baseline_models directory
+    model_files = [f for f in os.listdir(TRIALS_DIR) if f.endswith("_baseline.pth")]
+    print("\nFound models:", model_files)
 
-    for npz_path in npz_files:
-        run_dataset(npz_path, freeze_backbone=False)
+    for model_file in model_files:
+        # Extract dataset name from model file (e.g., 'pathmnist_224' from 'pathmnist_224_baseline.pth')
+        ds_name = model_file.replace("_baseline.pth", "")
+        npz_path = os.path.join(DATASET_DIR, f"{ds_name}.npz")
+        if not os.path.exists(npz_path):
+            print(f"Warning: Dataset file {npz_path} not found, skipping {ds_name}")
+            continue
+        run_dataset(npz_path, ds_name, freeze_backbone=False)
 
     print("\nAll done.")
