@@ -167,6 +167,9 @@ def dgmr_prune_mlp(model: nn.Module, target_r: int = 1):
     """
     print("\n--- Applying DGMR Pruning ---")
     
+    # Get device
+    device = next(model.parameters()).device
+    
     # First, let's inspect the architecture
     print("Inspecting model architecture for MLP layers...")
     mlp_layers = []
@@ -186,7 +189,6 @@ def dgmr_prune_mlp(model: nn.Module, target_r: int = 1):
     
     # Group layers into (fc1, fc2) pairs
     pruned_count = 0
-    module_dict = dict(model.backbone.named_modules())
     
     for name, module in mlp_layers:
         # Look for the first linear layer in MLP (expansion layer)
@@ -210,60 +212,83 @@ def dgmr_prune_mlp(model: nn.Module, target_r: int = 1):
             
             print(f"  Reducing from {M} to {target_M} neurons ({target_M/M*100:.1f}%)")
             
-            # Transpose weight for DGMR algorithm: [hidden, input]
-            W_hidden = module.weight.data  # [M, N]
+            # Get weight for DGMR algorithm: [M, N]
+            W_hidden = module.weight.data.clone()  # [M, N]
             
             # Apply DGMR selection
             V = W_hidden.clone()  # [M, N]
             selected = []
             
-            for _ in range(target_M):
+            for i in range(target_M):
                 norms = torch.norm(V, p=2, dim=1)  # Norm over input dimension
                 j = torch.argmax(norms).item()
                 selected.append(j)
                 vj = V[j:j+1]  # [1, N]
-                proj = (V @ vj.t()) / (vj @ vj.t() + 1e-8)  # [M, 1]
-                V -= proj * vj  # [M, N]
+                vj_norm_sq = (vj @ vj.t()).item()
+                if vj_norm_sq > 1e-8:
+                    proj = (V @ vj.t()) / vj_norm_sq  # [M, 1]
+                    V = V - proj * vj  # [M, N]
             
             selected = sorted(list(set(selected)))  # Remove duplicates and sort
+            print(f"  Selected {len(selected)} unique neurons")
             
-            print(f"  Selected {len(selected)} neurons")
-            
-            # Prune fc1
-            module.weight.data = module.weight.data[selected]
+            # Create new pruned layer
+            new_fc1 = nn.Linear(N, len(selected), bias=(module.bias is not None)).to(device)
+            new_fc1.weight.data = module.weight.data[selected]
             if module.bias is not None:
-                module.bias.data = module.bias.data[selected]
-            module.out_features = len(selected)
+                new_fc1.bias.data = module.bias.data[selected]
+            
+            # Replace in model
+            parent_name = '.'.join(name.split('.')[:-1])
+            child_name = name.split('.')[-1]
+            parent_module = dict(model.backbone.named_modules())[parent_name]
+            setattr(parent_module, child_name, new_fc1)
             
             # Find and prune corresponding fc2 (next linear layer in same block)
-            # Try common naming patterns
             base_name = name.rsplit('.', 1)[0]  # Remove last component
+            module_dict = dict(model.backbone.named_modules())
             
+            fc2_found = False
             for fc2_suffix in ['.fc2', '.linear', '.w2', '.1']:
                 fc2_name = base_name + fc2_suffix
                 if fc2_name in module_dict:
                     fc2_module = module_dict[fc2_name]
                     if isinstance(fc2_module, nn.Linear):
                         print(f"  Adjusting paired layer: {fc2_name}")
-                        fc2_module.weight.data = fc2_module.weight.data[:, selected]
-                        fc2_module.in_features = len(selected)
+                        
+                        # Create new fc2 layer
+                        new_fc2 = nn.Linear(len(selected), fc2_module.out_features, 
+                                          bias=(fc2_module.bias is not None)).to(device)
+                        new_fc2.weight.data = fc2_module.weight.data[:, selected]
+                        if fc2_module.bias is not None:
+                            new_fc2.bias.data = fc2_module.bias.data.clone()
+                        
+                        # Replace in model
+                        fc2_parent_name = '.'.join(fc2_name.split('.')[:-1])
+                        fc2_child_name = fc2_name.split('.')[-1]
+                        fc2_parent_module = dict(model.backbone.named_modules())[fc2_parent_name]
+                        setattr(fc2_parent_module, fc2_child_name, new_fc2)
+                        
                         pruned_count += 1
+                        fc2_found = True
                         break
-            else:
-                # If no fc2 found with naming convention, try to find next linear in same block
-                parts = name.split('.')
-                for other_name, other_module in module_dict.items():
-                    if (isinstance(other_module, nn.Linear) and 
-                        other_name.startswith(base_name) and 
-                        other_name != name and
-                        other_module.in_features == M):
-                        print(f"  Adjusting paired layer (found): {other_name}")
-                        other_module.weight.data = other_module.weight.data[:, selected]
-                        other_module.in_features = len(selected)
-                        pruned_count += 1
-                        break
+            
+            if not fc2_found:
+                print(f"  WARNING: Could not find paired fc2 layer for {name}")
     
     print(f"\nDGMR pruning completed: {pruned_count} layer pairs pruned")
+    
+    # Verify the model forward pass works
+    print("\nVerifying model after pruning...")
+    try:
+        with torch.no_grad():
+            dummy_input = torch.randn(2, 3, 224, 224).to(device)
+            output = model(dummy_input)
+            print(f"  Test forward pass successful: output shape {output.shape}")
+    except Exception as e:
+        print(f"  ERROR in test forward pass: {e}")
+        raise
+    
     return pruned_count
 
 def make_optimizer(model: nn.Module):
