@@ -161,33 +161,104 @@ def load_dino_pretrained(model: nn.Module, ds_name: str):
     print("Loaded DINO pretrained backbone successfully.")
 
 def dgmr_prune_mlp(model: nn.Module, target_r: int = 1):
+    """
+    Apply DGMR pruning to MLP layers in the ViT backbone.
+    DINOv2 uses different layer names - need to handle properly.
+    """
     print("\n--- Applying DGMR Pruning ---")
+    
+    # First, let's inspect the architecture
+    print("Inspecting model architecture for MLP layers...")
+    mlp_layers = []
     for name, module in model.backbone.named_modules():
-        if isinstance(module, nn.Linear) and "fc1" in name:
-            W_hidden = module.weight.data.t()  # [hidden, input]
-            M = W_hidden.shape[0]  # Hidden size
-            N = W_hidden.shape[1]  # Input size
+        if isinstance(module, nn.Linear):
+            # Look for MLP layers (typically in blocks)
+            if 'mlp' in name.lower() or 'ffn' in name.lower():
+                mlp_layers.append((name, module))
+                print(f"  Found MLP layer: {name}, in_features={module.in_features}, out_features={module.out_features}")
+    
+    if not mlp_layers:
+        print("Warning: No MLP layers found with 'mlp' or 'ffn' in name. Checking all Linear layers in blocks...")
+        for name, module in model.backbone.named_modules():
+            if isinstance(module, nn.Linear) and 'blocks' in name:
+                mlp_layers.append((name, module))
+                print(f"  Found block layer: {name}, in_features={module.in_features}, out_features={module.out_features}")
+    
+    # Group layers into (fc1, fc2) pairs
+    pruned_count = 0
+    module_dict = dict(model.backbone.named_modules())
+    
+    for name, module in mlp_layers:
+        # Look for the first linear layer in MLP (expansion layer)
+        # In standard ViT: mlp.fc1 (input_dim -> hidden_dim)
+        # We want to prune this and adjust the corresponding fc2
+        
+        # Check if this is an expansion layer (out_features > in_features)
+        if module.out_features > module.in_features:
+            print(f"\nPruning layer: {name}")
+            print(f"  Original: in={module.in_features}, out={module.out_features}")
+            
+            W_hidden = module.weight.data.t()  # [out_features, in_features] -> [hidden, input]
+            M = W_hidden.shape[0]  # Hidden size (out_features)
+            N = W_hidden.shape[1]  # Input size (in_features)
             target_M = target_r * N
+            
+            if target_M >= M:
+                print(f"  Skipping: target_M={target_M} >= current M={M}")
+                continue
+            
+            # Apply DGMR selection
             V = W_hidden.clone()
             selected = []
+            
             for _ in range(target_M):
                 norms = torch.norm(V, p=2, dim=1)
                 j = torch.argmax(norms).item()
                 selected.append(j)
                 vj = V[j:j+1]
-                proj = (V @ vj.t()) / (vj @ vj.t())
+                proj = (V @ vj.t()) / (vj @ vj.t() + 1e-8)  # Add epsilon for stability
                 V -= proj * vj
-            selected = sorted(selected)
-            # Prune to selected neurons
+            
+            selected = sorted(list(set(selected)))  # Remove duplicates and sort
+            
+            print(f"  Selected {len(selected)} neurons")
+            
+            # Prune fc1
             module.weight.data = module.weight.data[selected]
-            module.bias.data = module.bias.data[selected]
-            module.out_features = target_M
-            # Adjust next FC2
-            next_name = name.replace("fc1", "fc2")
-            next_module = dict(model.backbone.named_modules())[next_name]
-            next_module.weight.data = next_module.weight.data[:, selected]
-            next_module.in_features = target_M
-    print("DGMR pruning applied, expansion ratio reduced to r=1.")
+            if module.bias is not None:
+                module.bias.data = module.bias.data[selected]
+            module.out_features = len(selected)
+            
+            # Find and prune corresponding fc2 (next linear layer in same block)
+            # Try common naming patterns
+            base_name = name.rsplit('.', 1)[0]  # Remove last component
+            
+            for fc2_suffix in ['.fc2', '.linear', '.w2', '.1']:
+                fc2_name = base_name + fc2_suffix
+                if fc2_name in module_dict:
+                    fc2_module = module_dict[fc2_name]
+                    if isinstance(fc2_module, nn.Linear):
+                        print(f"  Adjusting paired layer: {fc2_name}")
+                        fc2_module.weight.data = fc2_module.weight.data[:, selected]
+                        fc2_module.in_features = len(selected)
+                        pruned_count += 1
+                        break
+            else:
+                # If no fc2 found with naming convention, try to find next linear in same block
+                parts = name.split('.')
+                for other_name, other_module in module_dict.items():
+                    if (isinstance(other_module, nn.Linear) and 
+                        other_name.startswith(base_name) and 
+                        other_name != name and
+                        other_module.in_features == M):
+                        print(f"  Adjusting paired layer (found): {other_name}")
+                        other_module.weight.data = other_module.weight.data[:, selected]
+                        other_module.in_features = len(selected)
+                        pruned_count += 1
+                        break
+    
+    print(f"\nDGMR pruning completed: {pruned_count} layer pairs pruned")
+    return pruned_count
 
 def make_optimizer(model: nn.Module):
     return optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
