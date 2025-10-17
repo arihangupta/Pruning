@@ -198,26 +198,32 @@ def dgmr_prune_mlp(model: nn.Module, target_r: int = 1):
             print(f"\nPruning layer: {name}")
             print(f"  Original: in={module.in_features}, out={module.out_features}")
             
-            W_hidden = module.weight.data.t()  # [out_features, in_features] -> [hidden, input]
-            M = W_hidden.shape[0]  # Hidden size (out_features)
-            N = W_hidden.shape[1]  # Input size (in_features)
-            target_M = target_r * N
+            # Weight shape: [out_features, in_features]
+            # For fc1 (expansion): in_features=384, out_features=1536
+            N = module.in_features   # Input dimension (384)
+            M = module.out_features  # Hidden dimension (1536)
+            target_M = target_r * N  # Target hidden dimension (1 * 384 = 384)
             
             if target_M >= M:
-                print(f"  Skipping: target_M={target_M} >= current M={M}")
+                print(f"  Skipping: target_M={target_M} >= current M={M} (no reduction needed)")
                 continue
             
+            print(f"  Reducing from {M} to {target_M} neurons ({target_M/M*100:.1f}%)")
+            
+            # Transpose weight for DGMR algorithm: [hidden, input]
+            W_hidden = module.weight.data  # [M, N]
+            
             # Apply DGMR selection
-            V = W_hidden.clone()
+            V = W_hidden.clone()  # [M, N]
             selected = []
             
             for _ in range(target_M):
-                norms = torch.norm(V, p=2, dim=1)
+                norms = torch.norm(V, p=2, dim=1)  # Norm over input dimension
                 j = torch.argmax(norms).item()
                 selected.append(j)
-                vj = V[j:j+1]
-                proj = (V @ vj.t()) / (vj @ vj.t() + 1e-8)  # Add epsilon for stability
-                V -= proj * vj
+                vj = V[j:j+1]  # [1, N]
+                proj = (V @ vj.t()) / (vj @ vj.t() + 1e-8)  # [M, 1]
+                V -= proj * vj  # [M, N]
             
             selected = sorted(list(set(selected)))  # Remove duplicates and sort
             
