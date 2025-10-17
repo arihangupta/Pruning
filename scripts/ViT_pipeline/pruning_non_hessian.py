@@ -162,134 +162,190 @@ def load_dino_pretrained(model: nn.Module, ds_name: str):
 
 def dgmr_prune_mlp(model: nn.Module, target_r: int = 1):
     """
-    Apply DGMR pruning to MLP layers in the ViT backbone.
-    DINOv2 uses different layer names - need to handle properly.
+    Apply DGMR pruning to MLP expansion (fc1) layers in the ViT backbone.
+    Robustly replaces fc1 and its paired fc2 using get_submodule/_modules mapping
+    and ensures the selected neuron count equals the target.
     """
-    print("\n--- Applying DGMR Pruning ---")
-    
-    # Get device
+    print("\n--- Applying DGMR Pruning (robust) ---")
     device = next(model.parameters()).device
-    
-    # First, let's inspect the architecture
-    print("Inspecting model architecture for MLP layers...")
+
+    # Collect candidate linear layers inside backbone that look like MLP expansion layers
     mlp_layers = []
     for name, module in model.backbone.named_modules():
-        if isinstance(module, nn.Linear):
-            # Look for MLP layers (typically in blocks)
-            if 'mlp' in name.lower() or 'ffn' in name.lower():
+        if isinstance(module, nn.Linear) and 'blocks' in name:
+            # candidate expansion layer is one where out_features > in_features
+            if module.out_features > module.in_features:
                 mlp_layers.append((name, module))
-                print(f"  Found MLP layer: {name}, in_features={module.in_features}, out_features={module.out_features}")
-    
+                print(f"  Candidate MLP layer: {name}  (in={module.in_features}, out={module.out_features})")
+
     if not mlp_layers:
-        print("Warning: No MLP layers found with 'mlp' or 'ffn' in name. Checking all Linear layers in blocks...")
-        for name, module in model.backbone.named_modules():
-            if isinstance(module, nn.Linear) and 'blocks' in name:
-                mlp_layers.append((name, module))
-                print(f"  Found block layer: {name}, in_features={module.in_features}, out_features={module.out_features}")
-    
-    # Group layers into (fc1, fc2) pairs
-    pruned_count = 0
-    
+        print("Warning: no expansion linear layers found. Exiting pruning.")
+        return 0
+
+    pruned_pairs = 0
+
     for name, module in mlp_layers:
-        # Look for the first linear layer in MLP (expansion layer)
-        # In standard ViT: mlp.fc1 (input_dim -> hidden_dim)
-        # We want to prune this and adjust the corresponding fc2
-        
-        # Check if this is an expansion layer (out_features > in_features)
-        if module.out_features > module.in_features:
-            print(f"\nPruning layer: {name}")
-            print(f"  Original: in={module.in_features}, out={module.out_features}")
-            
-            # Weight shape: [out_features, in_features]
-            # For fc1 (expansion): in_features=384, out_features=1536
-            N = module.in_features   # Input dimension (384)
-            M = module.out_features  # Hidden dimension (1536)
-            target_M = target_r * N  # Target hidden dimension (1 * 384 = 384)
-            
-            if target_M >= M:
-                print(f"  Skipping: target_M={target_M} >= current M={M} (no reduction needed)")
-                continue
-            
-            print(f"  Reducing from {M} to {target_M} neurons ({target_M/M*100:.1f}%)")
-            
-            # Get weight for DGMR algorithm: [M, N]
-            W_hidden = module.weight.data.clone()  # [M, N]
-            
-            # Apply DGMR selection
-            V = W_hidden.clone()  # [M, N]
-            selected = []
-            
-            for i in range(target_M):
-                norms = torch.norm(V, p=2, dim=1)  # Norm over input dimension
-                j = torch.argmax(norms).item()
+        # assume this is an fc1 (expansion): in_features = N, out_features = M
+        N = module.in_features
+        M = module.out_features
+        target_M = int(target_r * N)
+        if target_M >= M:
+            print(f"Skipping {name}: target {target_M} >= current {M}")
+            continue
+
+        print(f"\nPruning layer: {name}")
+        print(f"  Original: in={N}, out={M} -> target hidden {target_M}")
+
+        # copy weights to CPU for deterministic ops (avoid modifying original until ready)
+        W_hidden = module.weight.data.detach().clone().to('cpu')  # [M, N]
+        bias_hidden = module.bias.data.detach().clone().to('cpu') if module.bias is not None else None
+
+        # DGMR greedy selection but ensure we get exactly target_M unique indices.
+        V = W_hidden.clone()
+        selected = []
+        attempts = 0
+        max_attempts = M * 3  # safety cap
+        while len(selected) < target_M and attempts < max_attempts:
+            norms = torch.norm(V, p=2, dim=1)  # [M]
+            j = int(torch.argmax(norms).item())
+            if j not in selected:
                 selected.append(j)
                 vj = V[j:j+1]  # [1, N]
                 vj_norm_sq = (vj @ vj.t()).item()
-                if vj_norm_sq > 1e-8:
+                if vj_norm_sq > 1e-12:
                     proj = (V @ vj.t()) / vj_norm_sq  # [M, 1]
-                    V = V - proj * vj  # [M, N]
-            
-            selected = sorted(list(set(selected)))  # Remove duplicates and sort
-            print(f"  Selected {len(selected)} unique neurons")
-            
-            # Create new pruned layer
-            new_fc1 = nn.Linear(N, len(selected), bias=(module.bias is not None)).to(device)
-            new_fc1.weight.data = module.weight.data[selected]
-            if module.bias is not None:
-                new_fc1.bias.data = module.bias.data[selected]
-            
-            # Replace in model
-            parent_name = '.'.join(name.split('.')[:-1])
-            child_name = name.split('.')[-1]
-            parent_module = dict(model.backbone.named_modules())[parent_name]
-            setattr(parent_module, child_name, new_fc1)
-            
-            # Find and prune corresponding fc2 (next linear layer in same block)
-            base_name = name.rsplit('.', 1)[0]  # Remove last component
-            module_dict = dict(model.backbone.named_modules())
-            
-            fc2_found = False
-            for fc2_suffix in ['.fc2', '.linear', '.w2', '.1']:
-                fc2_name = base_name + fc2_suffix
-                if fc2_name in module_dict:
-                    fc2_module = module_dict[fc2_name]
-                    if isinstance(fc2_module, nn.Linear):
-                        print(f"  Adjusting paired layer: {fc2_name}")
-                        
-                        # Create new fc2 layer
-                        new_fc2 = nn.Linear(len(selected), fc2_module.out_features, 
-                                          bias=(fc2_module.bias is not None)).to(device)
-                        new_fc2.weight.data = fc2_module.weight.data[:, selected]
-                        if fc2_module.bias is not None:
-                            new_fc2.bias.data = fc2_module.bias.data.clone()
-                        
-                        # Replace in model
-                        fc2_parent_name = '.'.join(fc2_name.split('.')[:-1])
-                        fc2_child_name = fc2_name.split('.')[-1]
-                        fc2_parent_module = dict(model.backbone.named_modules())[fc2_parent_name]
-                        setattr(fc2_parent_module, fc2_child_name, new_fc2)
-                        
-                        pruned_count += 1
-                        fc2_found = True
-                        break
-            
-            if not fc2_found:
-                print(f"  WARNING: Could not find paired fc2 layer for {name}")
-    
-    print(f"\nDGMR pruning completed: {pruned_count} layer pairs pruned")
-    
-    # Verify the model forward pass works
-    print("\nVerifying model after pruning...")
+                    V = V - proj * vj  # Gram-Schmidt-style deflation
+                else:
+                    # zero vector — remove it from consideration to avoid infinite loop
+                    V[j] = torch.zeros_like(V[j])
+            else:
+                # if duplicate selected (rare), zero out that row and continue
+                V[j] = torch.zeros_like(V[j])
+            attempts += 1
+
+        selected = sorted(selected)
+        if len(selected) != target_M:
+            print(f"  ERROR: could not select required unique neurons for {name}. Selected {len(selected)} / {target_M}.")
+            print("  Skipping this layer to avoid corrupting shapes.")
+            continue
+
+        print(f"  Selected {len(selected)} unique neurons (target {target_M})")
+
+        # Build new fc1: in=N, out=len(selected)
+        new_fc1 = nn.Linear(N, len(selected), bias=(module.bias is not None)).to(device)
+        # assign weights (copy to device)
+        new_fc1.weight.data = module.weight.data[selected].clone().to(device)
+        if module.bias is not None:
+            new_fc1.bias.data = module.bias.data[selected].clone().to(device)
+
+        # Replace module robustly using get_submodule/_modules
+        parent_name = '.'.join(name.split('.')[:-1])
+        child_name = name.split('.')[-1]
+        if parent_name == '':
+            parent_module = model.backbone
+        else:
+            parent_module = model.backbone.get_submodule(parent_name)
+        # sanity: assert child exists in parent
+        if child_name not in parent_module._modules:
+            print(f"  WARNING: expected child '{child_name}' not found in parent '{parent_name}'. Skipping replacement.")
+            continue
+
+        # Temporarily store original for potential revert
+        orig_fc1 = parent_module._modules[child_name]
+        parent_module._modules[child_name] = new_fc1
+        print(f"  Replaced {name} -> new out_features={new_fc1.out_features}")
+
+        # Find corresponding fc2 inside same block/base_name by searching for linear with in_features == M
+        base_name = name.rsplit('.', 1)[0]  # e.g., blocks.0.mlp
+        base_module = model.backbone.get_submodule(base_name)
+        fc2_module = None
+        fc2_name_full = None
+
+        # search through direct child modules under base_module
+        for sub_name, sub_mod in base_module.named_modules():
+            # sub_name is relative path e.g. 'fc2' or 'linear'
+            # avoid base_module itself
+            if sub_name == '':
+                continue
+            if isinstance(sub_mod, nn.Linear) and sub_mod.in_features == M:
+                # heuristics: choose the linear whose in_features equals the original hidden M
+                fc2_module = sub_mod
+                fc2_name_full = f"{base_name}.{sub_name}"
+                break
+
+        if fc2_module is None:
+            # fallback: search all named_modules in backbone for a linear in same block with in_features == M
+            for full_nm, mod in model.backbone.named_modules():
+                if full_nm.startswith(base_name) and isinstance(mod, nn.Linear) and mod.in_features == M:
+                    fc2_module = mod
+                    fc2_name_full = full_nm
+                    break
+
+        if fc2_module is None:
+            print(f"  WARNING: could not find paired fc2 (in_features=={M}) under block '{base_name}'. Reverting fc1 replacement.")
+            # revert
+            parent_module._modules[child_name] = orig_fc1
+            continue
+
+        print(f"  Adjusting paired layer: {fc2_name_full} (orig in={fc2_module.in_features} out={fc2_module.out_features})")
+
+        # create new fc2 with in_features=len(selected)
+        new_fc2 = nn.Linear(len(selected), fc2_module.out_features, bias=(fc2_module.bias is not None)).to(device)
+        # copy weight columns corresponding to selected neurons
+        new_fc2.weight.data = fc2_module.weight.data[:, selected].clone().to(device)
+        if fc2_module.bias is not None:
+            new_fc2.bias.data = fc2_module.bias.data.clone().to(device)
+
+        # Replace fc2 in its parent
+        fc2_parent_name = '.'.join(fc2_name_full.split('.')[:-1])
+        fc2_child_name = fc2_name_full.split('.')[-1]
+        if fc2_parent_name == '':
+            fc2_parent_module = model.backbone
+        else:
+            fc2_parent_module = model.backbone.get_submodule(fc2_parent_name)
+
+        # sanity check child exists
+        if fc2_child_name not in fc2_parent_module._modules:
+            print(f"  WARNING: expected child '{fc2_child_name}' not found in parent '{fc2_parent_name}'. Reverting fc1.")
+            parent_module._modules[child_name] = orig_fc1
+            continue
+
+        orig_fc2 = fc2_parent_module._modules[fc2_child_name]
+        fc2_parent_module._modules[fc2_child_name] = new_fc2
+        print(f"  Replaced {fc2_name_full} -> new in_features={new_fc2.in_features}")
+
+        pruned_pairs += 1
+
+        # Quick sanity prints: show shapes after replacement
+        print(f"  Sanity: new {name} weight shape {new_fc1.weight.data.shape}, new {fc2_name_full} weight shape {new_fc2.weight.data.shape}")
+
+    print(f"\nDGMR pruning completed: {pruned_pairs} layer pairs pruned")
+
+    # Final verification: run a tiny forward through backbone and classifier head
+    print("\nVerifying model after pruning with a tiny input...")
     try:
         with torch.no_grad():
             dummy_input = torch.randn(2, 3, 224, 224).to(device)
-            output = model(dummy_input)
-            print(f"  Test forward pass successful: output shape {output.shape}")
+            backbone_out = model.backbone(dummy_input)
+            print("  backbone output shape:", tuple(backbone_out.shape))
+            # attempt to extract CLS token if present
+            if backbone_out.ndim == 3:
+                cls = backbone_out[:, 0]
+                print("  extracted CLS shape:", tuple(cls.shape))
+            else:
+                cls = backbone_out
+            # check head expectations
+            if hasattr(model, 'head'):
+                head = model.head
+                print("  head weight shape:", tuple(head.weight.shape))
+                _ = head(cls)
+            print("  Test forward pass successful.")
     except Exception as e:
-        print(f"  ERROR in test forward pass: {e}")
+        print(f"  ERROR in test forward pass after pruning: {e}")
         raise
-    
-    return pruned_count
+
+    return pruned_pairs
+
 
 def make_optimizer(model: nn.Module):
     return optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
