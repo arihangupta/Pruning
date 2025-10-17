@@ -35,11 +35,12 @@ except Exception:
 # -------------------------
 # Config
 # -------------------------
-DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets"
-TRIALS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/trials"
+DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
+SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/pruned_models_mlp"
+TRIALS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/baseline_models"
 
 TARGET_EXPANSION_RATIO = 1  # r=1 as in paper (hidden = input dim)
-FINETUNE_EPOCHS = 10
+FINETUNE_EPOCHS = 3
 BATCH_SIZE = 32
 LR = 5e-5
 IMG_SIZE = 224
@@ -281,7 +282,7 @@ def run_dataset(npz_path: str, freeze_backbone=False):
     print(f"Final Test → Loss {final_loss:.4f} Acc {final_acc:.4f} AUC {final_auc:.4f}")
     print(f"Final MACs: {final_macs}M, Params: {final_params}M")
 
-    save_path = os.path.join(TRIALS_DIR, f"{ds_name}_dgmr_pruned.pth")
+    save_path = os.path.join(SAVE_DIR, f"{ds_name}_dgmr_pruned.pth")
     torch.save(model.state_dict(), save_path)
     print(f"Saved DGMR pruned model to {save_path}")
 

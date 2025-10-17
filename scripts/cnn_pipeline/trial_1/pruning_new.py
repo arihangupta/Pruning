@@ -1085,7 +1085,7 @@ def process_dataset_safely(dataset_name, cfg):
                     cleanup_memory()
 
             elif method == "hybrid_pruning":
-                print(f"\n=== REGIONAL GRADIENTS (FP32 pruned) ===")
+                print(f"\n=== Hybrid Pruning (FP32 pruned) ===")
                 for compress_ratio in TARGET_COMPRESS_RATIOS:
                     keep_ratio = 1 - compress_ratio
                     print(f"  Compression: {compress_ratio*100}% (keep ratio {keep_ratio})")
