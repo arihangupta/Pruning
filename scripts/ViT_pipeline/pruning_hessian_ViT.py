@@ -335,11 +335,19 @@ def evaluate_model(model: nn.Module, loader: DataLoader) -> Tuple[float, float, 
         auc = float('nan')
     return avg_loss, acc, auc
 
+def parse_clever_format(value: str) -> float:
+    """Parse a string from clever_format (e.g., '5.525G', '21.345M') and convert to millions."""
+    num_str = value.rstrip('GMK')
+    multiplier = {'G': 1000.0, 'M': 1.0, 'K': 0.001}.get(value[-1], 1.0)
+    return float(num_str) * multiplier
+
 def count_params_flops(model: nn.Module, input_size=(1, 3, 224, 224)) -> Tuple[float, float]:
     input_tensor = torch.randn(*input_size).to(DEVICE)
     macs, params = profile(model, inputs=(input_tensor,))
     macs, params = clever_format([macs, params], "%.3f")
-    return float(macs.split()[0]), float(params.split()[0])
+    macs_m = parse_clever_format(macs)
+    params_m = parse_clever_format(params)
+    return macs_m, params_m
 
 # -------------------------
 # Dataset runner
