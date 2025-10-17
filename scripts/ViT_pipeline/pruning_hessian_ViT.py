@@ -144,9 +144,8 @@ class ViTClassifier(nn.Module):
             test_input = torch.randn(1, 3, 224, 224).to(DEVICE)
             test_output = self.backbone(test_input)
             print(f"Backbone output shape: {test_output.shape}")
-            cls_token = test_output[:, 0, :]  # Select CLS token
-            actual_dim = cls_token.shape[-1]
-            print(f"Backbone CLS token output dimension: {actual_dim}")
+            actual_dim = test_output.shape[-1]
+            print(f"Backbone output dimension: {actual_dim}")
             if actual_dim != feature_dim:
                 print(f"Warning: Expected feature_dim={feature_dim}, but got {actual_dim}")
         self.head = nn.Linear(feature_dim, num_classes)
@@ -156,7 +155,7 @@ class ViTClassifier(nn.Module):
                 param.requires_grad = False
 
     def forward(self, x):
-        x = self.backbone(x)[:, 0, :]  # Select CLS token
+        x = self.backbone(x)  # Use backbone output directly (CLS token)
         x = self.head(x)
         return x
 
@@ -251,7 +250,7 @@ def prune_structure(model: nn.Module, importance_scores: List[Dict], pruning_rat
         module = dict(model.backbone.named_modules())[layer_name.replace('.weight', '')]
         
         # Prune based on layer type
-        if 'q_proj' in layer_name or 'k_proj' in name or 'v_proj' in layer_name or 'out_proj' in layer_name:
+        if 'q_proj' in layer_name or 'k_proj' in layer_name or 'v_proj' in layer_name or 'out_proj' in layer_name:
             # Prune attention projections
             module.weight.data[idx] = 0
             if hasattr(module, 'bias') and module.bias is not None:
@@ -319,7 +318,7 @@ def evaluate_model(model: nn.Module, loader: DataLoader) -> Tuple[float, float, 
         loss_total += loss.item() * images.size(0)
         _, preds = outputs.max(1)
         total += labels.size(0)
-        correct = preds.eq(labels).sum().item()
+        correct += preds.eq(labels).sum().item()
         probs = torch.softmax(outputs, dim=1)
         probs_list.append(probs.cpu().numpy())
         labels_list.append(labels.cpu().numpy())
