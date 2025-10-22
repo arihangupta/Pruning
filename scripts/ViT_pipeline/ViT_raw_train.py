@@ -26,7 +26,7 @@ WEIGHT_DECAY = 0.05
 IMG_SIZE = 224
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
-EARLY_STOP_PATIENCE = 10
+EARLY_STOP_PATIENCE = 15
 
 # Training strategy: 'pretrained', 'scratch_enhanced', or 'scratch_original'
 TRAINING_STRATEGY = 'pretrained'  # Change this to experiment
