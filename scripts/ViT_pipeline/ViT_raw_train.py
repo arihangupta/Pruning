@@ -26,7 +26,7 @@ WEIGHT_DECAY = 0.05
 IMG_SIZE = 224
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
-EARLY_STOP_PATIENCE = 15
+EARLY_STOP_PATIENCE = 10
 
 # Training strategy: 'pretrained', 'scratch_enhanced', or 'scratch_original'
 TRAINING_STRATEGY = 'pretrained'  # Change this to experiment
@@ -520,7 +520,7 @@ def main():
             print("=" * 100)
             
             try:
-                train(dataset_name, model_name, train_loader, val_loader, num_classes, strategy=TRAINING_STRATEGY)
+                train(dataset_name, model_name, train_loader, val_loader, test_loader, num_classes, strategy=TRAINING_STRATEGY)
                 print(f"\n✓ Successfully completed training for {model_name} on {dataset_name}")
             except Exception as e:
                 print(f"\n✗ Error training {model_name} on {dataset_name}: {str(e)}")
