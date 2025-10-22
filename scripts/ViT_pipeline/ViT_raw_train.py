@@ -28,7 +28,38 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 EARLY_STOP_PATIENCE = 10
 
+# Training strategy: 'pretrained', 'scratch_enhanced', or 'scratch_original'
+TRAINING_STRATEGY = 'pretrained'  # Change this to experiment
+
+# Enhanced regularization for from-scratch training
+DROP_PATH_RATE = 0.1  # Stochastic depth
+LABEL_SMOOTHING = 0.1  # Label smoothing
+MIXUP_ALPHA = 0.2  # Mixup augmentation
+
 os.makedirs(SAVE_DIR, exist_ok=True)
+
+
+# -------------------------
+# Mixup Implementation
+# -------------------------
+def mixup_data(x, y, alpha=0.2):
+    """Apply mixup augmentation."""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).to(x.device)
+    
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Mixup loss."""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
 # -------------------------
@@ -83,22 +114,36 @@ class NumpyMemmapDataset(Dataset):
     Auto-detects grayscale vs RGB and normalizes accordingly.
     Includes data augmentation for training.
     """
-    def __init__(self, imgs_np, labels_np, img_size=224, is_train=False):
+    def __init__(self, imgs_np, labels_np, img_size=224, is_train=False, use_strong_aug=False):
         self.imgs = imgs_np
         self.labels = labels_np
         self.img_size = img_size
         self.is_train = is_train
 
         if is_train:
-            # Training transforms with augmentation
-            self.base_tfms = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Resize((img_size, img_size)),
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomRotation(15),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2),
-                transforms.ToTensor(),
-            ])
+            if use_strong_aug:
+                # Stronger augmentation for from-scratch training
+                self.base_tfms = transforms.Compose([
+                    transforms.ToPILImage(),
+                    transforms.Resize((img_size, img_size)),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandomVerticalFlip(p=0.3),
+                    transforms.RandomRotation(20),
+                    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+                    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+                    transforms.RandomErasing(p=0.3, scale=(0.02, 0.15)),
+                    transforms.ToTensor(),
+                ])
+            else:
+                # Standard augmentation
+                self.base_tfms = transforms.Compose([
+                    transforms.ToPILImage(),
+                    transforms.Resize((img_size, img_size)),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandomRotation(15),
+                    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                    transforms.ToTensor(),
+                ])
         else:
             # Test/validation transforms without augmentation
             self.base_tfms = transforms.Compose([
@@ -126,7 +171,7 @@ class NumpyMemmapDataset(Dataset):
         return x, label
 
 
-def load_dataset(npz_path: str):
+def load_dataset(npz_path: str, use_strong_aug=False):
     """Load dataset from NPZ file."""
     print(f"Loading {npz_path} ...")
     data = np.load(npz_path, mmap_mode="r")
@@ -142,7 +187,7 @@ def load_dataset(npz_path: str):
     print(f"Dataset sizes: train={n_train}, val={n_val}, test={n_test}")
 
     # Create datasets
-    train_ds = NumpyMemmapDataset(X_train, y_train, img_size=IMG_SIZE, is_train=True)
+    train_ds = NumpyMemmapDataset(X_train, y_train, img_size=IMG_SIZE, is_train=True, use_strong_aug=use_strong_aug)
     val_ds = NumpyMemmapDataset(X_val, y_val, img_size=IMG_SIZE, is_train=False)
     test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, is_train=False)
 
@@ -180,7 +225,7 @@ def overall_accuracy(conf_matrix):
     return tp_tn_sum / total_sum if total_sum > 0 else 0.0
 
 
-def train_epoch(net, train_loader, optimizer, scheduler, loss_function, device):
+def train_epoch(net, train_loader, optimizer, scheduler, loss_function, device, use_mixup=False):
     """Train for one epoch."""
     net.train()
     running_loss = 0.0
@@ -190,10 +235,21 @@ def train_epoch(net, train_loader, optimizer, scheduler, loss_function, device):
         images, labels = images.to(device), labels.to(device)
         
         optimizer.zero_grad()
-        outputs = net(images)
-        loss = loss_function(outputs, labels)
+        
+        if use_mixup and np.random.rand() < 0.5:
+            # Apply mixup
+            images, targets_a, targets_b, lam = mixup_data(images, labels, alpha=MIXUP_ALPHA)
+            outputs = net(images)
+            loss = mixup_criterion(loss_function, outputs, targets_a, targets_b, lam)
+        else:
+            outputs = net(images)
+            loss = loss_function(outputs, labels)
         
         loss.backward()
+        
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+        
         optimizer.step()
         scheduler.step()
         running_loss += loss.item()
@@ -255,40 +311,87 @@ def evaluate_model(net, test_loader, device):
     return metrics
 
 
-def train(dataset_name, model_name, train_loader, val_loader, num_classes):
-    """Main training function."""
+def train(dataset_name, model_name, train_loader, val_loader, num_classes, strategy='pretrained'):
+    """Main training function with different strategies."""
     print(f"\n{'='*100}")
     print(f"Training {model_name} on {dataset_name}")
+    print(f"Strategy: {strategy}")
     print(f"{'='*100}")
     
-    # Create model (from scratch, no pretrained weights)
+    # Determine if we should use enhanced regularization
+    use_mixup = (strategy == 'scratch_enhanced')
+    use_strong_aug = (strategy == 'scratch_enhanced')
+    use_pretrained = (strategy == 'pretrained')
+    
+    # Create model
     print(f"Creating model: {model_name}")
-    net = timm.create_model(
-        model_name,
-        pretrained=False,  # Train from scratch
-        num_classes=num_classes
-    ).to(DEVICE)
+    
+    if use_pretrained:
+        print("Loading ImageNet pretrained weights...")
+        net = timm.create_model(
+            model_name,
+            pretrained=True,  # Use pretrained weights
+            num_classes=num_classes,
+            drop_path_rate=0.0  # No drop path for fine-tuning
+        ).to(DEVICE)
+    else:
+        print("Training from scratch...")
+        if strategy == 'scratch_enhanced':
+            print(f"Using enhanced regularization: DropPath={DROP_PATH_RATE}, Mixup={MIXUP_ALPHA}, LabelSmoothing={LABEL_SMOOTHING}")
+        net = timm.create_model(
+            model_name,
+            pretrained=False,
+            num_classes=num_classes,
+            drop_path_rate=DROP_PATH_RATE if strategy == 'scratch_enhanced' else 0.0
+        ).to(DEVICE)
     
     print(f"Model parameters: {sum(p.numel() for p in net.parameters()):,}")
     
-    # Loss function
-    loss_function = nn.CrossEntropyLoss()
+    # Loss function with optional label smoothing
+    if strategy == 'scratch_enhanced':
+        loss_function = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    else:
+        loss_function = nn.CrossEntropyLoss()
     
-    # Optimizer
+    # Optimizer - different learning rates for pretrained vs scratch
+    if use_pretrained:
+        # Lower learning rate for fine-tuning
+        actual_lr = LR * 0.1  # 10x smaller for fine-tuning
+        actual_weight_decay = WEIGHT_DECAY * 0.1
+        print(f"Fine-tuning with LR={actual_lr}, WD={actual_weight_decay}")
+    else:
+        actual_lr = LR
+        actual_weight_decay = WEIGHT_DECAY
+    
     optimizer = optim.AdamW(
         net.parameters(),
-        lr=LR,
+        lr=actual_lr,
         betas=(0.9, 0.999),
-        weight_decay=WEIGHT_DECAY
+        weight_decay=actual_weight_decay
     )
     
     # Learning rate scheduler
     total_steps = EPOCHS * len(train_loader)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps,
-        eta_min=MIN_LR
-    )
+    
+    if use_pretrained:
+        # Gentler schedule for fine-tuning
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=MIN_LR
+        )
+    else:
+        # Warmup + cosine for from-scratch
+        warmup_steps = 5 * len(train_loader)
+        
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / warmup_steps
+            else:
+                progress = (step - warmup_steps) / (total_steps - warmup_steps)
+                return 0.5 * (1 + np.cos(np.pi * progress))
+        
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     # Initialize early stopping
     early_stopping = EarlyStopping(patience=EARLY_STOP_PATIENCE, verbose=True)
@@ -296,7 +399,8 @@ def train(dataset_name, model_name, train_loader, val_loader, num_classes):
     # Training loop
     best_acc = 0.0
     best_auc = 0.0
-    save_path = os.path.join(SAVE_DIR, f'{model_name}_{dataset_name}_scratch.pth')
+    strategy_suffix = 'pretrained' if use_pretrained else ('scratch_enhanced' if strategy == 'scratch_enhanced' else 'scratch')
+    save_path = os.path.join(SAVE_DIR, f'{model_name}_{dataset_name}_{strategy_suffix}.pth')
     
     print("\nStarting training...")
     print(f"Early stopping enabled with patience: {EARLY_STOP_PATIENCE}")
@@ -305,7 +409,7 @@ def train(dataset_name, model_name, train_loader, val_loader, num_classes):
         print(f"\nEpoch [{epoch + 1}/{EPOCHS}]")
         
         # Train
-        train_loss = train_epoch(net, train_loader, optimizer, scheduler, loss_function, DEVICE)
+        train_loss = train_epoch(net, train_loader, optimizer, scheduler, loss_function, DEVICE, use_mixup=use_mixup)
         
         # Evaluate
         metrics = evaluate_model(net, val_loader, DEVICE)
@@ -315,7 +419,7 @@ def train(dataset_name, model_name, train_loader, val_loader, num_classes):
         print(f"Val AUC: {metrics['auc']:.4f}, Val Acc: {metrics['acc']:.4f}")
         print(f"Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}")
         print(f"Specificity: {metrics['specificity']:.4f}, F1: {metrics['f1']:.4f}")
-        print(f"Learning Rate: {scheduler.get_last_lr()[0]:.8f}")
+        print(f"Learning Rate: {scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else optimizer.param_groups[0]['lr']:.8f}")
         
         # Save best model
         if metrics['acc'] > best_acc:
@@ -331,7 +435,8 @@ def train(dataset_name, model_name, train_loader, val_loader, num_classes):
                 'auc': best_auc,
                 'epoch': epoch,
                 'model_name': model_name,
-                'dataset': dataset_name
+                'dataset': dataset_name,
+                'strategy': strategy
             }
             torch.save(state, save_path)
             print(f"Model saved to {save_path}")
@@ -358,6 +463,7 @@ def train(dataset_name, model_name, train_loader, val_loader, num_classes):
 def main():
     set_seed(SEED)
     print(f"Using {DEVICE} device.")
+    print(f"Training Strategy: {TRAINING_STRATEGY}")
     
     # Validate dataset path
     if not os.path.exists(DATASET_DIR):
@@ -368,7 +474,7 @@ def main():
     # Define datasets and models to train
     datasets = ['bloodmnist', 'pathmnist', 'dermamnist']
     models = ['vit_tiny_patch16_224', 'vit_small_patch16_224', 
-              'vit_base_patch16_224', 'vit_large_patch16_224']
+              'vit_base_patch16_224']
     
     print("=" * 100)
     print("TRAINING VISION TRANSFORMERS ON MEDMNIST DATASETS")
@@ -382,7 +488,15 @@ def main():
     print(f"  - Early stopping patience: {EARLY_STOP_PATIENCE}")
     print(f"  - Learning rate: {LR}")
     print(f"  - Weight decay: {WEIGHT_DECAY}")
+    print(f"  - Training strategy: {TRAINING_STRATEGY}")
+    if TRAINING_STRATEGY == 'scratch_enhanced':
+        print(f"  - Drop path rate: {DROP_PATH_RATE}")
+        print(f"  - Label smoothing: {LABEL_SMOOTHING}")
+        print(f"  - Mixup alpha: {MIXUP_ALPHA}")
     print("\n" + "=" * 100)
+    
+    # Determine if we need strong augmentation
+    use_strong_aug = (TRAINING_STRATEGY == 'scratch_enhanced')
     
     # Train all combinations
     total_models = len(datasets) * len(models)
@@ -398,7 +512,7 @@ def main():
             continue
         
         try:
-            train_loader, val_loader, test_loader, num_classes, dataset_name = load_dataset(npz_path)
+            train_loader, val_loader, test_loader, num_classes, dataset_name = load_dataset(npz_path, use_strong_aug=use_strong_aug)
             print(f"Loaded {dataset_name}: {num_classes} classes")
         except Exception as e:
             print(f"\n✗ Error loading dataset {dataset}: {str(e)}")
@@ -416,7 +530,7 @@ def main():
             print("=" * 100)
             
             try:
-                train(dataset_name, model_name, train_loader, val_loader, num_classes)
+                train(dataset_name, model_name, train_loader, val_loader, num_classes, strategy=TRAINING_STRATEGY)
                 print(f"\n✓ Successfully completed training for {model_name} on {dataset_name}")
             except Exception as e:
                 print(f"\n✗ Error training {model_name} on {dataset_name}: {str(e)}")
