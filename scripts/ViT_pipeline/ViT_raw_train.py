@@ -11,7 +11,7 @@ from tqdm import tqdm
 import timm
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 from sklearn.preprocessing import label_binarize
-
+import csv
 
 # -------------------------
 # Config
@@ -311,28 +311,29 @@ def evaluate_model(net, test_loader, device):
     return metrics
 
 
-def train(dataset_name, model_name, train_loader, val_loader, num_classes, strategy='pretrained'):
+
+
+def train(dataset_name, model_name, train_loader, val_loader, test_loader, num_classes, strategy='pretrained'):
     """Main training function with different strategies."""
     print(f"\n{'='*100}")
     print(f"Training {model_name} on {dataset_name}")
     print(f"Strategy: {strategy}")
     print(f"{'='*100}")
     
-    # Determine if we should use enhanced regularization
+    # Determine strategy details
     use_mixup = (strategy == 'scratch_enhanced')
     use_strong_aug = (strategy == 'scratch_enhanced')
     use_pretrained = (strategy == 'pretrained')
     
     # Create model
     print(f"Creating model: {model_name}")
-    
     if use_pretrained:
         print("Loading ImageNet pretrained weights...")
         net = timm.create_model(
             model_name,
-            pretrained=True,  # Use pretrained weights
+            pretrained=True,
             num_classes=num_classes,
-            drop_path_rate=0.0  # No drop path for fine-tuning
+            drop_path_rate=0.0
         ).to(DEVICE)
     else:
         print("Training from scratch...")
@@ -347,86 +348,54 @@ def train(dataset_name, model_name, train_loader, val_loader, num_classes, strat
     
     print(f"Model parameters: {sum(p.numel() for p in net.parameters()):,}")
     
-    # Loss function with optional label smoothing
-    if strategy == 'scratch_enhanced':
-        loss_function = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
-    else:
-        loss_function = nn.CrossEntropyLoss()
+    # Loss function
+    loss_function = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING if strategy == 'scratch_enhanced' else 0.0)
     
-    # Optimizer - different learning rates for pretrained vs scratch
+    # Optimizer
     if use_pretrained:
-        # Lower learning rate for fine-tuning
-        actual_lr = LR * 0.1  # 10x smaller for fine-tuning
+        actual_lr = LR * 0.1
         actual_weight_decay = WEIGHT_DECAY * 0.1
         print(f"Fine-tuning with LR={actual_lr}, WD={actual_weight_decay}")
     else:
         actual_lr = LR
         actual_weight_decay = WEIGHT_DECAY
     
-    optimizer = optim.AdamW(
-        net.parameters(),
-        lr=actual_lr,
-        betas=(0.9, 0.999),
-        weight_decay=actual_weight_decay
-    )
+    optimizer = optim.AdamW(net.parameters(), lr=actual_lr, betas=(0.9, 0.999), weight_decay=actual_weight_decay)
     
-    # Learning rate scheduler
+    # Scheduler
     total_steps = EPOCHS * len(train_loader)
-    
     if use_pretrained:
-        # Gentler schedule for fine-tuning
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=total_steps,
-            eta_min=MIN_LR
-        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=MIN_LR)
     else:
-        # Warmup + cosine for from-scratch
         warmup_steps = 5 * len(train_loader)
-        
         def lr_lambda(step):
             if step < warmup_steps:
                 return step / warmup_steps
             else:
                 progress = (step - warmup_steps) / (total_steps - warmup_steps)
                 return 0.5 * (1 + np.cos(np.pi * progress))
-        
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
-    # Initialize early stopping
+    # Early stopping setup
     early_stopping = EarlyStopping(patience=EARLY_STOP_PATIENCE, verbose=True)
-    
-    # Training loop
-    best_acc = 0.0
-    best_auc = 0.0
+    best_acc, best_auc = 0.0, 0.0
     strategy_suffix = 'pretrained' if use_pretrained else ('scratch_enhanced' if strategy == 'scratch_enhanced' else 'scratch')
     save_path = os.path.join(SAVE_DIR, f'{model_name}_{dataset_name}_{strategy_suffix}.pth')
     
+    # ------------------ Training Loop ------------------
     print("\nStarting training...")
-    print(f"Early stopping enabled with patience: {EARLY_STOP_PATIENCE}")
-    
     for epoch in range(EPOCHS):
         print(f"\nEpoch [{epoch + 1}/{EPOCHS}]")
-        
-        # Train
         train_loss = train_epoch(net, train_loader, optimizer, scheduler, loss_function, DEVICE, use_mixup=use_mixup)
-        
-        # Evaluate
         metrics = evaluate_model(net, val_loader, DEVICE)
         
-        # Print metrics
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Val AUC: {metrics['auc']:.4f}, Val Acc: {metrics['acc']:.4f}")
-        print(f"Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}")
-        print(f"Specificity: {metrics['specificity']:.4f}, F1: {metrics['f1']:.4f}")
-        print(f"Learning Rate: {scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else optimizer.param_groups[0]['lr']:.8f}")
+        print(f"Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}, F1: {metrics['f1']:.4f}")
         
-        # Save best model
         if metrics['acc'] > best_acc:
             print(f"\n✓ New best accuracy: {metrics['acc']:.4f} (previous: {best_acc:.4f})")
-            best_acc = metrics['acc']
-            best_auc = metrics['auc']
-            
+            best_acc, best_auc = metrics['acc'], metrics['auc']
             state = {
                 'model': net.state_dict(),
                 'optimizer': optimizer.state_dict(),
@@ -441,23 +410,44 @@ def train(dataset_name, model_name, train_loader, val_loader, num_classes, strat
             torch.save(state, save_path)
             print(f"Model saved to {save_path}")
         
-        # Check early stopping
         early_stopping(metrics['acc'])
-        
         if early_stopping.early_stop:
-            print(f"\n{'='*100}")
-            print(f"Early stopping triggered at epoch {epoch + 1}")
-            print(f"No improvement in validation accuracy for {EARLY_STOP_PATIENCE} consecutive epochs")
-            print(f"{'='*100}")
+            print(f"\nEarly stopping triggered at epoch {epoch + 1}")
             break
     
-    print(f"\n{'='*100}")
-    print("Training completed!")
-    print(f"Best Accuracy: {best_acc:.4f}")
-    print(f"Best AUC: {best_auc:.4f}")
-    print(f"Total epochs trained: {epoch + 1}")
-    print(f"Model saved to: {save_path}")
-    print(f"{'='*100}")
+    print(f"\nTraining completed! Best Acc: {best_acc:.4f}, AUC: {best_auc:.4f}")
+    
+    # ------------------ Test Set Evaluation ------------------
+    print(f"\nEvaluating best model on test set for {dataset_name}...")
+    checkpoint = torch.load(save_path, map_location=DEVICE)
+    net.load_state_dict(checkpoint['model'])
+    test_metrics = evaluate_model(net, test_loader, DEVICE)
+    
+    # Prepare results
+    results = {
+        'dataset': dataset_name,
+        'model': model_name,
+        'strategy': strategy,
+        'test_acc': test_metrics['acc'],
+        'test_auc': test_metrics['auc'],
+        'test_precision': test_metrics['precision'],
+        'test_recall': test_metrics['recall'],
+        'test_specificity': test_metrics['specificity'],
+        'test_f1': test_metrics['f1']
+    }
+    
+    # Save to CSV
+    csv_path = os.path.join(SAVE_DIR, "test_results.csv")
+    file_exists = os.path.isfile(csv_path)
+    
+    with open(csv_path, mode='a', newline='') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=results.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(results)
+    
+    print(f"✓ Test results saved to {csv_path}")
+
 
 
 def main():
