@@ -20,8 +20,8 @@ import shutil
 # -------------------------
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/new_baseline"
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/Vision"
-EPOCHS_KD = 5  # Epochs for knowledge distillation (quick fine-tuning)
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/more_epochs"
+EPOCHS_KD = 50  # Epochs for knowledge distillation
 BATCH_SIZE = 64
 LR_KD = 0.0005  # Learning rate for student
 MIN_LR = 1e-6
@@ -29,6 +29,7 @@ WEIGHT_DECAY = 0.01
 IMG_SIZE = 224
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
+EARLY_STOP_PATIENCE = 10
 
 # Knowledge Distillation Parameters
 TEMPERATURE = 4.0  # Temperature for softening probabilities
@@ -78,26 +79,6 @@ def set_seed(seed: int = SEED):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-
-# -------------------------
-# Model Size Calculation
-# -------------------------
-def get_model_size_mb(model):
-    """Calculate model size in MB."""
-    param_size = 0
-    for param in model.parameters():
-        param_size += param.nelement() * param.element_size()
-    buffer_size = 0
-    for buffer in model.buffers():
-        buffer_size += buffer.nelement() * buffer.element_size()
-    size_mb = (param_size + buffer_size) / (1024 ** 2)
-    return size_mb
-
-
-def get_file_size_mb(filepath):
-    """Get file size in MB."""
-    return os.path.getsize(filepath) / (1024 ** 2)
 
 
 # -------------------------
@@ -266,17 +247,8 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, test_loader, num
     checkpoint = torch.load(baseline_path, map_location=DEVICE)
     net.load_state_dict(checkpoint['model'])
     
-    # Get baseline model size
-    baseline_model_size = get_model_size_mb(net)
-    baseline_file_size = get_file_size_mb(baseline_path)
-    
-    print(f"\nBASELINE MODEL STATISTICS:")
-    print(f"   Model size in memory: {baseline_model_size:.2f} MB")
-    print(f"   File size on disk: {baseline_file_size:.2f} MB")
-    print(f"   Parameters: {sum(p.numel() for p in net.parameters()):,}")
-    
     # Evaluate with AMP
-    print("\nEvaluating with AMP (float16)...")
+    print("Evaluating with AMP (float16)...")
     test_metrics = evaluate_model(net, test_loader, DEVICE, use_amp=True)
     
     # Save quantized model
@@ -292,32 +264,11 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, test_loader, num
     torch.save(state, save_path)
     print(f"✓ Quantized model saved to {save_path}")
     
-    # Get quantized model size
-    quantized_file_size = get_file_size_mb(save_path)
-    
-    # Note: AMP doesn't change model memory size significantly, but allows faster inference
-    # The main benefit is computational, not storage
-    
-    print(f"\nQUANTIZED MODEL STATISTICS:")
-    print(f"   Model size in memory: {baseline_model_size:.2f} MB (same - AMP is runtime optimization)")
-    print(f"   File size on disk: {quantized_file_size:.2f} MB")
-    print(f"   Compression ratio: {baseline_file_size / quantized_file_size:.2f}x")
-    print(f"   Size reduction: {((baseline_file_size - quantized_file_size) / baseline_file_size * 100):.2f}%")
-    
-    print(f"\nPERFORMANCE METRICS:")
-    print(f"   Test Accuracy: {test_metrics['acc']:.4f}")
-    print(f"   Test AUC: {test_metrics['auc']:.4f}")
-    print(f"   Test F1: {test_metrics['f1']:.4f}")
-    
     # Prepare results
     results = {
         'dataset': dataset_name,
         'model': model_name,
         'pruning_method': 'amp_quantization',
-        'baseline_size_mb': baseline_file_size,
-        'pruned_size_mb': quantized_file_size,
-        'compression_ratio': baseline_file_size / quantized_file_size,
-        'size_reduction_percent': ((baseline_file_size - quantized_file_size) / baseline_file_size * 100),
         'test_acc': test_metrics['acc'],
         'test_auc': test_metrics['auc'],
         'test_precision': test_metrics['precision'],
@@ -325,6 +276,17 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, test_loader, num
         'test_specificity': test_metrics['specificity'],
         'test_f1': test_metrics['f1']
     }
+    
+    # Calculate model size reduction
+    baseline_size = os.path.getsize(baseline_path) / (1024 * 1024)  # MB
+    quantized_size = os.path.getsize(save_path) / (1024 * 1024)  # MB
+    compression_ratio = baseline_size / quantized_size if quantized_size > 0 else 1.0
+    
+    print(f"\nBaseline size: {baseline_size:.2f} MB")
+    print(f"Quantized size: {quantized_size:.2f} MB")
+    print(f"Compression ratio: {compression_ratio:.2f}x")
+    print(f"Test Accuracy: {test_metrics['acc']:.4f}")
+    print(f"Test AUC: {test_metrics['auc']:.4f}")
     
     return results
 
@@ -413,42 +375,27 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
     teacher.load_state_dict(checkpoint['model'])
     teacher.eval()
     
-    # Get teacher statistics
-    teacher_params = sum(p.numel() for p in teacher.parameters())
-    teacher_model_size = get_model_size_mb(teacher)
-    teacher_file_size = get_file_size_mb(teacher_path)
-    
-    print(f"\nTEACHER MODEL STATISTICS:")
-    print(f"   Model: {teacher_model_name}")
-    print(f"   Parameters: {teacher_params:,}")
-    print(f"   Model size in memory: {teacher_model_size:.2f} MB")
-    print(f"   File size on disk: {teacher_file_size:.2f} MB")
-    
     # Evaluate teacher
-    print("\nEvaluating teacher model...")
+    print("Evaluating teacher model...")
     teacher_metrics = evaluate_model(teacher, test_loader, DEVICE)
-    print(f"   Teacher Test Accuracy: {teacher_metrics['acc']:.4f}")
-    print(f"   Teacher Test AUC: {teacher_metrics['auc']:.4f}")
+    print(f"Teacher Test Accuracy: {teacher_metrics['acc']:.4f}, AUC: {teacher_metrics['auc']:.4f}")
     
     # Create student model (random initialization)
-    print(f"\nSTUDENT MODEL (PRE-TRAINING):")
-    print(f"   Creating student model: {student_model_name} (random weights)")
+    print(f"Creating student model: {student_model_name} (random weights)")
     student = timm.create_model(student_model_name, pretrained=False, num_classes=num_classes).to(DEVICE)
     
+    teacher_params = sum(p.numel() for p in teacher.parameters())
     student_params = sum(p.numel() for p in student.parameters())
-    student_model_size = get_model_size_mb(student)
-    
-    print(f"   Parameters: {student_params:,}")
-    print(f"   Model size in memory: {student_model_size:.2f} MB")
-    print(f"   Parameter reduction: {(1 - student_params/teacher_params)*100:.2f}%")
-    print(f"   Memory reduction: {(1 - student_model_size/teacher_model_size)*100:.2f}%")
+    print(f"Teacher parameters: {teacher_params:,}")
+    print(f"Student parameters: {student_params:,}")
+    print(f"Parameter reduction: {(1 - student_params/teacher_params)*100:.2f}%")
     
     # Setup training
     criterion = DistillationLoss(temperature=TEMPERATURE, alpha=ALPHA)
     optimizer = optim.AdamW(student.parameters(), lr=LR_KD, weight_decay=WEIGHT_DECAY)
     
     total_steps = EPOCHS_KD * len(train_loader)
-    warmup_steps = 1 * len(train_loader)  # Reduced warmup for shorter training
+    warmup_steps = 3 * len(train_loader)
     
     def lr_lambda(step):
         if step < warmup_steps:
@@ -459,23 +406,24 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
     
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
+    # Early stopping
+    early_stopping = EarlyStopping(patience=EARLY_STOP_PATIENCE, verbose=True)
     best_acc, best_auc = 0.0, 0.0
     save_path = os.path.join(save_dir, f'{student_model_name}_{dataset_name}_kd_from_{teacher_model_name}.pth')
     
-    # Training loop (fixed 5 epochs, no early stopping)
+    # Training loop
     print(f"\nStarting knowledge distillation training for {EPOCHS_KD} epochs...")
     for epoch in range(EPOCHS_KD):
-        print(f"\n--- Epoch [{epoch + 1}/{EPOCHS_KD}] ---")
+        print(f"\nEpoch [{epoch + 1}/{EPOCHS_KD}]")
         train_loss = train_epoch_kd(student, teacher, train_loader, optimizer, scheduler, criterion, DEVICE)
         metrics = evaluate_model(student, val_loader, DEVICE)
         
         print(f"Train Loss: {train_loss:.4f}")
-        print(f"Val Acc: {metrics['acc']:.4f}, Val AUC: {metrics['auc']:.4f}")
-        print(f"Val F1: {metrics['f1']:.4f}")
+        print(f"Val AUC: {metrics['auc']:.4f}, Val Acc: {metrics['acc']:.4f}")
+        print(f"Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}, F1: {metrics['f1']:.4f}")
         
-        # Always save the best model
         if metrics['acc'] > best_acc:
-            print(f"✓ New best accuracy: {metrics['acc']:.4f} (previous: {best_acc:.4f})")
+            print(f"\n✓ New best accuracy: {metrics['acc']:.4f} (previous: {best_acc:.4f})")
             best_acc, best_auc = metrics['acc'], metrics['auc']
             state = {
                 'model': student.state_dict(),
@@ -490,33 +438,25 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
                 'pruning_method': 'knowledge_distillation'
             }
             torch.save(state, save_path)
+            print(f"Model saved to {save_path}")
+        
+        early_stopping(metrics['acc'])
+        if early_stopping.early_stop:
+            print(f"\nEarly stopping triggered at epoch {epoch + 1}")
+            break
     
-    print(f"\n✓ Training completed! Best Val Acc: {best_acc:.4f}, Best Val AUC: {best_auc:.4f}")
+    print(f"\nTraining completed! Best Acc: {best_acc:.4f}, AUC: {best_auc:.4f}")
     
     # Test set evaluation
-    print(f"\n FINAL TEST SET EVALUATION:")
+    print(f"\nEvaluating student model on test set...")
     checkpoint = torch.load(save_path, map_location=DEVICE)
     student.load_state_dict(checkpoint['model'])
     test_metrics = evaluate_model(student, test_loader, DEVICE)
     
-    # Get final student file size
-    student_file_size = get_file_size_mb(save_path)
-    
-    print(f"\nSTUDENT MODEL (POST-TRAINING):")
-    print(f"   File size on disk: {student_file_size:.2f} MB")
-    print(f"   Test Accuracy: {test_metrics['acc']:.4f}")
-    print(f"   Test AUC: {test_metrics['auc']:.4f}")
-    print(f"   Test F1: {test_metrics['f1']:.4f}")
-    
-    print(f"\nCOMPARISON SUMMARY:")
-    print(f"   Teacher → Student Size Reduction:")
-    print(f"      File size: {teacher_file_size:.2f} MB → {student_file_size:.2f} MB")
-    print(f"      Compression ratio: {teacher_file_size / student_file_size:.2f}x")
-    print(f"      Size reduction: {(1 - student_file_size/teacher_file_size)*100:.2f}%")
-    print(f"   Teacher → Student Performance:")
-    print(f"      Test Accuracy: {teacher_metrics['acc']:.4f} → {test_metrics['acc']:.4f}")
-    print(f"      Accuracy drop: {(teacher_metrics['acc'] - test_metrics['acc'])*100:.2f}%")
-    print(f"      Test AUC: {teacher_metrics['auc']:.4f} → {test_metrics['auc']:.4f}")
+    print(f"\nFinal Results:")
+    print(f"Teacher Test Acc: {teacher_metrics['acc']:.4f}, AUC: {teacher_metrics['auc']:.4f}")
+    print(f"Student Test Acc: {test_metrics['acc']:.4f}, AUC: {test_metrics['auc']:.4f}")
+    print(f"Accuracy drop: {(teacher_metrics['acc'] - test_metrics['acc'])*100:.2f}%")
     
     # Prepare results
     results = {
@@ -524,22 +464,15 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
         'teacher_model': teacher_model_name,
         'student_model': student_model_name,
         'pruning_method': 'knowledge_distillation',
-        'teacher_params': teacher_params,
-        'student_params': student_params,
-        'param_reduction_percent': (1 - student_params/teacher_params)*100,
-        'teacher_size_mb': teacher_file_size,
-        'student_size_mb': student_file_size,
-        'compression_ratio': teacher_file_size / student_file_size,
-        'size_reduction_percent': (1 - student_file_size/teacher_file_size)*100,
         'teacher_test_acc': teacher_metrics['acc'],
         'teacher_test_auc': teacher_metrics['auc'],
         'student_test_acc': test_metrics['acc'],
         'student_test_auc': test_metrics['auc'],
-        'accuracy_drop_percent': (teacher_metrics['acc'] - test_metrics['acc'])*100,
         'test_precision': test_metrics['precision'],
         'test_recall': test_metrics['recall'],
         'test_specificity': test_metrics['specificity'],
-        'test_f1': test_metrics['f1']
+        'test_f1': test_metrics['f1'],
+        'param_reduction': f"{(1 - student_params/teacher_params)*100:.2f}%"
     }
     
     return results
@@ -592,7 +525,7 @@ def main():
     print(f"Knowledge distillation pairs: {kd_pairs}")
     print(f"\nParameters:")
     print(f"  - Batch size: {BATCH_SIZE}")
-    print(f"  - KD epochs: {EPOCHS_KD} (fixed, no early stopping)")
+    print(f"  - KD epochs: {EPOCHS_KD}")
     print(f"  - KD learning rate: {LR_KD}")
     print(f"  - Temperature: {TEMPERATURE}")
     print(f"  - Alpha (distillation weight): {ALPHA}")
