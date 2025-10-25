@@ -651,4 +651,61 @@ def main():
         print(f"{'='*100}")
         
         for model_name in models_for_quantization:
-            baseline_path = os.path.join
+            baseline_path = os.path.join(BASELINE_DIR, f'{model_name}_{dataset_name}_pretrained.pth')
+            
+            if not os.path.exists(baseline_path):
+                print(f"✗ Baseline model not found: {baseline_path}")
+                continue
+            
+            try:
+                results = quantize_model_amp(dataset_name, model_name, baseline_path, test_loader, num_classes)
+                if results is not None:
+                    save_results_to_csv(results, "quantization_amp")
+                    print(f"✓ Completed quantization for {model_name} on {dataset_name}")
+                else:
+                    print(f"⊗ Skipped quantization for {model_name} on {dataset_name} (already exists)")
+            except Exception as e:
+                print(f"✗ Error quantizing {model_name}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+        
+        # -------------------------
+        # 2. KNOWLEDGE DISTILLATION
+        # -------------------------
+        print(f"\n{'='*100}")
+        print(f"STEP 2: KNOWLEDGE DISTILLATION")
+        print(f"{'='*100}")
+        
+        for teacher_model, student_model in kd_pairs:
+            teacher_path = os.path.join(BASELINE_DIR, f'{teacher_model}_{dataset_name}_pretrained.pth')
+            
+            if not os.path.exists(teacher_path):
+                print(f"✗ Teacher model not found: {teacher_path}")
+                continue
+            
+            try:
+                results = knowledge_distillation(
+                    dataset_name, teacher_model, student_model,
+                    teacher_path, train_loader, val_loader, test_loader, num_classes
+                )
+                if results is not None:
+                    save_results_to_csv(results, "knowledge_distillation")
+                    print(f"✓ Completed KD: {teacher_model} → {student_model} on {dataset_name}")
+                else:
+                    print(f"⊗ Skipped KD for {teacher_model} → {student_model} on {dataset_name} (already exists)")
+            except Exception as e:
+                print(f"✗ Error in KD {teacher_model} → {student_model}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+    
+    print("\n" + "=" * 100)
+    print("ALL PRUNING COMPLETED!")
+    print("=" * 100)
+    print(f"\nResults saved in:")
+    print(f"  - Quantized models: {os.path.join(SAVE_DIR_BASE, 'quantized_amp')}")
+    print(f"  - KD models: {os.path.join(SAVE_DIR_BASE, 'knowledge_distillation')}")
+    print(f"  - CSV results: {SAVE_DIR_BASE}")
+
+
+if __name__ == '__main__':
+    main()
