@@ -14,6 +14,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_sco
 from sklearn.preprocessing import label_binarize
 import csv
 import shutil
+from codecarbon import EmissionsTracker
 
 # -------------------------
 # Config
@@ -179,7 +180,7 @@ def evaluate_model(net, test_loader, device, use_amp=False):
     all_probs = []
     
     with torch.no_grad():
-        val_bar = tqdm(test_loader, file=sys.stdout, desc="Evaluating")
+        val_bar = tqdm(test_loader, file=sys.stdout, desc="Evaluating", leave=False)
         for inputs, targets in val_bar:
             inputs = inputs.to(device)
             
@@ -241,22 +242,48 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, test_loader, num
     save_dir = os.path.join(SAVE_DIR_BASE, "quantized_amp")
     os.makedirs(save_dir, exist_ok=True)
     
+    # Check if quantized model already exists
+    save_path = os.path.join(save_dir, f'{model_name}_{dataset_name}_amp.pth')
+    if os.path.exists(save_path):
+        print(f"⊗ Quantized model already exists at {save_path}")
+        print(f"⊗ Skipping quantization for {model_name} on {dataset_name}")
+        return None
+    
+    # Start energy tracking
+    tracker = EmissionsTracker(
+        project_name=f"quantization_{model_name}_{dataset_name}",
+        log_level='error',
+        save_to_file=False
+    )
+    tracker.start()
+    
     # Load baseline model
     print(f"Loading baseline model from {baseline_path}")
     net = timm.create_model(model_name, pretrained=False, num_classes=num_classes).to(DEVICE)
     checkpoint = torch.load(baseline_path, map_location=DEVICE)
     net.load_state_dict(checkpoint['model'])
     
-    # Evaluate with AMP
+    # Evaluate baseline (without AMP)
+    print("Evaluating baseline model (float32)...")
+    baseline_metrics = evaluate_model(net, test_loader, DEVICE, use_amp=False)
+    
+    # Evaluate with AMP (float16)
     print("Evaluating with AMP (float16)...")
-    test_metrics = evaluate_model(net, test_loader, DEVICE, use_amp=True)
+    quantized_metrics = evaluate_model(net, test_loader, DEVICE, use_amp=True)
+    
+    # Stop energy tracking
+    emissions = tracker.stop()
+    energy_kwh = tracker._total_energy.kWh if hasattr(tracker, '_total_energy') else 0.0
+    co2_kg = emissions if emissions else 0.0
+    
+    print(f"\n⚡ Energy consumed: {energy_kwh:.6f} kWh")
+    print(f"🌍 CO2 emissions: {co2_kg:.6f} kg")
     
     # Save quantized model
-    save_path = os.path.join(save_dir, f'{model_name}_{dataset_name}_amp.pth')
     state = {
         'model': net.state_dict(),
-        'acc': test_metrics['acc'],
-        'auc': test_metrics['auc'],
+        'acc': quantized_metrics['acc'],
+        'auc': quantized_metrics['auc'],
         'model_name': model_name,
         'dataset': dataset_name,
         'pruning_method': 'amp_quantization'
@@ -264,29 +291,46 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, test_loader, num
     torch.save(state, save_path)
     print(f"✓ Quantized model saved to {save_path}")
     
+    # Calculate drops
+    acc_drop = (baseline_metrics['acc'] - quantized_metrics['acc']) * 100
+    auc_drop = (baseline_metrics['auc'] - quantized_metrics['auc']) * 100
+    
+    # Calculate model size
+    baseline_size = os.path.getsize(baseline_path) / (1024 * 1024)  # MB
+    quantized_size = os.path.getsize(save_path) / (1024 * 1024)  # MB
+    compression_ratio = baseline_size / quantized_size if quantized_size > 0 else 1.0
+    
+    print(f"\n{'='*60}")
+    print(f"COMPARISON RESULTS:")
+    print(f"{'='*60}")
+    print(f"Baseline  - Acc: {baseline_metrics['acc']:.4f}, AUC: {baseline_metrics['auc']:.4f}")
+    print(f"Quantized - Acc: {quantized_metrics['acc']:.4f}, AUC: {quantized_metrics['auc']:.4f}")
+    print(f"Drop      - Acc: {acc_drop:.2f}%, AUC: {auc_drop:.2f}%")
+    print(f"Size      - Baseline: {baseline_size:.2f} MB, Quantized: {quantized_size:.2f} MB")
+    print(f"Compression: {compression_ratio:.2f}x")
+    print(f"{'='*60}")
+    
     # Prepare results
     results = {
         'dataset': dataset_name,
         'model': model_name,
         'pruning_method': 'amp_quantization',
-        'test_acc': test_metrics['acc'],
-        'test_auc': test_metrics['auc'],
-        'test_precision': test_metrics['precision'],
-        'test_recall': test_metrics['recall'],
-        'test_specificity': test_metrics['specificity'],
-        'test_f1': test_metrics['f1']
+        'baseline_acc': baseline_metrics['acc'],
+        'baseline_auc': baseline_metrics['auc'],
+        'test_acc': quantized_metrics['acc'],
+        'test_auc': quantized_metrics['auc'],
+        'acc_drop_percent': acc_drop,
+        'auc_drop_percent': auc_drop,
+        'test_precision': quantized_metrics['precision'],
+        'test_recall': quantized_metrics['recall'],
+        'test_specificity': quantized_metrics['specificity'],
+        'test_f1': quantized_metrics['f1'],
+        'baseline_size_mb': baseline_size,
+        'quantized_size_mb': quantized_size,
+        'compression_ratio': compression_ratio,
+        'energy_kwh': energy_kwh,
+        'co2_emissions_kg': co2_kg
     }
-    
-    # Calculate model size reduction
-    baseline_size = os.path.getsize(baseline_path) / (1024 * 1024)  # MB
-    quantized_size = os.path.getsize(save_path) / (1024 * 1024)  # MB
-    compression_ratio = baseline_size / quantized_size if quantized_size > 0 else 1.0
-    
-    print(f"\nBaseline size: {baseline_size:.2f} MB")
-    print(f"Quantized size: {quantized_size:.2f} MB")
-    print(f"Compression ratio: {compression_ratio:.2f}x")
-    print(f"Test Accuracy: {test_metrics['acc']:.4f}")
-    print(f"Test AUC: {test_metrics['auc']:.4f}")
     
     return results
 
@@ -326,7 +370,7 @@ def train_epoch_kd(student, teacher, train_loader, optimizer, scheduler, criteri
     student.train()
     teacher.eval()
     running_loss = 0.0
-    train_bar = tqdm(train_loader, file=sys.stdout, desc="Training (KD)")
+    train_bar = tqdm(train_loader, file=sys.stdout, desc="Training (KD)", leave=False)
     
     for step, (images, labels) in enumerate(train_bar):
         images, labels = images.to(device), labels.to(device)
@@ -367,6 +411,21 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
     # Create save directory
     save_dir = os.path.join(SAVE_DIR_BASE, "knowledge_distillation")
     os.makedirs(save_dir, exist_ok=True)
+    
+    # Check if KD model already exists
+    save_path = os.path.join(save_dir, f'{student_model_name}_{dataset_name}_kd_from_{teacher_model_name}.pth')
+    if os.path.exists(save_path):
+        print(f"⊗ KD model already exists at {save_path}")
+        print(f"⊗ Skipping knowledge distillation for {teacher_model_name} → {student_model_name} on {dataset_name}")
+        return None
+    
+    # Start energy tracking for training
+    training_tracker = EmissionsTracker(
+        project_name=f"kd_training_{teacher_model_name}_to_{student_model_name}_{dataset_name}",
+        log_level='error',
+        save_to_file=False
+    )
+    training_tracker.start()
     
     # Load teacher model
     print(f"Loading teacher model: {teacher_model_name}")
@@ -409,7 +468,6 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
     # Early stopping
     early_stopping = EarlyStopping(patience=EARLY_STOP_PATIENCE, verbose=True)
     best_acc, best_auc = 0.0, 0.0
-    save_path = os.path.join(save_dir, f'{student_model_name}_{dataset_name}_kd_from_{teacher_model_name}.pth')
     
     # Training loop
     print(f"\nStarting knowledge distillation training for {EPOCHS_KD} epochs...")
@@ -445,13 +503,42 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
             print(f"\nEarly stopping triggered at epoch {epoch + 1}")
             break
     
+    # Stop training energy tracking
+    training_emissions = training_tracker.stop()
+    training_energy_kwh = training_tracker._total_energy.kWh if hasattr(training_tracker, '_total_energy') else 0.0
+    training_co2_kg = training_emissions if training_emissions else 0.0
+    
+    print(f"\n⚡ Training energy consumed: {training_energy_kwh:.6f} kWh")
+    print(f"🌍 Training CO2 emissions: {training_co2_kg:.6f} kg")
+    
     print(f"\nTraining completed! Best Acc: {best_acc:.4f}, AUC: {best_auc:.4f}")
     
-    # Test set evaluation
+    # Test set evaluation with energy tracking
     print(f"\nEvaluating student model on test set...")
+    eval_tracker = EmissionsTracker(
+        project_name=f"kd_evaluation_{student_model_name}_{dataset_name}",
+        log_level='error',
+        save_to_file=False
+    )
+    eval_tracker.start()
+    
     checkpoint = torch.load(save_path, map_location=DEVICE)
     student.load_state_dict(checkpoint['model'])
     test_metrics = evaluate_model(student, test_loader, DEVICE)
+    
+    eval_emissions = eval_tracker.stop()
+    eval_energy_kwh = eval_tracker._total_energy.kWh if hasattr(eval_tracker, '_total_energy') else 0.0
+    eval_co2_kg = eval_emissions if eval_emissions else 0.0
+    
+    print(f"\n⚡ Evaluation energy consumed: {eval_energy_kwh:.6f} kWh")
+    print(f"🌍 Evaluation CO2 emissions: {eval_co2_kg:.6f} kg")
+    
+    # Total energy
+    total_energy_kwh = training_energy_kwh + eval_energy_kwh
+    total_co2_kg = training_co2_kg + eval_co2_kg
+    
+    print(f"\n⚡ TOTAL energy consumed: {total_energy_kwh:.6f} kWh")
+    print(f"🌍 TOTAL CO2 emissions: {total_co2_kg:.6f} kg")
     
     print(f"\nFinal Results:")
     print(f"Teacher Test Acc: {teacher_metrics['acc']:.4f}, AUC: {teacher_metrics['auc']:.4f}")
@@ -472,7 +559,13 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
         'test_recall': test_metrics['recall'],
         'test_specificity': test_metrics['specificity'],
         'test_f1': test_metrics['f1'],
-        'param_reduction': f"{(1 - student_params/teacher_params)*100:.2f}%"
+        'param_reduction_percent': (1 - student_params/teacher_params)*100,
+        'training_energy_kwh': training_energy_kwh,
+        'training_co2_kg': training_co2_kg,
+        'eval_energy_kwh': eval_energy_kwh,
+        'eval_co2_kg': eval_co2_kg,
+        'total_energy_kwh': total_energy_kwh,
+        'total_co2_kg': total_co2_kg
     }
     
     return results
@@ -558,55 +651,4 @@ def main():
         print(f"{'='*100}")
         
         for model_name in models_for_quantization:
-            baseline_path = os.path.join(BASELINE_DIR, f'{model_name}_{dataset_name}_pretrained.pth')
-            
-            if not os.path.exists(baseline_path):
-                print(f"✗ Baseline model not found: {baseline_path}")
-                continue
-            
-            try:
-                results = quantize_model_amp(dataset_name, model_name, baseline_path, test_loader, num_classes)
-                save_results_to_csv(results, "quantization_amp")
-                print(f"✓ Completed quantization for {model_name} on {dataset_name}")
-            except Exception as e:
-                print(f"✗ Error quantizing {model_name}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-        
-        # -------------------------
-        # 2. KNOWLEDGE DISTILLATION
-        # -------------------------
-        print(f"\n{'='*100}")
-        print(f"STEP 2: KNOWLEDGE DISTILLATION")
-        print(f"{'='*100}")
-        
-        for teacher_model, student_model in kd_pairs:
-            teacher_path = os.path.join(BASELINE_DIR, f'{teacher_model}_{dataset_name}_pretrained.pth')
-            
-            if not os.path.exists(teacher_path):
-                print(f"✗ Teacher model not found: {teacher_path}")
-                continue
-            
-            try:
-                results = knowledge_distillation(
-                    dataset_name, teacher_model, student_model,
-                    teacher_path, train_loader, val_loader, test_loader, num_classes
-                )
-                save_results_to_csv(results, "knowledge_distillation")
-                print(f"✓ Completed KD: {teacher_model} → {student_model} on {dataset_name}")
-            except Exception as e:
-                print(f"✗ Error in KD {teacher_model} → {student_model}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-    
-    print("\n" + "=" * 100)
-    print("ALL PRUNING COMPLETED!")
-    print("=" * 100)
-    print(f"\nResults saved in:")
-    print(f"  - Quantized models: {os.path.join(SAVE_DIR_BASE, 'quantized_amp')}")
-    print(f"  - KD models: {os.path.join(SAVE_DIR_BASE, 'knowledge_distillation')}")
-    print(f"  - CSV results: {SAVE_DIR_BASE}")
-
-
-if __name__ == '__main__':
-    main()
+            baseline_path = os.path.join
