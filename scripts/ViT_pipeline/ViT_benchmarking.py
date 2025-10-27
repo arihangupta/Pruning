@@ -266,7 +266,7 @@ def warmup_model(model, test_loader, num_batches, device, precision):
                 break
             inputs = inputs.to(device)
             if precision == 'amp':
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     _ = model(inputs)
             else:
                 _ = model(inputs)
@@ -350,7 +350,7 @@ def benchmark_model(config: BenchmarkConfig):
                 
                 # Inference
                 if config.precision == 'amp':
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         outputs = model(inputs)
                 else:
                     outputs = model(inputs)
@@ -361,9 +361,28 @@ def benchmark_model(config: BenchmarkConfig):
                 batch_end = time.time()
                 batch_times.append((batch_end - batch_start) * 1000)  # ms
                 
-                # Collect predictions for AUC
+                # Collect predictions for AUC with proper probability normalization
+                # Convert to float32 if needed for numerical stability
+                if outputs.dtype == torch.float16:
+                    outputs = outputs.float()
+                
+                # Clip extreme values to prevent overflow
+                outputs = torch.clamp(outputs, min=-100, max=100)
+                
+                # Calculate softmax probabilities
                 probs = torch.softmax(outputs, dim=1)
-                all_probs.append(probs.cpu().numpy())
+                probs_np = probs.cpu().numpy()
+                
+                # Normalize to ensure probabilities sum to 1 (handle numerical precision issues)
+                probs_sum = probs_np.sum(axis=1, keepdims=True)
+                probs_np = probs_np / probs_sum
+                
+                # Verify no NaN or Inf values
+                if np.any(np.isnan(probs_np)) or np.any(np.isinf(probs_np)):
+                    print(f"Warning: Invalid probabilities detected in batch {batch_idx}, skipping...")
+                    continue
+                
+                all_probs.append(probs_np)
                 all_labels.append(labels.cpu().numpy())
                 
                 images_processed += len(inputs)
@@ -399,15 +418,44 @@ def benchmark_model(config: BenchmarkConfig):
         }
     
     # Calculate metrics
+    if not all_probs:
+        print("Error: No valid predictions collected!")
+        return None
+    
     all_probs = np.concatenate(all_probs)
     all_labels = np.concatenate(all_labels)
     
-    # AUC
+    # Verify probabilities are valid
+    print(f"Probability check: min={all_probs.min():.6f}, max={all_probs.max():.6f}")
+    print(f"Probability sums: min={all_probs.sum(axis=1).min():.6f}, max={all_probs.sum(axis=1).max():.6f}")
+    
+    # Final normalization to ensure exact sum to 1.0
+    all_probs = all_probs / all_probs.sum(axis=1, keepdims=True)
+    
+    # AUC - use explicit label handling for multiclass
     try:
-        auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', labels=list(range(num_classes)))
+        # For multiclass, we need one-hot encoded labels or probability scores
+        auc = roc_auc_score(
+            all_labels, 
+            all_probs, 
+            multi_class='ovr',
+            average='weighted',
+            labels=np.arange(num_classes)
+        )
     except Exception as e:
-        print(f"Warning: Could not calculate AUC: {e}")
-        auc = float('nan')
+        print(f"Warning: Could not calculate weighted AUC: {e}")
+        try:
+            # Try macro average
+            auc = roc_auc_score(
+                all_labels, 
+                all_probs, 
+                multi_class='ovr',
+                average='macro',
+                labels=np.arange(num_classes)
+            )
+        except Exception as e2:
+            print(f"Warning: Could not calculate macro AUC: {e2}")
+            auc = float('nan')
     
     # Accuracy
     preds = np.argmax(all_probs, axis=1)
