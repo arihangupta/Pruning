@@ -36,7 +36,7 @@ except Exception:
 # -------------------------
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/new_baseline"
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/more_epochs"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/pruned_models"
 EPOCHS_KD = 50  # Epochs for knowledge distillation
 BATCH_SIZE = 64
 LR_KD = 0.0005  # Learning rate for student
