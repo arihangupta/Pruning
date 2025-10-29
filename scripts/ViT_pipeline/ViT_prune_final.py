@@ -290,12 +290,15 @@ def compute_flops(model):
         model_device = DEVICE
     
     try:
-        inputs = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(model_device)
-        if model_dtype == torch.half:
-            inputs = inputs.half()
-        macs = profile_macs(model, inputs)
-        flops = macs * 2
-        return float(flops)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='No handlers found')
+            inputs = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(model_device)
+            if model_dtype == torch.half:
+                inputs = inputs.half()
+            macs = profile_macs(model, inputs)
+            flops = macs * 2
+            return float(flops)
     except Exception as e:
         print(f"FLOPs calculation failed: {e}")
         return float("nan")
@@ -310,11 +313,17 @@ def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES)
         model_dtype = torch.float32
     
     use_cuda = model_device.type == "cuda"
+    
+    # Calculate max possible batches
+    total_batches = len(loader)
+    actual_warmup = min(warmup, max(1, total_batches // 4))
+    actual_timed = min(timed, max(1, total_batches - actual_warmup))
+    
     it = iter(loader)
     
     # Warmup
     try:
-        for _ in range(warmup):
+        for _ in range(actual_warmup):
             imgs, _ = next(it)
             imgs = imgs.to(model_device)
             if model_dtype == torch.half:
@@ -324,7 +333,6 @@ def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES)
             if use_cuda:
                 torch.cuda.synchronize()
     except StopIteration:
-        print("    Warning: Iterator exhausted during warmup, resetting iterator")
         it = iter(loader)
     
     # Timed run
@@ -334,7 +342,7 @@ def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES)
     batches_done = 0
     images_processed = 0
     try:
-        for _ in range(timed):
+        for _ in range(actual_timed):
             imgs, _ = next(it)
             imgs = imgs.to(model_device)
             if model_dtype == torch.half:
@@ -346,7 +354,7 @@ def inference_time_per_batch(model, loader, warmup=WARMUP, timed=TIMING_BATCHES)
             batches_done += 1
             images_processed += imgs.size(0)
     except StopIteration:
-        print(f"    Warning: Only {batches_done} batches processed due to dataset size")
+        pass
     
     elapsed = time.time() - start
     avg_batch = elapsed / max(1, batches_done)
@@ -717,7 +725,7 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, baseline_model, 
     
     # Create quantized model (FP16)
     quantized_model = timm.create_model(model_name, pretrained=False, num_classes=num_classes).to(DEVICE)
-    checkpoint = torch.load(baseline_path, map_location=DEVICE)
+    checkpoint = torch.load(baseline_path, map_location=DEVICE, weights_only=False)
     quantized_model.load_state_dict(checkpoint['model'])
     quantized_model = quantized_model.half()
     
@@ -907,7 +915,7 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
     # Load teacher
     print(f"Loading teacher: {teacher_model_name}")
     teacher = timm.create_model(teacher_model_name, pretrained=False, num_classes=num_classes).to(DEVICE)
-    checkpoint = torch.load(teacher_path, map_location=DEVICE)
+    checkpoint = torch.load(teacher_path, map_location=DEVICE, weights_only=False)
     teacher.load_state_dict(checkpoint['model'])
     teacher.eval()
     
@@ -987,7 +995,7 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
     print(f"\n⚡ Training: {training_energy_kwh:.6f} kWh, {training_emissions_kg:.6f} kg CO2")
     
     # Test evaluation
-    checkpoint = torch.load(save_path, map_location=DEVICE)
+    checkpoint = torch.load(save_path, map_location=DEVICE, weights_only=False)
     student.load_state_dict(checkpoint['model'])
     test_metrics = evaluate_model(student, test_loader, DEVICE)
     
@@ -1075,7 +1083,7 @@ def evaluate_baseline_model(model_name, baseline_path, test_loader, num_classes,
     
     # Load baseline model
     net = timm.create_model(model_name, pretrained=False, num_classes=num_classes).to(DEVICE)
-    checkpoint = torch.load(baseline_path, map_location=DEVICE)
+    checkpoint = torch.load(baseline_path, map_location=DEVICE, weights_only=False)
     net.load_state_dict(checkpoint['model'])
     net.eval()
     
