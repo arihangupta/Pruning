@@ -61,7 +61,7 @@ if CODECARBON_AVAILABLE:
 IMG_SIZE = 224
 SEED = 42
 BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/new_baseline"
-MODELS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/pruned_models"
+PRUNED_MODELS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/pruned_models"
 DATASETS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 OUTPUT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/benchmarking_results"
 
@@ -163,17 +163,21 @@ def make_test_loader(npz_path, batch_size):
 def parse_model_name(model_path, dataset):
     """
     Parse model filename to extract metadata.
-    Supports: baseline, quantized (AMP), and knowledge distillation models.
+    Handles patterns from pruned_models directory:
+    - quantization_vit_{size}_patch16_224_{dataset}_final.pth
+    - kd_vit_{teacher_size}_patch16_224_to_vit_{student_size}_patch16_224_{dataset}_final.pth
+    And baseline models:
+    - vit_{size}_patch16_224_{dataset}_pretrained.pth
     """
     basename = os.path.basename(model_path)
     logger.debug(f"Parsing model file: {basename} for dataset: {dataset}")
     
-    # Handle baseline models
+    # Handle baseline models from baseline directory
     if "_pretrained.pth" in basename:
         model_name = basename.replace(f"_{dataset}_pretrained.pth", "")
         return {
             "model_name": model_name,
-            "full_name": basename.replace(".pth", ""),
+            "full_name": f"{model_name}_baseline",
             "pruning_method": "baseline",
             "sparsity": "0%",
             "stored_precision": "fp32",
@@ -181,46 +185,56 @@ def parse_model_name(model_path, dataset):
             "student_model": None
         }
     
-    # Handle quantized models (AMP)
-    if "_amp.pth" in basename:
-        model_name = basename.replace(f"_{dataset}_amp.pth", "")
+    # Handle quantized models from pruned_models directory
+    # Pattern: quantization_vit_{size}_patch16_224_{dataset}_final.pth
+    if basename.startswith("quantization_") and "_final.pth" in basename:
+        # Extract the model architecture name
+        # quantization_vit_tiny_patch16_224_bloodmnist_final.pth -> vit_tiny_patch16_224
+        parts = basename.replace("quantization_", "").replace(f"_{dataset}_final.pth", "")
+        model_name = parts  # e.g., vit_tiny_patch16_224
+        
         return {
             "model_name": model_name,
-            "full_name": basename.replace(".pth", ""),
+            "full_name": f"quantization_{model_name}",
             "pruning_method": "quantization",
-            "sparsity": "50%",  # AMP typically represents ~50% reduction
+            "sparsity": "50%",  # Quantization typically represents ~50% reduction
             "stored_precision": "amp",
             "teacher_model": None,
             "student_model": None
         }
     
-    # Handle knowledge distillation models
-    if "_kd_from_" in basename:
-        # Format: vit_tiny_patch16_224_{dataset}_kd_from_vit_base_patch16_224.pth
-        parts = basename.replace(".pth", "").split("_kd_from_")
-        student_full = parts[0].replace(f"_{dataset}", "")
-        teacher_name = parts[1] if len(parts) > 1 else None
+    # Handle knowledge distillation models from pruned_models directory
+    # Pattern: kd_vit_{teacher_size}_patch16_224_to_vit_{student_size}_patch16_224_{dataset}_final.pth
+    if basename.startswith("kd_") and "_final.pth" in basename:
+        # Remove kd_ prefix and _final.pth suffix
+        middle = basename.replace("kd_", "").replace(f"_{dataset}_final.pth", "")
         
-        # Estimate sparsity based on student/teacher size
-        sparsity_map = {
-            ("base", "small"): "33%",
-            ("base", "tiny"): "67%",
-            ("small", "tiny"): "50%"
-        }
-        
-        student_size = "tiny" if "tiny" in student_full else ("small" if "small" in student_full else "base")
-        teacher_size = "tiny" if teacher_name and "tiny" in teacher_name else ("small" if teacher_name and "small" in teacher_name else "base")
-        sparsity = sparsity_map.get((teacher_size, student_size), "unknown")
-        
-        return {
-            "model_name": student_full,
-            "full_name": basename.replace(".pth", ""),
-            "pruning_method": "kd",
-            "sparsity": sparsity,
-            "stored_precision": "fp32",
-            "teacher_model": teacher_name,
-            "student_model": student_full
-        }
+        # Split on "_to_" to get teacher and student
+        if "_to_" in middle:
+            parts = middle.split("_to_")
+            teacher_name = parts[0]  # e.g., vit_base_patch16_224
+            student_name = parts[1]  # e.g., vit_small_patch16_224
+            
+            # Estimate sparsity based on student/teacher size
+            sparsity_map = {
+                ("base", "small"): "33%",
+                ("base", "tiny"): "67%",
+                ("small", "tiny"): "50%"
+            }
+            
+            teacher_size = "tiny" if "tiny" in teacher_name else ("small" if "small" in teacher_name else "base")
+            student_size = "tiny" if "tiny" in student_name else ("small" if "small" in student_name else "base")
+            sparsity = sparsity_map.get((teacher_size, student_size), "unknown")
+            
+            return {
+                "model_name": student_name,
+                "full_name": f"kd_{teacher_name}_to_{student_name}",
+                "pruning_method": "kd",
+                "sparsity": sparsity,
+                "stored_precision": "fp32",
+                "teacher_model": teacher_name,
+                "student_model": student_name
+            }
     
     logger.debug(f"Skipping {basename}: unrecognized format")
     return None
@@ -228,7 +242,8 @@ def parse_model_name(model_path, dataset):
 
 def discover_models():
     """
-    Discover all available models: baselines, quantized (AMP), and KD models.
+    Discover all available models: baselines, quantized, and KD models.
+    Models are organized in dataset-specific subdirectories under pruned_models.
     Returns a structured list matching ResNet script format.
     """
     models = []
@@ -240,7 +255,7 @@ def discover_models():
     for dataset in MATRIX_CONFIG["datasets"]:
         dataset_models = []
         
-        # Baseline models
+        # 1. Baseline models (from separate baseline directory)
         for model_size in ['tiny', 'small', 'base']:
             model_name = f"vit_{model_size}_patch16_224"
             baseline_path = os.path.join(BASELINE_DIR, f"{model_name}_{dataset}_pretrained.pth")
@@ -250,33 +265,29 @@ def discover_models():
                     parsed["model_path"] = baseline_path
                     dataset_models.append(parsed)
                     print(f"✓ Found baseline: {model_name} for {dataset}")
+            else:
+                logger.debug(f"Baseline not found: {baseline_path}")
         
-        # Quantized models (AMP)
-        quant_dir = os.path.join(MODELS_DIR, "quantized_amp")
-        if os.path.exists(quant_dir):
-            for model_size in ['tiny', 'small', 'base']:
-                model_name = f"vit_{model_size}_patch16_224"
-                quant_path = os.path.join(quant_dir, f"{model_name}_{dataset}_amp.pth")
-                if os.path.exists(quant_path):
-                    parsed = parse_model_name(quant_path, dataset)
-                    if parsed:
-                        parsed["model_path"] = quant_path
-                        dataset_models.append(parsed)
-                        print(f"✓ Found quantized: {model_name}_amp for {dataset}")
-        
-        # Knowledge distillation models
-        kd_dir = os.path.join(MODELS_DIR, "knowledge_distillation")
-        if os.path.exists(kd_dir):
-            kd_files = glob.glob(os.path.join(kd_dir, f"*_{dataset}_kd_from_*.pth"))
-            for kd_path in kd_files:
-                parsed = parse_model_name(kd_path, dataset)
+        # 2. Quantized and KD models (from pruned_models/{dataset}/ subdirectory)
+        dataset_pruned_dir = os.path.join(PRUNED_MODELS_DIR, dataset)
+        if os.path.exists(dataset_pruned_dir):
+            # Find all _final.pth files in the dataset subdirectory
+            model_files = glob.glob(os.path.join(dataset_pruned_dir, "*_final.pth"))
+            
+            for model_path in model_files:
+                parsed = parse_model_name(model_path, dataset)
                 if parsed:
-                    parsed["model_path"] = kd_path
+                    parsed["model_path"] = model_path
                     dataset_models.append(parsed)
-                    print(f"✓ Found KD model: {parsed['full_name']} for {dataset}")
+                    print(f"✓ Found {parsed['pruning_method']}: {parsed['full_name']} for {dataset}")
+                else:
+                    logger.debug(f"Skipping unrecognized file: {os.path.basename(model_path)}")
+        else:
+            print(f"Warning: Pruned models directory for {dataset} does not exist: {dataset_pruned_dir}")
         
         if dataset_models:
             models.append({"dataset": dataset, "models": dataset_models})
+            print(f"  Total models for {dataset}: {len(dataset_models)}")
         else:
             print(f"Warning: No models found for {dataset}")
     
@@ -977,6 +988,10 @@ def main():
     # Verify paths exist
     if not os.path.exists(BASELINE_DIR):
         print(f"\n✗ Error: Baseline directory not found: {BASELINE_DIR}")
+        return
+    
+    if not os.path.exists(PRUNED_MODELS_DIR):
+        print(f"\n✗ Error: Pruned models directory not found: {PRUNED_MODELS_DIR}")
         return
     
     if not os.path.exists(DATASETS_DIR):
