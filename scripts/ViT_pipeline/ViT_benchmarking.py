@@ -61,7 +61,7 @@ if CODECARBON_AVAILABLE:
 IMG_SIZE = 224
 SEED = 42
 BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/new_baseline"
-MODELS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/more_epochs"
+MODELS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/pruned_models"
 DATASETS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 OUTPUT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/benchmarking_results"
 
