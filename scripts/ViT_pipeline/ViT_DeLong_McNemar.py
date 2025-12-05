@@ -677,23 +677,46 @@ def main():
         logger.info(f"Found {len(baseline_models)} baseline models and {len(compressed_models)} compressed models")
         
         # For each compressed model, find the matching baseline
-        # Match based on model size (tiny, small, base)
+        # For quantization: compare to baseline of same size
+        # For KD: compare student to TEACHER (e.g., distilled small to baseline base)
         for compressed_model in compressed_models:
-            # Determine the size of the compressed model
-            compressed_size = None
-            if 'tiny' in compressed_model['model_name']:
-                compressed_size = 'tiny'
-            elif 'small' in compressed_model['model_name']:
-                compressed_size = 'small'
-            elif 'base' in compressed_model['model_name']:
-                compressed_size = 'base'
-            
-            # Find matching baseline
             baseline_model = None
-            for bl_model in baseline_models:
-                if compressed_size and compressed_size in bl_model['model_name']:
-                    baseline_model = bl_model
-                    break
+            
+            if compressed_model['compression_method'] == 'kd':
+                # For KD models, compare student to teacher
+                # Extract teacher size from teacher_model name
+                teacher_name = compressed_model['teacher_model']
+                teacher_size = None
+                if teacher_name:
+                    if 'tiny' in teacher_name:
+                        teacher_size = 'tiny'
+                    elif 'small' in teacher_name:
+                        teacher_size = 'small'
+                    elif 'base' in teacher_name:
+                        teacher_size = 'base'
+                    
+                    # Find baseline matching teacher size
+                    for bl_model in baseline_models:
+                        if teacher_size and teacher_size in bl_model['model_name']:
+                            baseline_model = bl_model
+                            logger.info(f"KD comparison: {compressed_model['full_name']} vs teacher baseline {bl_model['model_name']}")
+                            break
+            else:
+                # For quantization, compare to baseline of same size
+                compressed_size = None
+                if 'tiny' in compressed_model['model_name']:
+                    compressed_size = 'tiny'
+                elif 'small' in compressed_model['model_name']:
+                    compressed_size = 'small'
+                elif 'base' in compressed_model['model_name']:
+                    compressed_size = 'base'
+                
+                # Find matching baseline
+                for bl_model in baseline_models:
+                    if compressed_size and compressed_size in bl_model['model_name']:
+                        baseline_model = bl_model
+                        logger.info(f"Quantization comparison: {compressed_model['full_name']} vs baseline {bl_model['model_name']}")
+                        break
             
             if baseline_model is None:
                 logger.warning(f"No matching baseline found for {compressed_model['full_name']}")
