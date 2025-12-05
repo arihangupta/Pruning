@@ -526,7 +526,7 @@ def compare_models(dataset_name, baseline_info, pruned_info, dataloader, num_cla
         'dataset': dataset_name,
         'baseline_model': baseline_info['model_name'],
         'compressed_model': pruned_info['full_name'],
-        'compression_method': pruned_info['pruning_method'],
+        'pruning_method': pruned_info['pruning_method'],
         'sparsity': pruned_info['sparsity'],
         'stored_precision': pruned_info['stored_precision'],
         'baseline_accuracy': baseline_acc,
@@ -682,7 +682,7 @@ def main():
         for compressed_model in compressed_models:
             baseline_model = None
             
-            if compressed_model['compression_method'] == 'kd':
+            if compressed_model['pruning_method'] == 'kd':
                 # For KD models, compare student to teacher
                 # Extract teacher size from teacher_model name
                 teacher_name = compressed_model['teacher_model']
@@ -745,7 +745,7 @@ def main():
         # Reorder columns for better readability
         column_order = [
             'dataset', 'baseline_model', 'compressed_model', 
-            'compression_method', 'sparsity', 'stored_precision',
+            'pruning_method', 'sparsity', 'stored_precision',
             'teacher_model', 'student_model',
             'baseline_accuracy', 'compressed_accuracy', 'accuracy_difference',
             'mcnemar_statistic', 'mcnemar_p_value', 'mcnemar_significant',
