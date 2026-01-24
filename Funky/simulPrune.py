@@ -66,7 +66,6 @@ DATASETS = {
 # Training hyperparameters
 INITIAL_LR = 1e-3
 WEIGHT_DECAY = 1e-4  # L2 regularization (applied to ALL training)
-DROPOUT_RATE = 0.5  # Dropout (applied to ALL models)
 FIXED_EPOCHS = 15  # Fixed number of epochs for ALL training (baseline and progressive)
 
 # Progressive pruning configuration
@@ -174,12 +173,11 @@ def make_loaders(npz_path, batch_size):
 # Model architecture
 # -------------------------
 class CustomResNet(nn.Module):
-    """Custom ResNet50 with configurable channel widths and optional dropout"""
+    """Custom ResNet50 with configurable channel widths (no dropout to maintain compatibility with pretrained weights)"""
     def __init__(self, block=Bottleneck, layers=[3,4,6,3], stage_planes=[64,128,256,512], 
-                 num_classes=1000, dropout_rate=0.0, random_init=False):
+                 num_classes=1000, random_init=False):
         super().__init__()
         self.inplanes = 64
-        self.dropout_rate = dropout_rate
         
         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
@@ -239,26 +237,20 @@ class CustomResNet(nn.Module):
         
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
-        
-        # Apply dropout if specified
-        if self.dropout_rate > 0:
-            x = F.dropout(x, p=self.dropout_rate, training=self.training)
-        
         x = self.fc(x)
         return x
 
-def build_baseline_resnet(num_classes, dropout_rate=0.5):
-    """Build baseline ResNet50 with dropout and load ImageNet weights"""
+def build_baseline_resnet(num_classes):
+    """Build baseline ResNet50 and load ImageNet pretrained weights"""
     # Start with pretrained ResNet50
     base_model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
     
-    # Create custom model with same architecture but with dropout
+    # Create custom model with same architecture
     model = CustomResNet(
         block=Bottleneck, 
         layers=[3,4,6,3], 
         stage_planes=[64,128,256,512],
         num_classes=num_classes, 
-        dropout_rate=dropout_rate,
         random_init=False
     )
     
@@ -279,16 +271,20 @@ def build_baseline_resnet(num_classes, dropout_rate=0.5):
     
     return model.to(DEVICE)
 
-def build_pruned_resnet(stage_planes, num_classes, dropout_rate=0.0):
-    """Build a ResNet with custom channel widths (for progressive pruning)"""
+def build_pruned_resnet(stage_planes, num_classes):
+    """Build a ResNet with custom channel widths (for progressive pruning)
+    
+    Uses random initialization since pruned architectures don't match 
+    pretrained ResNet50 dimensions. Weights are copied from the source 
+    model using copy_weights_to_pruned_model().
+    """
     stage_planes = [max(1, int(p)) for p in stage_planes]
     return CustomResNet(
         block=Bottleneck, 
         layers=[3,4,6,3], 
         stage_planes=stage_planes,
         num_classes=num_classes, 
-        dropout_rate=dropout_rate,
-        random_init=False
+        random_init=True  # Must be True for pruned models
     ).to(DEVICE)
 
 def stage_orig_channels(model, stage_name):
@@ -729,16 +725,16 @@ def stop_energy_tracker(tracker, save_dir, project_name):
 def train_baseline_with_regularization(dataset_name, train_loader, val_loader, test_loader, 
                                       num_classes, save_dir, trial_num):
     """
-    Phase 1: Train baseline model with dropout, L2 regularization, and batch normalization
+    Phase 1: Train baseline model with L2 regularization and batch normalization
     All models train for exactly FIXED_EPOCHS epochs
     """
     print("\n" + "="*80)
     print(f"PHASE 1: BASELINE WITH REGULARIZATION - {dataset_name.upper()} - TRIAL {trial_num}/{NUM_TRIALS}")
     print("="*80)
     
-    # Build model with dropout (batch normalization is built into ResNet)
-    model = build_baseline_resnet(num_classes, dropout_rate=DROPOUT_RATE)
-    print(f"Model built with dropout={DROPOUT_RATE}, L2={WEIGHT_DECAY}, batch_norm=True")
+    # Build model with pretrained ImageNet weights (batch normalization is built into ResNet)
+    model = build_baseline_resnet(num_classes)
+    print(f"Model built with L2={WEIGHT_DECAY}, batch_norm=True, pretrained=ImageNet")
     
     # Optimizer with L2 regularization
     optimizer = optim.Adam(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
@@ -834,7 +830,6 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
         'training_energy_kwh': energy_metrics['energy_kwh'],
         'training_emissions_kg': energy_metrics['emissions_kg'],
         'training_duration_s': energy_metrics['duration_s'],
-        'dropout': DROPOUT_RATE,
         'weight_decay': WEIGHT_DECAY,
         'channels_layer1': 64,
         'channels_layer2': 128,
@@ -848,7 +843,7 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
                                   num_classes, save_dir, trial_num):
     """
     Phase 2: Train with progressive channel pruning during training
-    Uses same regularization as baseline: dropout, L2, batch normalization
+    Uses same regularization as baseline: L2, batch normalization
     Fixed schedule: 15 epochs total, prune at epochs 5, 8, 11, 14 (every 3 epochs after warmup)
     """
     print("\n" + "="*80)
@@ -867,9 +862,9 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
     print(f"Pruning at epochs: {prune_epochs} (every {EPOCHS_BETWEEN_PRUNES} epochs)")
     print(f"Total prune steps: {actual_prune_steps}")
     
-    # Build initial model WITH dropout (same as baseline)
-    model = build_baseline_resnet(num_classes, dropout_rate=DROPOUT_RATE)
-    print(f"Model built with dropout={DROPOUT_RATE}, L2={WEIGHT_DECAY}, batch_norm=True")
+    # Build initial model with pretrained ImageNet weights (same as baseline)
+    model = build_baseline_resnet(num_classes)
+    print(f"Model built with L2={WEIGHT_DECAY}, batch_norm=True, pretrained=ImageNet")
     
     # Optimizer with L2 regularization
     optimizer = optim.Adam(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
@@ -913,11 +908,11 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
                 
                 current_channels[stage_name] = kept
             
-            # Build new pruned model WITH DROPOUT (keep same regularization)
+            # Build new pruned model (random initialization)
             new_stage_planes = [current_channels[s] for s in STAGES]
-            pruned_model = build_pruned_resnet(new_stage_planes, num_classes, dropout_rate=DROPOUT_RATE)
+            pruned_model = build_pruned_resnet(new_stage_planes, num_classes)
             
-            # Copy weights
+            # Copy weights from important channels
             print("Copying weights to pruned model...")
             pruned_model = copy_weights_to_pruned_model(model, pruned_model, keep_indices)
             
@@ -1074,7 +1069,6 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
         'channels_layer4': current_channels['layer4'],
         'total_prune_steps': actual_prune_steps,
         'epochs_between_prunes': EPOCHS_BETWEEN_PRUNES,
-        'dropout': DROPOUT_RATE,
         'weight_decay': WEIGHT_DECAY,
     })
     
@@ -1267,8 +1261,8 @@ def main():
     print(f"    Fixed Epochs: {FIXED_EPOCHS}")
     print(f"    Initial LR: {INITIAL_LR}")
     print(f"    Weight Decay (L2): {WEIGHT_DECAY}")
-    print(f"    Dropout Rate: {DROPOUT_RATE}")
     print(f"    Batch Normalization: True (built-in to ResNet)")
+    print(f"    Pretrained: ImageNet weights")
     print(f"\n  Progressive Pruning Specific:")
     print(f"    Warmup Epochs: {WARMUP_EPOCHS}")
     print(f"    Epochs Between Prunes: {EPOCHS_BETWEEN_PRUNES}")
@@ -1309,7 +1303,7 @@ def main():
     print("="*100)
     print("\nKey Takeaways:")
     print("  - Both methods trained for exactly {} epochs".format(FIXED_EPOCHS))
-    print("  - Both methods used same regularization: dropout={}, L2={}, batch_norm=True".format(DROPOUT_RATE, WEIGHT_DECAY))
+    print("  - Both methods used same regularization: L2={}, batch_norm=True, pretrained=ImageNet".format(WEIGHT_DECAY))
     print("  - Progressive pruning performed {} pruning steps at epochs {}".format(
         NUM_PRUNE_STEPS, 
         [WARMUP_EPOCHS + 1 + i * EPOCHS_BETWEEN_PRUNES for i in range(NUM_PRUNE_STEPS)]
