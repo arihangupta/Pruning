@@ -65,16 +65,19 @@ DATASETS = {
 
 # Training hyperparameters
 INITIAL_LR = 1e-3
-WEIGHT_DECAY = 1e-4  # L2 regularization
-DROPOUT_RATE = 0.5
-EARLY_STOPPING_PATIENCE = 7
-MAX_BASELINE_EPOCHS = 50
+WEIGHT_DECAY = 1e-4  # L2 regularization (applied to ALL training)
+DROPOUT_RATE = 0.5  # Dropout (applied to ALL models)
+FIXED_EPOCHS = 15  # Fixed number of epochs for ALL training (baseline and progressive)
 
 # Progressive pruning configuration
 WARMUP_EPOCHS = 2  # Train normally before first prune
+EPOCHS_BETWEEN_PRUNES = 3  # Fixed interval between pruning steps
+NUM_PRUNE_STEPS = 4  # Number of pruning iterations (epochs 5, 8, 11, 14)
 PRUNE_PERCENT = 0.10  # Remove 10% of channels each time
-NUM_PRUNE_STEPS = 5  # Total pruning iterations
 LR_REDUCTION_AFTER_PRUNE = 0.5  # Multiply LR by this after each prune
+
+# Experimental configuration
+NUM_TRIALS = 3  # Number of trials per dataset for statistical reliability
 
 # Importance calculation
 IMPORTANCE_CAL_BATCHES = 50  # Batches to use for importance scoring
@@ -642,14 +645,15 @@ def start_energy_tracker(save_dir, project_name):
         try:
             os.remove(csv_path)
         except Exception as e:
-            print(f"    Warning: Could not remove {csv_path}: {e}")
+            pass  # Silently ignore
     
     tracker = EmissionsTracker(
         project_name=project_name,
         output_dir=save_dir,
         output_file="emissions.csv",
         measure_power_secs=30,
-        save_to_file=True
+        save_to_file=True,
+        log_level="error"  # Only show errors, not info
     )
     tracker.start()
     return tracker
@@ -717,70 +721,42 @@ def stop_energy_tracker(tracker, save_dir, project_name):
             "duration_s": float("nan")
         }
 
-# -------------------------
-# Early stopping utility
-# -------------------------
-class EarlyStopping:
-    """Early stopping to stop training when validation loss doesn't improve"""
-    def __init__(self, patience=7, min_delta=0.0, verbose=True):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.verbose = verbose
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
-        self.best_epoch = 0
-    
-    def __call__(self, val_loss, epoch):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-            self.best_epoch = epoch
-        elif val_loss > self.best_loss - self.min_delta:
-            self.counter += 1
-            if self.verbose:
-                print(f"    EarlyStopping counter: {self.counter}/{self.patience}")
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_loss = val_loss
-            self.best_epoch = epoch
-            self.counter = 0
+# Removed EarlyStopping class - using fixed epochs for consistency
 
 # -------------------------
 # Main training functions
 # -------------------------
 def train_baseline_with_regularization(dataset_name, train_loader, val_loader, test_loader, 
-                                      num_classes, save_dir):
+                                      num_classes, save_dir, trial_num):
     """
-    Phase 1: Train baseline model with dropout, L2 regularization, and early stopping
+    Phase 1: Train baseline model with dropout, L2 regularization, and batch normalization
+    All models train for exactly FIXED_EPOCHS epochs
     """
     print("\n" + "="*80)
-    print(f"PHASE 1: BASELINE WITH REGULARIZATION - {dataset_name.upper()}")
+    print(f"PHASE 1: BASELINE WITH REGULARIZATION - {dataset_name.upper()} - TRIAL {trial_num}/{NUM_TRIALS}")
     print("="*80)
     
-    # Build model with dropout
+    # Build model with dropout (batch normalization is built into ResNet)
     model = build_baseline_resnet(num_classes, dropout_rate=DROPOUT_RATE)
-    print(f"Model built with dropout={DROPOUT_RATE}")
+    print(f"Model built with dropout={DROPOUT_RATE}, L2={WEIGHT_DECAY}, batch_norm=True")
     
     # Optimizer with L2 regularization
     optimizer = optim.Adam(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
     print(f"Optimizer: Adam(lr={INITIAL_LR}, weight_decay={WEIGHT_DECAY})")
     
-    # Early stopping
-    early_stopping = EarlyStopping(patience=EARLY_STOPPING_PATIENCE, verbose=True)
-    
     # Track metrics
     history = []
     best_val_loss = float('inf')
     best_model_state = None
+    best_epoch = 0
     
     # Start energy tracking
-    tracker = start_energy_tracker(save_dir, f"{dataset_name}_baseline_training")
+    tracker = start_energy_tracker(save_dir, f"{dataset_name}_baseline_training_trial{trial_num}")
     
-    print(f"\nTraining for up to {MAX_BASELINE_EPOCHS} epochs with early stopping (patience={EARLY_STOPPING_PATIENCE})")
+    print(f"\nTraining for exactly {FIXED_EPOCHS} epochs (fixed schedule)")
     
-    for epoch in range(1, MAX_BASELINE_EPOCHS + 1):
-        print(f"\n--- Epoch {epoch}/{MAX_BASELINE_EPOCHS} ---")
+    for epoch in range(1, FIXED_EPOCHS + 1):
+        print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
         
         # Train
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, epoch)
@@ -791,13 +767,15 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
         print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
         print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
         
-        # Save best model
+        # Track best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_model_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
         
         # Record metrics
         history.append({
+            'trial': trial_num,
             'epoch': epoch,
             'train_loss': train_loss,
             'train_acc': train_acc,
@@ -805,22 +783,15 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
             'val_acc': val_acc,
             'val_auc': val_auc
         })
-        
-        # Check early stopping
-        early_stopping(val_loss, epoch)
-        if early_stopping.early_stop:
-            print(f"\n  Early stopping triggered at epoch {epoch}")
-            print(f"  Best validation loss: {early_stopping.best_loss:.4f} at epoch {early_stopping.best_epoch}")
-            break
     
     # Stop energy tracking
-    energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_baseline_training")
+    energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_baseline_training_trial{trial_num}")
     print(f"\nTraining energy: {energy_metrics['energy_kwh']:.6f} kWh, emissions: {energy_metrics['emissions_kg']:.6f} kg")
     
     # Load best model
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
-        print("\nLoaded best model state")
+        print(f"\nLoaded best model from epoch {best_epoch} (val_loss: {best_val_loss:.4f})")
     
     # Final evaluation on test set
     test_loss, test_acc, test_auc = evaluate(model, test_loader, dataset_name, "baseline_test")
@@ -836,22 +807,21 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
     print(f"FLOPs: {flops/1e6:.2f}M, Inference: {inf_time*1000:.2f}ms/batch, Peak RAM: {peak_ram:.2f}MB")
     
     # Save model
-    model_path = os.path.join(save_dir, f"{dataset_name}_baseline_final.pth")
+    model_path = os.path.join(save_dir, f"{dataset_name}_baseline_trial{trial_num}_final.pth")
     torch.save(model.state_dict(), model_path)
     print(f"\nSaved model to {model_path}")
     
     # Save training history
     history_df = pd.DataFrame(history)
-    history_path = os.path.join(save_dir, f"{dataset_name}_baseline_training_history.csv")
+    history_path = os.path.join(save_dir, f"{dataset_name}_baseline_trial{trial_num}_training_history.csv")
     history_df.to_csv(history_path, index=False)
-    
-    # Determine stability epoch (when val_loss stops improving significantly)
-    stability_epoch = early_stopping.best_epoch
     
     final_metrics = {
         'method': 'baseline_regularized',
-        'epoch': len(history),
-        'stability_epoch': stability_epoch,
+        'trial': trial_num,
+        'total_epochs': FIXED_EPOCHS,
+        'best_epoch': best_epoch,
+        'best_val_loss': best_val_loss,
         'test_loss': test_loss,
         'test_acc': test_acc,
         'test_auc': test_auc,
@@ -872,31 +842,36 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
         'channels_layer4': 512,
     }
     
-    return model, final_metrics, stability_epoch
+    return model, final_metrics
 
 def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_loader, 
-                                  num_classes, save_dir, stability_epoch):
+                                  num_classes, save_dir, trial_num):
     """
     Phase 2: Train with progressive channel pruning during training
+    Uses same regularization as baseline: dropout, L2, batch normalization
+    Fixed schedule: 15 epochs total, prune at epochs 5, 8, 11, 14 (every 3 epochs after warmup)
     """
     print("\n" + "="*80)
-    print(f"PHASE 2: PROGRESSIVE PRUNING DURING TRAINING - {dataset_name.upper()}")
+    print(f"PHASE 2: PROGRESSIVE PRUNING DURING TRAINING - {dataset_name.upper()} - TRIAL {trial_num}/{NUM_TRIALS}")
     print("="*80)
     
-    # Determine training schedule based on stability
-    # Use 3 epochs between prunes if stability < 15, else 2 epochs
-    epochs_between_prunes = 3 if stability_epoch < 15 else 2
-    total_epochs = WARMUP_EPOCHS + (NUM_PRUNE_STEPS * epochs_between_prunes)
+    # Calculate pruning schedule
+    # Warmup: epochs 1-2, then prune at 5, 8, 11, 14
+    prune_epochs = [WARMUP_EPOCHS + 1 + i * EPOCHS_BETWEEN_PRUNES for i in range(NUM_PRUNE_STEPS)]
+    # Ensure we don't prune beyond FIXED_EPOCHS
+    prune_epochs = [e for e in prune_epochs if e <= FIXED_EPOCHS]
+    actual_prune_steps = len(prune_epochs)
     
-    print(f"Baseline reached stability at epoch {stability_epoch}")
-    print(f"Using {epochs_between_prunes} epochs between prunes")
-    print(f"Total training epochs: {total_epochs} (warmup: {WARMUP_EPOCHS}, prunes: {NUM_PRUNE_STEPS})")
+    print(f"Fixed schedule: {FIXED_EPOCHS} epochs total")
+    print(f"Warmup: {WARMUP_EPOCHS} epochs")
+    print(f"Pruning at epochs: {prune_epochs} (every {EPOCHS_BETWEEN_PRUNES} epochs)")
+    print(f"Total prune steps: {actual_prune_steps}")
     
-    # Build initial model (no dropout for progressive pruning)
-    model = build_baseline_resnet(num_classes, dropout_rate=0.0)
-    print("Initial model built (no dropout)")
+    # Build initial model WITH dropout (same as baseline)
+    model = build_baseline_resnet(num_classes, dropout_rate=DROPOUT_RATE)
+    print(f"Model built with dropout={DROPOUT_RATE}, L2={WEIGHT_DECAY}, batch_norm=True")
     
-    # Optimizer
+    # Optimizer with L2 regularization
     optimizer = optim.Adam(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
     current_lr = INITIAL_LR
     
@@ -905,21 +880,20 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
     
     # Track all metrics
     all_metrics = []
+    best_val_loss = float('inf')
+    best_model_state = None
+    best_epoch = 0
     
     # Start energy tracking
-    tracker = start_energy_tracker(save_dir, f"{dataset_name}_progressive_training")
+    tracker = start_energy_tracker(save_dir, f"{dataset_name}_progressive_training_trial{trial_num}")
     
-    # Pruning schedule
-    prune_epochs = [WARMUP_EPOCHS + i * epochs_between_prunes for i in range(1, NUM_PRUNE_STEPS + 1)]
-    print(f"Pruning will occur at epochs: {prune_epochs}")
-    
-    for epoch in range(1, total_epochs + 1):
-        print(f"\n--- Epoch {epoch}/{total_epochs} ---")
+    for epoch in range(1, FIXED_EPOCHS + 1):
+        print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
         
         # Check if this is a pruning epoch
         if epoch in prune_epochs:
             prune_step = prune_epochs.index(epoch) + 1
-            print(f"\n*** PRUNING STEP {prune_step}/{NUM_PRUNE_STEPS} ***")
+            print(f"\n*** PRUNING STEP {prune_step}/{actual_prune_steps} ***")
             
             # Compute importance for each stage
             print("Computing channel importance...")
@@ -939,9 +913,9 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
                 
                 current_channels[stage_name] = kept
             
-            # Build new pruned model
+            # Build new pruned model WITH DROPOUT (keep same regularization)
             new_stage_planes = [current_channels[s] for s in STAGES]
-            pruned_model = build_pruned_resnet(new_stage_planes, num_classes, dropout_rate=0.0)
+            pruned_model = build_pruned_resnet(new_stage_planes, num_classes, dropout_rate=DROPOUT_RATE)
             
             # Copy weights
             print("Copying weights to pruned model...")
@@ -965,7 +939,7 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
             print(f"Post-prune test       - Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, AUC: {test_auc:.4f}")
             
             # Save checkpoint
-            ckpt_path = os.path.join(save_dir, f"{dataset_name}_progressive_epoch{epoch}_postprune.pth")
+            ckpt_path = os.path.join(save_dir, f"{dataset_name}_progressive_trial{trial_num}_epoch{epoch}_postprune.pth")
             torch.save(model.state_dict(), ckpt_path)
             
             # Compute metrics
@@ -976,6 +950,7 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
             
             all_metrics.append({
                 'method': 'progressive_pruning',
+                'trial': trial_num,
                 'epoch': epoch,
                 'stage': f'post_prune_step_{prune_step}',
                 'test_loss': test_loss,
@@ -1004,6 +979,12 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
         print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
         print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
         
+        # Track best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
+        
         # Record metrics for regular training epochs
         if epoch not in prune_epochs:
             test_loss, test_acc, test_auc = evaluate(model, test_loader, dataset_name, "progressive_test")
@@ -1014,6 +995,7 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
             
             all_metrics.append({
                 'method': 'progressive_pruning',
+                'trial': trial_num,
                 'epoch': epoch,
                 'stage': 'training',
                 'test_loss': test_loss,
@@ -1036,8 +1018,13 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
             })
     
     # Stop energy tracking
-    energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_progressive_training")
+    energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_progressive_training_trial{trial_num}")
     print(f"\nTraining energy: {energy_metrics['energy_kwh']:.6f} kWh, emissions: {energy_metrics['emissions_kg']:.6f} kg")
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"\nLoaded best model from epoch {best_epoch} (val_loss: {best_val_loss:.4f})")
     
     # Final evaluation
     print("\n" + "="*60)
@@ -1057,14 +1044,17 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
           f"L3={current_channels['layer3']}, L4={current_channels['layer4']}")
     
     # Save final model
-    model_path = os.path.join(save_dir, f"{dataset_name}_progressive_final.pth")
+    model_path = os.path.join(save_dir, f"{dataset_name}_progressive_trial{trial_num}_final.pth")
     torch.save(model.state_dict(), model_path)
     print(f"\nSaved final model to {model_path}")
     
     # Add final metrics with energy
     all_metrics.append({
         'method': 'progressive_pruning',
-        'epoch': total_epochs,
+        'trial': trial_num,
+        'total_epochs': FIXED_EPOCHS,
+        'best_epoch': best_epoch,
+        'best_val_loss': best_val_loss,
         'stage': 'final',
         'test_loss': test_loss,
         'test_acc': test_acc,
@@ -1082,13 +1072,15 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
         'channels_layer2': current_channels['layer2'],
         'channels_layer3': current_channels['layer3'],
         'channels_layer4': current_channels['layer4'],
-        'total_prune_steps': NUM_PRUNE_STEPS,
-        'epochs_between_prunes': epochs_between_prunes,
+        'total_prune_steps': actual_prune_steps,
+        'epochs_between_prunes': EPOCHS_BETWEEN_PRUNES,
+        'dropout': DROPOUT_RATE,
+        'weight_decay': WEIGHT_DECAY,
     })
     
     # Save all metrics
     metrics_df = pd.DataFrame(all_metrics)
-    metrics_path = os.path.join(save_dir, f"{dataset_name}_progressive_all_metrics.csv")
+    metrics_path = os.path.join(save_dir, f"{dataset_name}_progressive_trial{trial_num}_all_metrics.csv")
     metrics_df.to_csv(metrics_path, index=False)
     print(f"Saved progressive metrics to {metrics_path}")
     
@@ -1098,7 +1090,7 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
 # Main execution
 # -------------------------
 def process_dataset(dataset_name, cfg):
-    """Process a single dataset with both training approaches"""
+    """Process a single dataset with both training approaches across multiple trials"""
     print("\n" + "#"*100)
     print(f"# PROCESSING DATASET: {dataset_name.upper()}")
     print("#"*100)
@@ -1112,66 +1104,153 @@ def process_dataset(dataset_name, cfg):
     train_loader, val_loader, test_loader, num_classes = make_loaders(cfg['path'], cfg['batch_size'])
     print(f"Number of classes: {num_classes}")
     
-    # Phase 1: Baseline with regularization
-    baseline_model, baseline_metrics, stability_epoch = train_baseline_with_regularization(
-        dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir
-    )
+    all_baseline_metrics = []
+    all_progressive_metrics = []
     
-    # Clean up
-    del baseline_model
-    cleanup_memory()
+    # Run multiple trials
+    for trial in range(1, NUM_TRIALS + 1):
+        print("\n" + "~"*100)
+        print(f"~ TRIAL {trial}/{NUM_TRIALS}")
+        print("~"*100)
+        
+        # Set different seed for each trial
+        trial_seed = SEED + trial * 100
+        set_seed(trial_seed, deterministic=True)
+        
+        # Phase 1: Baseline with regularization
+        baseline_model, baseline_metrics = train_baseline_with_regularization(
+            dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial
+        )
+        all_baseline_metrics.append(baseline_metrics)
+        
+        # Clean up
+        del baseline_model
+        cleanup_memory()
+        
+        # Phase 2: Progressive pruning
+        progressive_model, progressive_metrics = train_with_progressive_pruning(
+            dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial
+        )
+        all_progressive_metrics.append(progressive_metrics)
+        
+        # Clean up
+        del progressive_model
+        cleanup_memory()
+        
+        print(f"\n✓ Trial {trial} completed")
     
-    # Phase 2: Progressive pruning
-    progressive_model, progressive_metrics = train_with_progressive_pruning(
-        dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, stability_epoch
-    )
+    # Combine all trials
+    all_metrics_df = pd.DataFrame(all_baseline_metrics + all_progressive_metrics)
+    all_metrics_path = os.path.join(save_dir, f"{dataset_name}_all_trials_metrics.csv")
+    all_metrics_df.to_csv(all_metrics_path, index=False)
+    print(f"\nSaved all trials metrics to {all_metrics_path}")
     
-    # Clean up
-    del progressive_model
-    cleanup_memory()
+    # Compute statistics across trials
+    baseline_df = pd.DataFrame(all_baseline_metrics)
+    progressive_df = pd.DataFrame(all_progressive_metrics)
     
-    # Save combined comparison
-    comparison_df = pd.DataFrame([baseline_metrics, progressive_metrics])
-    comparison_path = os.path.join(save_dir, f"{dataset_name}_comparison.csv")
-    comparison_df.to_csv(comparison_path, index=False)
-    print(f"\nSaved comparison to {comparison_path}")
+    # Create summary with mean and std
+    summary_rows = []
     
-    # Print summary
-    print("\n" + "="*100)
-    print("SUMMARY COMPARISON")
-    print("="*100)
-    print(f"{'Metric':<30} {'Baseline':<20} {'Progressive':<20} {'Change':<15}")
-    print("-"*100)
+    # Baseline summary
+    baseline_summary = {
+        'method': 'baseline_regularized',
+        'dataset': dataset_name,
+        'num_trials': NUM_TRIALS,
+        'fixed_epochs': FIXED_EPOCHS,
+    }
+    for col in ['test_acc', 'test_auc', 'test_loss', 'params_m', 'model_size_mb', 'flops_m', 
+                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg', 'best_epoch', 'best_val_loss']:
+        if col in baseline_df.columns:
+            baseline_summary[f'{col}_mean'] = baseline_df[col].mean()
+            baseline_summary[f'{col}_std'] = baseline_df[col].std()
+            baseline_summary[f'{col}_min'] = baseline_df[col].min()
+            baseline_summary[f'{col}_max'] = baseline_df[col].max()
+    summary_rows.append(baseline_summary)
+    
+    # Progressive summary
+    progressive_summary = {
+        'method': 'progressive_pruning',
+        'dataset': dataset_name,
+        'num_trials': NUM_TRIALS,
+        'fixed_epochs': FIXED_EPOCHS,
+    }
+    for col in ['test_acc', 'test_auc', 'test_loss', 'params_m', 'model_size_mb', 'flops_m', 
+                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg', 'best_epoch', 'best_val_loss',
+                'channels_layer1', 'channels_layer2', 'channels_layer3', 'channels_layer4']:
+        if col in progressive_df.columns:
+            progressive_summary[f'{col}_mean'] = progressive_df[col].mean()
+            progressive_summary[f'{col}_std'] = progressive_df[col].std()
+            progressive_summary[f'{col}_min'] = progressive_df[col].min()
+            progressive_summary[f'{col}_max'] = progressive_df[col].max()
+    summary_rows.append(progressive_summary)
+    
+    # Save summary
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(save_dir, f"{dataset_name}_summary_statistics.csv")
+    summary_df.to_csv(summary_path, index=False)
+    print(f"Saved summary statistics to {summary_path}")
+    
+    # Print comparison table
+    print("\n" + "="*120)
+    print(f"SUMMARY COMPARISON - {dataset_name.upper()} ({NUM_TRIALS} trials, {FIXED_EPOCHS} epochs each)")
+    print("="*120)
+    print(f"{'Metric':<30} {'Baseline (Mean±Std)':<35} {'Progressive (Mean±Std)':<35} {'Difference':<20}")
+    print("-"*120)
     
     metrics_to_compare = [
-        ('test_acc', 'Test Accuracy', '{:.4f}'),
-        ('test_auc', 'Test AUC', '{:.4f}'),
-        ('params_m', 'Parameters (M)', '{:.2f}'),
-        ('model_size_mb', 'Model Size (MB)', '{:.2f}'),
-        ('flops_m', 'FLOPs (M)', '{:.2f}'),
-        ('inference_time_ms', 'Inference Time (ms)', '{:.2f}'),
-        ('training_energy_kwh', 'Training Energy (kWh)', '{:.6f}'),
-        ('training_emissions_kg', 'Training Emissions (kg)', '{:.6f}'),
+        ('test_acc', 'Test Accuracy', '{:.4f}', True),
+        ('test_auc', 'Test AUC', '{:.4f}', True),
+        ('test_loss', 'Test Loss', '{:.4f}', False),
+        ('params_m', 'Parameters (M)', '{:.2f}', False),
+        ('model_size_mb', 'Model Size (MB)', '{:.2f}', False),
+        ('flops_m', 'FLOPs (M)', '{:.2f}', False),
+        ('inference_time_ms', 'Inference Time (ms)', '{:.2f}', False),
+        ('training_energy_kwh', 'Training Energy (kWh)', '{:.6f}', False),
+        ('training_emissions_kg', 'Training Emissions (kg)', '{:.6f}', False),
+        ('best_epoch', 'Best Epoch', '{:.1f}', False),
     ]
     
-    for key, name, fmt in metrics_to_compare:
-        base_val = baseline_metrics.get(key, float('nan'))
-        prog_val = progressive_metrics.get(key, float('nan'))
+    for key, name, fmt, higher_better in metrics_to_compare:
+        base_mean = baseline_summary.get(f'{key}_mean', float('nan'))
+        base_std = baseline_summary.get(f'{key}_std', float('nan'))
+        prog_mean = progressive_summary.get(f'{key}_mean', float('nan'))
+        prog_std = progressive_summary.get(f'{key}_std', float('nan'))
         
-        if not math.isnan(base_val) and not math.isnan(prog_val):
+        base_str = f"{fmt.format(base_mean)} ± {fmt.format(base_std)}"
+        prog_str = f"{fmt.format(prog_mean)} ± {fmt.format(prog_std)}"
+        
+        if not math.isnan(base_mean) and not math.isnan(prog_mean):
             if 'acc' in key or 'auc' in key:
-                change = f"{(prog_val - base_val)*100:+.2f}%"
+                diff = (prog_mean - base_mean) * 100
+                diff_str = f"{diff:+.2f}% abs"
             else:
-                pct = ((prog_val - base_val) / base_val) * 100 if base_val != 0 else 0
-                change = f"{pct:+.1f}%"
+                pct = ((prog_mean - base_mean) / base_mean) * 100 if base_mean != 0 else 0
+                diff_str = f"{pct:+.1f}%"
+                
+                # Add indicator for better/worse
+                if higher_better:
+                    indicator = "✓" if prog_mean > base_mean else "✗"
+                else:
+                    indicator = "✓" if prog_mean < base_mean else "✗"
+                diff_str = f"{diff_str} {indicator}"
         else:
-            change = "N/A"
+            diff_str = "N/A"
         
-        print(f"{name:<30} {fmt.format(base_val):<20} {fmt.format(prog_val):<20} {change:<15}")
+        print(f"{name:<30} {base_str:<35} {prog_str:<35} {diff_str:<20}")
     
-    print("="*100)
+    # Channel reduction info
+    print(f"\n{'Final Channel Counts (Progressive)':<30}")
+    for i, stage in enumerate(['layer1', 'layer2', 'layer3', 'layer4']):
+        orig = ORIGINAL_PLANES[i]
+        final_mean = progressive_summary.get(f'channels_{stage}_mean', float('nan'))
+        final_std = progressive_summary.get(f'channels_{stage}_std', float('nan'))
+        reduction = ((orig - final_mean) / orig * 100) if not math.isnan(final_mean) else 0
+        print(f"  {stage}: {orig} → {final_mean:.1f}±{final_std:.1f} ({reduction:.1f}% reduction)")
     
-    return comparison_df
+    print("="*120)
+    
+    return summary_df
 
 def main():
     """Main entry point"""
@@ -1183,15 +1262,19 @@ def main():
     print(f"\nConfiguration:")
     print(f"  Device: {DEVICE}")
     print(f"  Seed: {SEED}")
-    print(f"  Initial LR: {INITIAL_LR}")
-    print(f"  Weight Decay (L2): {WEIGHT_DECAY}")
-    print(f"  Dropout Rate: {DROPOUT_RATE}")
-    print(f"  Early Stopping Patience: {EARLY_STOPPING_PATIENCE}")
-    print(f"  Max Baseline Epochs: {MAX_BASELINE_EPOCHS}")
-    print(f"\n  Progressive Pruning:")
+    print(f"  Number of Trials: {NUM_TRIALS}")
+    print(f"\n  Training Configuration (SAME for both methods):")
+    print(f"    Fixed Epochs: {FIXED_EPOCHS}")
+    print(f"    Initial LR: {INITIAL_LR}")
+    print(f"    Weight Decay (L2): {WEIGHT_DECAY}")
+    print(f"    Dropout Rate: {DROPOUT_RATE}")
+    print(f"    Batch Normalization: True (built-in to ResNet)")
+    print(f"\n  Progressive Pruning Specific:")
     print(f"    Warmup Epochs: {WARMUP_EPOCHS}")
-    print(f"    Prune Percent: {PRUNE_PERCENT*100}%")
+    print(f"    Epochs Between Prunes: {EPOCHS_BETWEEN_PRUNES}")
     print(f"    Number of Prune Steps: {NUM_PRUNE_STEPS}")
+    print(f"    Prune Percent per Step: {PRUNE_PERCENT*100}%")
+    print(f"    Pruning Schedule: epochs {[WARMUP_EPOCHS + 1 + i * EPOCHS_BETWEEN_PRUNES for i in range(NUM_PRUNE_STEPS)]}")
     print(f"    LR Reduction After Prune: {LR_REDUCTION_AFTER_PRUNE}")
     print(f"    Importance Calibration Batches: {IMPORTANCE_CAL_BATCHES}")
     print(f"\n  Datasets: {list(DATASETS.keys())}")
@@ -1203,26 +1286,35 @@ def main():
     os.makedirs(SAVE_DIR_BASE, exist_ok=True)
     
     # Process each dataset
-    all_results = []
+    all_summaries = []
     for dataset_name, cfg in DATASETS.items():
         try:
-            result = process_dataset(dataset_name, cfg)
-            all_results.append(result)
+            summary = process_dataset(dataset_name, cfg)
+            all_summaries.append(summary)
             print(f"\n✓ Successfully completed {dataset_name}")
         except Exception as e:
             print(f"\n✗ Error processing {dataset_name}: {e}")
             import traceback
             traceback.print_exc()
     
-    # Save combined results
-    if all_results:
-        combined_df = pd.concat(all_results, ignore_index=True)
-        combined_path = os.path.join(SAVE_DIR_BASE, "all_datasets_comparison.csv")
-        combined_df.to_csv(combined_path, index=False)
-        print(f"\n\nSaved combined results to {combined_path}")
+    # Save combined summaries
+    if all_summaries:
+        combined_summary = pd.concat(all_summaries, ignore_index=True)
+        combined_path = os.path.join(SAVE_DIR_BASE, "all_datasets_summary.csv")
+        combined_summary.to_csv(combined_path, index=False)
+        print(f"\n\nSaved combined summary to {combined_path}")
     
     print("\n" + "="*100)
     print("EXPERIMENT COMPLETED")
+    print("="*100)
+    print("\nKey Takeaways:")
+    print("  - Both methods trained for exactly {} epochs".format(FIXED_EPOCHS))
+    print("  - Both methods used same regularization: dropout={}, L2={}, batch_norm=True".format(DROPOUT_RATE, WEIGHT_DECAY))
+    print("  - Progressive pruning performed {} pruning steps at epochs {}".format(
+        NUM_PRUNE_STEPS, 
+        [WARMUP_EPOCHS + 1 + i * EPOCHS_BETWEEN_PRUNES for i in range(NUM_PRUNE_STEPS)]
+    ))
+    print("  - Results are averaged over {} trials for statistical reliability".format(NUM_TRIALS))
     print("="*100)
 
 if __name__ == "__main__":
