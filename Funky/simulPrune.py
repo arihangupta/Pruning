@@ -1298,18 +1298,11 @@ def main():
         combined_summary.to_csv(combined_path, index=False)
         print(f"\n\nSaved combined summary to {combined_path}")
     
-    print("\n" + "="*100)
-    print("EXPERIMENT COMPLETED")
-    print("="*100)
-    print("\nKey Takeaways:")
-    print("  - Both methods trained for exactly {} epochs".format(FIXED_EPOCHS))
-    print("  - Both methods used same regularization: L2={}, batch_norm=True, pretrained=ImageNet".format(WEIGHT_DECAY))
     print("  - Progressive pruning performed {} pruning steps at epochs {}".format(
         NUM_PRUNE_STEPS, 
         [WARMUP_EPOCHS + 1 + i * EPOCHS_BETWEEN_PRUNES for i in range(NUM_PRUNE_STEPS)]
     ))
-    print("  - Results are averaged over {} trials for statistical reliability".format(NUM_TRIALS))
-    print("="*100)
+    print("  ")
 
 if __name__ == "__main__":
     main()
