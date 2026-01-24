@@ -725,11 +725,11 @@ def stop_energy_tracker(tracker, save_dir, project_name):
 def train_baseline_with_regularization(dataset_name, train_loader, val_loader, test_loader, 
                                       num_classes, save_dir, trial_num):
     """
-    Phase 1: Train baseline model with L2 regularization and batch normalization
+    Phase 2: Train baseline model with L2 regularization and batch normalization (TRAINED SECOND)
     All models train for exactly FIXED_EPOCHS epochs
     """
     print("\n" + "="*80)
-    print(f"PHASE 1: BASELINE WITH REGULARIZATION - {dataset_name.upper()} - TRIAL {trial_num}/{NUM_TRIALS}")
+    print(f"PHASE 2: BASELINE WITH REGULARIZATION - {dataset_name.upper()} - TRIAL {trial_num}/{NUM_TRIALS}")
     print("="*80)
     
     # Build model with pretrained ImageNet weights (batch normalization is built into ResNet)
@@ -842,12 +842,12 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
 def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_loader, 
                                   num_classes, save_dir, trial_num):
     """
-    Phase 2: Train with progressive channel pruning during training
+    Phase 1: Train with progressive channel pruning during training (TRAINED FIRST for easier debugging)
     Uses same regularization as baseline: L2, batch normalization
     Fixed schedule: 15 epochs total, prune at epochs 5, 8, 11, 14 (every 3 epochs after warmup)
     """
     print("\n" + "="*80)
-    print(f"PHASE 2: PROGRESSIVE PRUNING DURING TRAINING - {dataset_name.upper()} - TRIAL {trial_num}/{NUM_TRIALS}")
+    print(f"PHASE 1: PROGRESSIVE PRUNING DURING TRAINING - {dataset_name.upper()} - TRIAL {trial_num}/{NUM_TRIALS}")
     print("="*80)
     
     # Calculate pruning schedule
@@ -1111,17 +1111,7 @@ def process_dataset(dataset_name, cfg):
         trial_seed = SEED + trial * 100
         set_seed(trial_seed, deterministic=True)
         
-        # Phase 1: Baseline with regularization
-        baseline_model, baseline_metrics = train_baseline_with_regularization(
-            dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial
-        )
-        all_baseline_metrics.append(baseline_metrics)
-        
-        # Clean up
-        del baseline_model
-        cleanup_memory()
-        
-        # Phase 2: Progressive pruning
+        # Phase 1: Progressive pruning (train first for easier debugging)
         progressive_model, progressive_metrics = train_with_progressive_pruning(
             dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial
         )
@@ -1129,6 +1119,16 @@ def process_dataset(dataset_name, cfg):
         
         # Clean up
         del progressive_model
+        cleanup_memory()
+        
+        # Phase 2: Baseline with regularization
+        baseline_model, baseline_metrics = train_baseline_with_regularization(
+            dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial
+        )
+        all_baseline_metrics.append(baseline_metrics)
+        
+        # Clean up
+        del baseline_model
         cleanup_memory()
         
         print(f"\n✓ Trial {trial} completed")
@@ -1297,12 +1297,7 @@ def main():
         combined_path = os.path.join(SAVE_DIR_BASE, "all_datasets_summary.csv")
         combined_summary.to_csv(combined_path, index=False)
         print(f"\n\nSaved combined summary to {combined_path}")
-    
-    print("  - Progressive pruning performed {} pruning steps at epochs {}".format(
-        NUM_PRUNE_STEPS, 
-        [WARMUP_EPOCHS + 1 + i * EPOCHS_BETWEEN_PRUNES for i in range(NUM_PRUNE_STEPS)]
-    ))
-    print("  ")
+   
 
 if __name__ == "__main__":
     main()
