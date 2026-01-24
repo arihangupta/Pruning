@@ -71,7 +71,7 @@ FIXED_EPOCHS = 15  # Fixed number of epochs for ALL training (baseline and progr
 # Progressive pruning configuration
 WARMUP_EPOCHS = 2  # Train normally before first prune
 EPOCHS_BETWEEN_PRUNES = 3  # Fixed interval between pruning steps
-NUM_PRUNE_STEPS = 4  # Number of pruning iterations (epochs 5, 8, 11, 14)
+NUM_PRUNE_STEPS = 4  # Number of pruning iterations (epochs 3, 6, 9, 12)
 PRUNE_PERCENT = 0.10  # Remove 10% of channels each time
 LR_REDUCTION_AFTER_PRUNE = 0.5  # Multiply LR by this after each prune
 
@@ -742,9 +742,6 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
     
     # Track metrics
     history = []
-    best_val_loss = float('inf')
-    best_model_state = None
-    best_epoch = 0
     
     # Start energy tracking
     tracker = start_energy_tracker(save_dir, f"{dataset_name}_baseline_training_trial{trial_num}")
@@ -760,16 +757,13 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
         # Validate
         val_loss, val_acc, val_auc = evaluate(model, val_loader, dataset_name, "baseline_val")
         
+        # Test (for per-epoch tracking)
+        test_loss, test_acc, test_auc = evaluate(model, test_loader, dataset_name, "baseline_test")
+        
         print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
         print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
         
-        # Track best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_state = copy.deepcopy(model.state_dict())
-            best_epoch = epoch
-        
-        # Record metrics
+        # Record metrics for all epochs
         history.append({
             'trial': trial_num,
             'epoch': epoch,
@@ -777,17 +771,18 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
             'train_acc': train_acc,
             'val_loss': val_loss,
             'val_acc': val_acc,
-            'val_auc': val_auc
+            'val_auc': val_auc,
+            'test_loss': test_loss,
+            'test_acc': test_acc,
+            'test_auc': test_auc,
         })
     
     # Stop energy tracking
     energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_baseline_training_trial{trial_num}")
     print(f"\nTraining energy: {energy_metrics['energy_kwh']:.6f} kWh, emissions: {energy_metrics['emissions_kg']:.6f} kg")
     
-    # Load best model
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print(f"\nLoaded best model from epoch {best_epoch} (val_loss: {best_val_loss:.4f})")
+    # Use the LAST model (no best model loading - size is paramount)
+    print("\nUsing final model from last epoch (epoch 15)")
     
     # Final evaluation on test set
     test_loss, test_acc, test_auc = evaluate(model, test_loader, dataset_name, "baseline_test")
@@ -816,8 +811,6 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
         'method': 'baseline_regularized',
         'trial': trial_num,
         'total_epochs': FIXED_EPOCHS,
-        'best_epoch': best_epoch,
-        'best_val_loss': best_val_loss,
         'test_loss': test_loss,
         'test_acc': test_acc,
         'test_auc': test_auc,
@@ -851,8 +844,8 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
     print("="*80)
     
     # Calculate pruning schedule
-    # Warmup: epochs 1-2, then prune at 5, 8, 11, 14
-    prune_epochs = [WARMUP_EPOCHS + 1 + i * EPOCHS_BETWEEN_PRUNES for i in range(NUM_PRUNE_STEPS)]
+    # Warmup: epochs 1-2, then prune at 3, 6, 9, 12
+    prune_epochs = [WARMUP_EPOCHS + i * EPOCHS_BETWEEN_PRUNES for i in range(1, NUM_PRUNE_STEPS + 1)]
     # Ensure we don't prune beyond FIXED_EPOCHS
     prune_epochs = [e for e in prune_epochs if e <= FIXED_EPOCHS]
     actual_prune_steps = len(prune_epochs)
@@ -873,11 +866,8 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
     # Track current channel counts
     current_channels = {s: ORIGINAL_PLANES[i] for i, s in enumerate(STAGES)}
     
-    # Track all metrics
+    # Track all metrics (including per-epoch val metrics)
     all_metrics = []
-    best_val_loss = float('inf')
-    best_model_state = None
-    best_epoch = 0
     
     # Start energy tracking
     tracker = start_energy_tracker(save_dir, f"{dataset_name}_progressive_training_trial{trial_num}")
@@ -948,12 +938,14 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
                 'trial': trial_num,
                 'epoch': epoch,
                 'stage': f'post_prune_step_{prune_step}',
-                'test_loss': test_loss,
-                'test_acc': test_acc,
-                'test_auc': test_auc,
+                'train_loss': None,
+                'train_acc': None,
                 'val_loss': val_loss,
                 'val_acc': val_acc,
                 'val_auc': val_auc,
+                'test_loss': test_loss,
+                'test_acc': test_acc,
+                'test_auc': test_auc,
                 'params_m': params_m,
                 'model_size_mb': size_mb,
                 'flops': flops,
@@ -974,52 +966,45 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
         print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
         print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
         
-        # Track best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_state = copy.deepcopy(model.state_dict())
-            best_epoch = epoch
+        # Record metrics for all epochs (including pruning epochs)
+        test_loss, test_acc, test_auc = evaluate(model, test_loader, dataset_name, "progressive_test")
+        params_m = count_parameters(model)
+        size_mb = model_size_mb(model)
+        flops = compute_flops(model)
+        inf_time, peak_ram = inference_time_per_batch(model, test_loader)
         
-        # Record metrics for regular training epochs
-        if epoch not in prune_epochs:
-            test_loss, test_acc, test_auc = evaluate(model, test_loader, dataset_name, "progressive_test")
-            params_m = count_parameters(model)
-            size_mb = model_size_mb(model)
-            flops = compute_flops(model)
-            inf_time, peak_ram = inference_time_per_batch(model, test_loader)
-            
-            all_metrics.append({
-                'method': 'progressive_pruning',
-                'trial': trial_num,
-                'epoch': epoch,
-                'stage': 'training',
-                'test_loss': test_loss,
-                'test_acc': test_acc,
-                'test_auc': test_auc,
-                'val_loss': val_loss,
-                'val_acc': val_acc,
-                'val_auc': val_auc,
-                'params_m': params_m,
-                'model_size_mb': size_mb,
-                'flops': flops,
-                'flops_m': flops / 1e6,
-                'inference_time_ms': inf_time * 1000,
-                'peak_ram_mb': peak_ram,
-                'channels_layer1': current_channels['layer1'],
-                'channels_layer2': current_channels['layer2'],
-                'channels_layer3': current_channels['layer3'],
-                'channels_layer4': current_channels['layer4'],
-                'learning_rate': current_lr,
-            })
+        all_metrics.append({
+            'method': 'progressive_pruning',
+            'trial': trial_num,
+            'epoch': epoch,
+            'stage': 'after_training' if epoch in prune_epochs else 'training',
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'val_auc': val_auc,
+            'test_loss': test_loss,
+            'test_acc': test_acc,
+            'test_auc': test_auc,
+            'params_m': params_m,
+            'model_size_mb': size_mb,
+            'flops': flops,
+            'flops_m': flops / 1e6,
+            'inference_time_ms': inf_time * 1000,
+            'peak_ram_mb': peak_ram,
+            'channels_layer1': current_channels['layer1'],
+            'channels_layer2': current_channels['layer2'],
+            'channels_layer3': current_channels['layer3'],
+            'channels_layer4': current_channels['layer4'],
+            'learning_rate': current_lr,
+        })
     
     # Stop energy tracking
     energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_progressive_training_trial{trial_num}")
     print(f"\nTraining energy: {energy_metrics['energy_kwh']:.6f} kWh, emissions: {energy_metrics['emissions_kg']:.6f} kg")
     
-    # Load best model
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print(f"\nLoaded best model from epoch {best_epoch} (val_loss: {best_val_loss:.4f})")
+    # Use the LAST model (no best model loading - size is paramount)
+    print("\nUsing final model from last epoch (epoch 15)")
     
     # Final evaluation
     print("\n" + "="*60)
@@ -1048,9 +1033,12 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
         'method': 'progressive_pruning',
         'trial': trial_num,
         'total_epochs': FIXED_EPOCHS,
-        'best_epoch': best_epoch,
-        'best_val_loss': best_val_loss,
         'stage': 'final',
+        'train_loss': None,
+        'train_acc': None,
+        'val_loss': None,
+        'val_acc': None,
+        'val_auc': None,
         'test_loss': test_loss,
         'test_acc': test_acc,
         'test_auc': test_auc,
@@ -1154,7 +1142,7 @@ def process_dataset(dataset_name, cfg):
         'fixed_epochs': FIXED_EPOCHS,
     }
     for col in ['test_acc', 'test_auc', 'test_loss', 'params_m', 'model_size_mb', 'flops_m', 
-                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg', 'best_epoch', 'best_val_loss']:
+                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg']:
         if col in baseline_df.columns:
             baseline_summary[f'{col}_mean'] = baseline_df[col].mean()
             baseline_summary[f'{col}_std'] = baseline_df[col].std()
@@ -1170,7 +1158,7 @@ def process_dataset(dataset_name, cfg):
         'fixed_epochs': FIXED_EPOCHS,
     }
     for col in ['test_acc', 'test_auc', 'test_loss', 'params_m', 'model_size_mb', 'flops_m', 
-                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg', 'best_epoch', 'best_val_loss',
+                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg',
                 'channels_layer1', 'channels_layer2', 'channels_layer3', 'channels_layer4']:
         if col in progressive_df.columns:
             progressive_summary[f'{col}_mean'] = progressive_df[col].mean()
@@ -1202,7 +1190,6 @@ def process_dataset(dataset_name, cfg):
         ('inference_time_ms', 'Inference Time (ms)', '{:.2f}', False),
         ('training_energy_kwh', 'Training Energy (kWh)', '{:.6f}', False),
         ('training_emissions_kg', 'Training Emissions (kg)', '{:.6f}', False),
-        ('best_epoch', 'Best Epoch', '{:.1f}', False),
     ]
     
     for key, name, fmt, higher_better in metrics_to_compare:
@@ -1268,7 +1255,7 @@ def main():
     print(f"    Epochs Between Prunes: {EPOCHS_BETWEEN_PRUNES}")
     print(f"    Number of Prune Steps: {NUM_PRUNE_STEPS}")
     print(f"    Prune Percent per Step: {PRUNE_PERCENT*100}%")
-    print(f"    Pruning Schedule: epochs {[WARMUP_EPOCHS + 1 + i * EPOCHS_BETWEEN_PRUNES for i in range(NUM_PRUNE_STEPS)]}")
+    print(f"    Pruning Schedule: epochs {[WARMUP_EPOCHS + i * EPOCHS_BETWEEN_PRUNES for i in range(1, NUM_PRUNE_STEPS + 1)]}")
     print(f"    LR Reduction After Prune: {LR_REDUCTION_AFTER_PRUNE}")
     print(f"    Importance Calibration Batches: {IMPORTANCE_CAL_BATCHES}")
     print(f"\n  Datasets: {list(DATASETS.keys())}")
@@ -1297,7 +1284,19 @@ def main():
         combined_path = os.path.join(SAVE_DIR_BASE, "all_datasets_summary.csv")
         combined_summary.to_csv(combined_path, index=False)
         print(f"\n\nSaved combined summary to {combined_path}")
-   
+    
+    print("\n" + "="*100)
+    print("EXPERIMENT COMPLETED")
+    print("="*100)
+    print("\nKey Takeaways:")
+    print("  - Both methods trained for exactly {} epochs".format(FIXED_EPOCHS))
+    print("  - Both methods used same regularization: L2={}, batch_norm=True, pretrained=ImageNet".format(WEIGHT_DECAY))
+    print("  - Progressive pruning performed {} pruning steps at epochs {}".format(
+        NUM_PRUNE_STEPS, 
+        [WARMUP_EPOCHS + i * EPOCHS_BETWEEN_PRUNES for i in range(1, NUM_PRUNE_STEPS + 1)]
+    ))
+    print("  - Results are averaged over {} trials for statistical reliability".format(NUM_TRIALS))
+    print("="*100)
 
 if __name__ == "__main__":
     main()
