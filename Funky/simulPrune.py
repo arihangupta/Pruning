@@ -42,7 +42,7 @@ except ImportError:
 # -------------------------
 # Configuration
 # -------------------------
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/progressive_pruning_results_three"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/progressive_pruning_results"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
@@ -85,7 +85,7 @@ TARGET_PRUNED_CHANNELS = {
 }
 
 # Experimental configuration
-NUM_TRIALS = 3  # Number of trials per dataset for statistical reliability
+NUM_TRIALS = 1  # Number of trials per dataset for statistical reliability
 
 # Importance calculation
 IMPORTANCE_CAL_BATCHES = 50  # Batches to use for importance scoring
@@ -749,8 +749,11 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
     optimizer = optim.Adam(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
     print(f"Optimizer: Adam(lr={INITIAL_LR}, weight_decay={WEIGHT_DECAY})")
     
-    # Track metrics
+    # Track metrics and best model
     history = []
+    best_val_acc = 0.0
+    best_model_state = None
+    best_epoch = 0
     
     # Start energy tracking
     tracker = start_energy_tracker(save_dir, f"{dataset_name}_baseline_training_trial{trial_num}")
@@ -772,6 +775,13 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
         print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
         print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
         
+        # Track best model based on validation accuracy
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
+            print(f"  ✓ New best validation accuracy: {val_acc:.4f}")
+        
         # Record metrics for all epochs
         history.append({
             'trial': trial_num,
@@ -790,8 +800,10 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
     energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_baseline_training_trial{trial_num}")
     print(f"\nTraining energy: {energy_metrics['energy_kwh']:.6f} kWh, emissions: {energy_metrics['emissions_kg']:.6f} kg")
     
-    # Use the LAST model (no best model loading - size is paramount)
-    print("\nUsing final model from last epoch (epoch 15)")
+    # Load best model based on validation accuracy
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"\n✓ Loaded best model from epoch {best_epoch} (val_acc: {best_val_acc:.4f})")
     
     # Final evaluation on test set
     test_loss, test_acc, test_auc = evaluate(model, test_loader, dataset_name, "baseline_test")
@@ -820,6 +832,8 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
         'method': 'baseline_regularized',
         'trial': trial_num,
         'total_epochs': FIXED_EPOCHS,
+        'best_epoch': best_epoch,
+        'best_val_acc': best_val_acc,
         'test_loss': test_loss,
         'test_acc': test_acc,
         'test_auc': test_auc,
@@ -875,8 +889,11 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
     # Track current channel counts
     current_channels = {s: ORIGINAL_PLANES[i] for i, s in enumerate(STAGES)}
     
-    # Track all metrics (including per-epoch val metrics)
+    # Track all metrics (including per-epoch val metrics) and best model
     all_metrics = []
+    best_val_acc = 0.0
+    best_model_state = None
+    best_epoch = 0
     
     # Start energy tracking
     tracker = start_energy_tracker(save_dir, f"{dataset_name}_progressive_training_trial{trial_num}")
@@ -975,6 +992,13 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
         print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
         print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
         
+        # Track best model based on validation accuracy
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
+            print(f"  ✓ New best validation accuracy: {val_acc:.4f}")
+        
         # Record metrics for all epochs (including pruning epochs)
         test_loss, test_acc, test_auc = evaluate(model, test_loader, dataset_name, "progressive_test")
         params_m = count_parameters(model)
@@ -1012,8 +1036,10 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
     energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_progressive_training_trial{trial_num}")
     print(f"\nTraining energy: {energy_metrics['energy_kwh']:.6f} kWh, emissions: {energy_metrics['emissions_kg']:.6f} kg")
     
-    # Use the LAST model (no best model loading - size is paramount)
-    print("\nUsing final model from last epoch (epoch 15)")
+    # Load best model based on validation accuracy
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"\n✓ Loaded best model from epoch {best_epoch} (val_acc: {best_val_acc:.4f})")
     
     # Final evaluation
     print("\n" + "="*60)
@@ -1042,6 +1068,8 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
         'method': 'progressive_pruning',
         'trial': trial_num,
         'total_epochs': FIXED_EPOCHS,
+        'best_epoch': best_epoch,
+        'best_val_acc': best_val_acc,
         'stage': 'final',
         'train_loss': None,
         'train_acc': None,
@@ -1144,8 +1172,11 @@ def train_prune_then_finetune(dataset_name, train_loader, val_loader, test_loade
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
     
-    # Track all metrics
+    # Track all metrics and best model
     all_metrics = []
+    best_val_acc = 0.0
+    best_model_state = None
+    best_epoch = 0
     
     # Train for fixed epochs
     for epoch in range(1, FIXED_EPOCHS + 1):
@@ -1162,6 +1193,13 @@ def train_prune_then_finetune(dataset_name, train_loader, val_loader, test_loade
         
         print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
         print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
+        
+        # Track best model based on validation accuracy
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
+            print(f"  ✓ New best validation accuracy: {val_acc:.4f}")
         
         # Compute metrics
         params_m = count_parameters(model)
@@ -1200,8 +1238,10 @@ def train_prune_then_finetune(dataset_name, train_loader, val_loader, test_loade
     energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_prune_then_train_trial{trial_num}")
     print(f"\nTotal energy (pruning + training): {energy_metrics['energy_kwh']:.6f} kWh, emissions: {energy_metrics['emissions_kg']:.6f} kg")
     
-    # Use the LAST model (no best model loading - size is paramount)
-    print("\nUsing final model from last epoch (epoch 15)")
+    # Load best model based on validation accuracy
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"\n✓ Loaded best model from epoch {best_epoch} (val_acc: {best_val_acc:.4f})")
     
     # Final evaluation
     print("\n" + "="*60)
@@ -1230,6 +1270,8 @@ def train_prune_then_finetune(dataset_name, train_loader, val_loader, test_loade
         'method': 'prune_then_train',
         'trial': trial_num,
         'total_epochs': FIXED_EPOCHS,
+        'best_epoch': best_epoch,
+        'best_val_acc': best_val_acc,
         'stage': 'final',
         'train_loss': None,
         'train_acc': None,
@@ -1349,7 +1391,7 @@ def process_dataset(dataset_name, cfg):
         'fixed_epochs': FIXED_EPOCHS,
     }
     for col in ['test_acc', 'test_auc', 'test_loss', 'params_m', 'model_size_mb', 'flops_m', 
-                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg']:
+                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg', 'best_epoch', 'best_val_acc']:
         if col in baseline_df.columns:
             baseline_summary[f'{col}_mean'] = baseline_df[col].mean()
             baseline_summary[f'{col}_std'] = baseline_df[col].std()
@@ -1365,7 +1407,7 @@ def process_dataset(dataset_name, cfg):
         'fixed_epochs': FIXED_EPOCHS,
     }
     for col in ['test_acc', 'test_auc', 'test_loss', 'params_m', 'model_size_mb', 'flops_m', 
-                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg',
+                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg', 'best_epoch', 'best_val_acc',
                 'channels_layer1', 'channels_layer2', 'channels_layer3', 'channels_layer4']:
         if col in progressive_df.columns:
             progressive_summary[f'{col}_mean'] = progressive_df[col].mean()
@@ -1382,7 +1424,7 @@ def process_dataset(dataset_name, cfg):
         'fixed_epochs': FIXED_EPOCHS,
     }
     for col in ['test_acc', 'test_auc', 'test_loss', 'params_m', 'model_size_mb', 'flops_m', 
-                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg',
+                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg', 'best_epoch', 'best_val_acc',
                 'channels_layer1', 'channels_layer2', 'channels_layer3', 'channels_layer4']:
         if col in prune_then_train_df.columns:
             prune_then_train_summary[f'{col}_mean'] = prune_then_train_df[col].mean()
@@ -1519,6 +1561,7 @@ def main():
     print("\nKey Takeaways:")
     print("  - All three methods trained for exactly {} epochs".format(FIXED_EPOCHS))
     print("  - All methods used same regularization: L2={}, batch_norm=True, pretrained=ImageNet".format(WEIGHT_DECAY))
+    print("  - All methods saved BEST validation accuracy model (not last epoch)")
     print("\n  Method 1 - Baseline:")
     print("    Full ResNet50, no pruning")
     print("\n  Method 2 - Progressive Pruning:")
