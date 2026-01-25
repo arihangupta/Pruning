@@ -62,7 +62,7 @@ IMPORTANCE_CAL_BATCHES = 50
 # These will be calculated dynamically based on model architecture
 
 # Experimental configuration (MATCHING CNN SCRIPT)
-NUM_TRIALS = 3
+NUM_TRIALS = 1
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
