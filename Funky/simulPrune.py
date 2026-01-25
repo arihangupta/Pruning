@@ -550,18 +550,18 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
     for epoch in range(1, FIXED_EPOCHS + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, epoch, True, L1_LAMBDA)
         val_loss, val_acc, val_auc = evaluate(model, val_loader)
-        test_loss, test_acc, test_auc = evaluate(model, test_loader)
         
-        print(f"  Epoch {epoch}: val_acc={val_acc:.4f} val_auc={val_auc:.4f} | test_acc={test_acc:.4f} test_auc={test_auc:.4f}")
+        print(f"  Epoch {epoch}: val_acc={val_acc:.4f} val_auc={val_auc:.4f}")
         
         history.append({'trial': trial_num, 'epoch': epoch, 'train_loss': train_loss, 'train_acc': train_acc,
-                       'val_loss': val_loss, 'val_acc': val_acc, 'val_auc': val_auc,
-                       'test_loss': test_loss, 'test_acc': test_acc, 'test_auc': test_auc})
+                       'val_loss': val_loss, 'val_acc': val_acc, 'val_auc': val_auc})
         
         # Save incrementally for live monitoring
         pd.DataFrame(history).to_csv(os.path.join(save_dir, f"{dataset_name}_baseline_trial{trial_num}_training_history.csv"), index=False)
     
     energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_baseline_training_trial{trial_num}")
+    
+    # ONLY evaluate test set after all training is complete
     test_loss, test_acc, test_auc = evaluate(model, test_loader)
     params_m = count_parameters(model)
     size_mb = model_size_mb(model)
@@ -601,30 +601,26 @@ def train_prune_then_train(dataset_name, train_loader, val_loader, test_loader, 
     del initial_model
     cleanup_memory()
     
-    pre_train_loss, pre_train_acc, pre_train_auc = evaluate(pruned_model, test_loader)
-    print(f"  Pre-training: test_acc={pre_train_acc:.4f}")
-    
     optimizer = optim.Adam(pruned_model.parameters(), lr=INITIAL_LR, weight_decay=0.0)
-    history = [{'trial': trial_num, 'epoch': 0, 'stage': 'pre_training',
-                'test_loss': pre_train_loss, 'test_acc': pre_train_acc, 'test_auc': pre_train_auc}]
+    history = []
     tracker = start_energy_tracker(save_dir, f"{dataset_name}_prune_then_train_trial{trial_num}")
     
     for epoch in range(1, FIXED_EPOCHS + 1):
         train_loss, train_acc = train_one_epoch(pruned_model, train_loader, optimizer, epoch, True, L1_LAMBDA)
         val_loss, val_acc, val_auc = evaluate(pruned_model, val_loader)
-        test_loss, test_acc, test_auc = evaluate(pruned_model, test_loader)
         
-        print(f"  Epoch {epoch}: val_acc={val_acc:.4f} val_auc={val_auc:.4f} | test_acc={test_acc:.4f} test_auc={test_auc:.4f}")
+        print(f"  Epoch {epoch}: val_acc={val_acc:.4f} val_auc={val_auc:.4f}")
         
         history.append({'trial': trial_num, 'epoch': epoch, 'stage': 'training',
                        'train_loss': train_loss, 'train_acc': train_acc,
-                       'val_loss': val_loss, 'val_acc': val_acc, 'val_auc': val_auc,
-                       'test_loss': test_loss, 'test_acc': test_acc, 'test_auc': test_auc})
+                       'val_loss': val_loss, 'val_acc': val_acc, 'val_auc': val_auc})
         
         # Save incrementally for live monitoring
         pd.DataFrame(history).to_csv(os.path.join(save_dir, f"{dataset_name}_prune_then_train_trial{trial_num}_history.csv"), index=False)
     
     energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_prune_then_train_trial{trial_num}")
+    
+    # ONLY evaluate test set after all training is complete
     test_loss, test_acc, test_auc = evaluate(pruned_model, test_loader)
     params_m = count_parameters(pruned_model)
     size_mb = model_size_mb(pruned_model)
@@ -686,23 +682,20 @@ def train_progressive(dataset_name, train_loader, val_loader, test_loader, num_c
             optimizer = optim.Adam(model.parameters(), lr=current_lr, weight_decay=0.0)
             
             val_loss, val_acc, val_auc = evaluate(model, val_loader)
-            test_loss, test_acc, test_auc = evaluate(model, test_loader)
-            print(f"  Prune step {prune_step}: channels={list(current_channels.values())} | val_acc={val_acc:.4f} test_acc={test_acc:.4f}")
+            print(f"  Prune step {prune_step}: channels={list(current_channels.values())} | val_acc={val_acc:.4f}")
             
             torch.save(model.state_dict(), os.path.join(save_dir, f"{dataset_name}_progressive_{suffix}_trial{trial_num}_epoch{epoch}_postprune.pth"))
         
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, epoch, use_l1, L1_LAMBDA)
         val_loss, val_acc, val_auc = evaluate(model, val_loader)
-        test_loss, test_acc, test_auc = evaluate(model, test_loader)
         
-        print(f"  Epoch {epoch}: val_acc={val_acc:.4f} val_auc={val_auc:.4f} | test_acc={test_acc:.4f} test_auc={test_auc:.4f}")
+        print(f"  Epoch {epoch}: val_acc={val_acc:.4f} val_auc={val_auc:.4f}")
         
         all_metrics.append({
             'method': f'progressive_pruning_{"with_reg" if use_l1 else "no_reg"}',
             'trial': trial_num, 'epoch': epoch,
             'train_loss': train_loss, 'train_acc': train_acc,
             'val_loss': val_loss, 'val_acc': val_acc, 'val_auc': val_auc,
-            'test_loss': test_loss, 'test_acc': test_acc, 'test_auc': test_auc,
             'channels_layer1': current_channels['layer1'], 'channels_layer2': current_channels['layer2'],
             'channels_layer3': current_channels['layer3'], 'channels_layer4': current_channels['layer4'],
             'learning_rate': current_lr
@@ -712,6 +705,8 @@ def train_progressive(dataset_name, train_loader, val_loader, test_loader, num_c
         pd.DataFrame(all_metrics).to_csv(os.path.join(save_dir, f"{dataset_name}_progressive_{suffix}_trial{trial_num}_all_metrics.csv"), index=False)
     
     energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_progressive_{suffix}_trial{trial_num}")
+    
+    # ONLY evaluate test set after all training is complete
     test_loss, test_acc, test_auc = evaluate(model, test_loader)
     params_m = count_parameters(model)
     size_mb = model_size_mb(model)
