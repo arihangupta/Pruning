@@ -36,7 +36,7 @@ except ImportError:
 # ==================== CONFIGURATION ====================
 
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
-SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/vit_structured_pruning"
+SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/vit_structured_pruning"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
