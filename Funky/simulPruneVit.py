@@ -58,6 +58,9 @@ LR_REDUCTION_AFTER_PRUNE = 0.5
 L1_LAMBDA = 1e-4  # Sparsity penalty
 IMPORTANCE_CAL_BATCHES = 50
 
+# Calculate pruning schedule: [3, 6, 9, 12]
+PRUNE_EPOCHS_SCHEDULE = [WARMUP_EPOCHS + 1 + i * EPOCHS_BETWEEN_PRUNES for i in range(NUM_PRUNE_STEPS)]
+
 # Prune-then-train configuration (target dimensions after 4 prunes)
 # These will be calculated dynamically based on model architecture
 
@@ -264,7 +267,13 @@ def evaluate_model(net, test_loader, device):
 # ==================== PRUNABLE VIT WITH TIMM ====================
 
 class PrunableViTWrapper(nn.Module):
-    """Wrapper around TIMM ViT models to add learnable importance scores"""
+    """
+    Wrapper around TIMM ViT models to add learnable importance scores
+    Importance scores are used for:
+    1. L1 regularization during training (encourages sparsity)
+    2. Determining which dimensions to prune
+    They are NOT applied during forward pass (no hooks)
+    """
     def __init__(self, base_model):
         super().__init__()
         self.base_model = base_model
@@ -274,7 +283,7 @@ class PrunableViTWrapper(nn.Module):
         self.hidden_dim = base_model.embed_dim
         self.num_heads = base_model.blocks[0].attn.num_heads
         
-        # Add learnable importance scores
+        # Add learnable importance scores (for ranking only)
         self.head_importance = nn.ParameterList([
             nn.Parameter(torch.ones(self.num_heads))
             for _ in range(self.num_layers)
@@ -287,41 +296,16 @@ class PrunableViTWrapper(nn.Module):
         
         # For FFN (MLP) importance
         mlp_hidden_dim = base_model.blocks[0].mlp.fc1.out_features
+        self.mlp_hidden_dim = mlp_hidden_dim
         self.mlp_importance = nn.ParameterList([
             nn.Parameter(torch.ones(mlp_hidden_dim))
             for _ in range(self.num_layers)
         ])
         
-        # Register hooks
-        self._register_importance_hooks()
-    
-    def _register_importance_hooks(self):
-        """Register forward hooks to apply importance scores"""
-        for i, block in enumerate(self.base_model.blocks):
-            # Hook for attention
-            def make_attn_hook(layer_idx):
-                def hook(module, input, output):
-                    B, N, C = output.shape
-                    num_heads = self.num_heads
-                    head_dim = C // num_heads
-                    
-                    output_reshaped = output.view(B, N, num_heads, head_dim)
-                    head_weights = self.head_importance[layer_idx].view(1, 1, num_heads, 1)
-                    output_weighted = output_reshaped * head_weights
-                    
-                    return output_weighted.view(B, N, C)
-                return hook
-            
-            # Hook for MLP
-            def make_mlp_hook(layer_idx):
-                def hook(module, input, output):
-                    return output * self.mlp_importance[layer_idx].view(1, 1, -1)
-                return hook
-            
-            block.attn.proj.register_forward_hook(make_attn_hook(i))
-            block.mlp.fc2.register_forward_hook(make_mlp_hook(i))
+        print(f"  Importance tracking: {self.num_heads} heads, {self.hidden_dim} embed dims, {mlp_hidden_dim} mlp dims per layer")
     
     def forward(self, x):
+        """Standard forward pass - no masking applied"""
         return self.base_model(x)
     
     def get_importance_scores(self):
@@ -333,7 +317,10 @@ class PrunableViTWrapper(nn.Module):
         }
     
     def apply_mask(self, mask_dict):
-        """Apply binary masks to prune dimensions"""
+        """
+        Apply binary masks to prune dimensions
+        This zeros out the importance scores for pruned dimensions
+        """
         if 'heads' in mask_dict:
             for i, mask in enumerate(mask_dict['heads']):
                 self.head_importance[i].data *= mask
@@ -609,7 +596,7 @@ def train_progressive_pruning_vit(dataset_name, model_name, train_loader, val_lo
     print("="*80)
     
     # Pruning schedule
-    prune_epochs = [WARMUP_EPOCHS + i * EPOCHS_BETWEEN_PRUNES for i in range(1, NUM_PRUNE_STEPS + 1)]
+    prune_epochs = PRUNE_EPOCHS_SCHEDULE.copy()
     print(f"Fixed schedule: {FIXED_EPOCHS} epochs total")
     print(f"Pruning at epochs: {prune_epochs}")
     
@@ -1067,7 +1054,7 @@ def main():
     print(f"\nConfiguration:")
     print(f"  Device: {DEVICE}")
     print(f"  Fixed Epochs: {FIXED_EPOCHS}")
-    print(f"  Pruning Schedule: {[WARMUP_EPOCHS + i * EPOCHS_BETWEEN_PRUNES for i in range(1, NUM_PRUNE_STEPS + 1)]}")
+    print(f"  Pruning Schedule: {PRUNE_EPOCHS_SCHEDULE}")
     print(f"  Number of Trials: {NUM_TRIALS}")
     print(f"\n  Method 1: Baseline (No pruning)")
     print(f"  Method 2: Progressive Pruning (Prune at epochs 3, 6, 9, 12)")

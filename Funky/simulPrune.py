@@ -42,7 +42,7 @@ except ImportError:
 # -------------------------
 # Configuration
 # -------------------------
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/progressive_pruning_results_CNN"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/progressive_pruning_results"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
@@ -74,6 +74,10 @@ EPOCHS_BETWEEN_PRUNES = 3  # Fixed interval between pruning steps
 NUM_PRUNE_STEPS = 4  # Number of pruning iterations (epochs 3, 6, 9, 12)
 PRUNE_PERCENT = 0.10  # Remove 10% of channels each time
 LR_REDUCTION_AFTER_PRUNE = 0.5  # Multiply LR by this after each prune
+
+# Calculate pruning schedule: [3, 6, 9, 12]
+# Formula: warmup + 1, then add EPOCHS_BETWEEN_PRUNES for each subsequent prune
+PRUNE_EPOCHS_SCHEDULE = [WARMUP_EPOCHS + 1 + i * EPOCHS_BETWEEN_PRUNES for i in range(NUM_PRUNE_STEPS)]
 
 # Prune-then-train configuration (based on progressive pruning final dimensions)
 # These are the target dimensions after 4 pruning steps of 10% each
@@ -860,7 +864,7 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
     """
     Phase 1: Train with progressive channel pruning during training (TRAINED FIRST for easier debugging)
     Uses same regularization as baseline: L2, batch normalization
-    Fixed schedule: 15 epochs total, prune at epochs 5, 8, 11, 14 (every 3 epochs after warmup)
+    Fixed schedule: 15 epochs total, prune at epochs 3, 6, 9, 12 (every 3 epochs after 2-epoch warmup)
     """
     print("\n" + "="*80)
     print(f"PHASE 1: PROGRESSIVE PRUNING DURING TRAINING - {dataset_name.upper()} - TRIAL {trial_num}/{NUM_TRIALS}")
@@ -868,7 +872,7 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
     
     # Calculate pruning schedule
     # Warmup: epochs 1-2, then prune at 3, 6, 9, 12
-    prune_epochs = [WARMUP_EPOCHS + i * EPOCHS_BETWEEN_PRUNES for i in range(1, NUM_PRUNE_STEPS + 1)]
+    prune_epochs = PRUNE_EPOCHS_SCHEDULE.copy()
     # Ensure we don't prune beyond FIXED_EPOCHS
     prune_epochs = [e for e in prune_epochs if e <= FIXED_EPOCHS]
     actual_prune_steps = len(prune_epochs)
@@ -1520,7 +1524,7 @@ def main():
     print(f"    Epochs Between Prunes: {EPOCHS_BETWEEN_PRUNES}")
     print(f"    Number of Prune Steps: {NUM_PRUNE_STEPS}")
     print(f"    Prune Percent per Step: {PRUNE_PERCENT*100}%")
-    print(f"    Pruning Schedule: epochs {[WARMUP_EPOCHS + i * EPOCHS_BETWEEN_PRUNES for i in range(1, NUM_PRUNE_STEPS + 1)]}")
+    print(f"    Pruning Schedule: epochs {PRUNE_EPOCHS_SCHEDULE}")
     print(f"    LR Reduction After Prune: {LR_REDUCTION_AFTER_PRUNE}")
     print(f"    Final Target Channels: ~{[TARGET_PRUNED_CHANNELS[s] for s in STAGES]}")
     print(f"\n  Method 3: Prune-Then-Train (One-Shot Pruning)")
@@ -1567,7 +1571,7 @@ def main():
     print("\n  Method 2 - Progressive Pruning:")
     print("    Pruned {} times at epochs {}".format(
         NUM_PRUNE_STEPS, 
-        [WARMUP_EPOCHS + i * EPOCHS_BETWEEN_PRUNES for i in range(1, NUM_PRUNE_STEPS + 1)]
+        PRUNE_EPOCHS_SCHEDULE
     ))
     print("    Gradual adaptation during training")
     print("\n  Method 3 - Prune-Then-Train:")
