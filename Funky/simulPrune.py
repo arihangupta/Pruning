@@ -75,6 +75,15 @@ NUM_PRUNE_STEPS = 4  # Number of pruning iterations (epochs 3, 6, 9, 12)
 PRUNE_PERCENT = 0.10  # Remove 10% of channels each time
 LR_REDUCTION_AFTER_PRUNE = 0.5  # Multiply LR by this after each prune
 
+# Prune-then-train configuration (based on progressive pruning final dimensions)
+# These are the target dimensions after 4 pruning steps of 10% each
+TARGET_PRUNED_CHANNELS = {
+    'layer1': 40,   # ~62.5% of original 64
+    'layer2': 82,   # ~64% of original 128
+    'layer3': 167,  # ~65% of original 256
+    'layer4': 334,  # ~65% of original 512
+}
+
 # Experimental configuration
 NUM_TRIALS = 3  # Number of trials per dataset for statistical reliability
 
@@ -1068,6 +1077,192 @@ def train_with_progressive_pruning(dataset_name, train_loader, val_loader, test_
     
     return model, all_metrics[-1]
 
+def train_prune_then_finetune(dataset_name, train_loader, val_loader, test_loader, 
+                               num_classes, save_dir, trial_num):
+    """
+    Phase 3: Prune ONCE at initialization, then train for 15 epochs (PRUNE-THEN-TRAIN)
+    - Load pretrained ResNet50
+    - Perform one-shot pruning to target dimensions using importance scoring
+    - Train pruned model for 15 epochs
+    
+    This tests: "Is it better to prune once upfront, or progressively during training?"
+    """
+    print("\n" + "="*80)
+    print(f"PHASE 3: PRUNE-THEN-TRAIN - {dataset_name.upper()} - TRIAL {trial_num}/{NUM_TRIALS}")
+    print("="*80)
+    
+    print(f"Fixed schedule: {FIXED_EPOCHS} epochs total")
+    print(f"One-shot pruning at initialization to target dimensions:")
+    print(f"  Target channels: {TARGET_PRUNED_CHANNELS}")
+    
+    # Build initial model with pretrained ImageNet weights
+    model = build_baseline_resnet(num_classes)
+    print(f"Model built with L2={WEIGHT_DECAY}, batch_norm=True, pretrained=ImageNet")
+    
+    # Start energy tracking (includes pruning time)
+    tracker = start_energy_tracker(save_dir, f"{dataset_name}_prune_then_train_trial{trial_num}")
+    
+    # ONE-SHOT PRUNING at initialization
+    print("\n*** ONE-SHOT PRUNING ***")
+    print("Computing channel importance for all stages...")
+    
+    keep_indices = {}
+    current_channels = {s: ORIGINAL_PLANES[i] for i, s in enumerate(STAGES)}
+    
+    for stage_name in STAGES:
+        # Compute importance using calibration data
+        importance = compute_channel_importance(model, stage_name, train_loader, 
+                                               max_batches=IMPORTANCE_CAL_BATCHES)
+        
+        # Select top K channels to keep (K = target dimension)
+        target_k = TARGET_PRUNED_CHANNELS[stage_name]
+        keeps = select_channels_to_keep(importance, keep_ratio=target_k/current_channels[stage_name])
+        keep_indices[stage_name] = keeps
+        
+        orig = current_channels[stage_name]
+        kept = len(keeps)
+        pruned = orig - kept
+        print(f"  {stage_name}: {orig} → {kept} channels ({pruned} pruned, {kept/orig*100:.1f}% kept)")
+        
+        current_channels[stage_name] = kept
+    
+    # Build pruned model
+    new_stage_planes = [current_channels[s] for s in STAGES]
+    pruned_model = build_pruned_resnet(new_stage_planes, num_classes)
+    
+    # Copy weights from important channels
+    print("Copying weights to pruned model...")
+    pruned_model = copy_weights_to_pruned_model(model, pruned_model, keep_indices)
+    
+    # Replace model
+    del model
+    model = pruned_model
+    cleanup_memory()
+    
+    print(f"Pruned model created. Now training for {FIXED_EPOCHS} epochs...")
+    
+    # Optimizer
+    optimizer = optim.Adam(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
+    
+    # Track all metrics
+    all_metrics = []
+    
+    # Train for fixed epochs
+    for epoch in range(1, FIXED_EPOCHS + 1):
+        print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
+        
+        # Train
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, epoch)
+        
+        # Validate
+        val_loss, val_acc, val_auc = evaluate(model, val_loader, dataset_name, "prune_then_train_val")
+        
+        # Test
+        test_loss, test_acc, test_auc = evaluate(model, test_loader, dataset_name, "prune_then_train_test")
+        
+        print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
+        print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
+        
+        # Compute metrics
+        params_m = count_parameters(model)
+        size_mb = model_size_mb(model)
+        flops = compute_flops(model)
+        inf_time, peak_ram = inference_time_per_batch(model, test_loader)
+        
+        # Record metrics for all epochs
+        all_metrics.append({
+            'method': 'prune_then_train',
+            'trial': trial_num,
+            'epoch': epoch,
+            'stage': 'training',
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'val_auc': val_auc,
+            'test_loss': test_loss,
+            'test_acc': test_acc,
+            'test_auc': test_auc,
+            'params_m': params_m,
+            'model_size_mb': size_mb,
+            'flops': flops,
+            'flops_m': flops / 1e6,
+            'inference_time_ms': inf_time * 1000,
+            'peak_ram_mb': peak_ram,
+            'channels_layer1': current_channels['layer1'],
+            'channels_layer2': current_channels['layer2'],
+            'channels_layer3': current_channels['layer3'],
+            'channels_layer4': current_channels['layer4'],
+            'learning_rate': INITIAL_LR,
+        })
+    
+    # Stop energy tracking
+    energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_prune_then_train_trial{trial_num}")
+    print(f"\nTotal energy (pruning + training): {energy_metrics['energy_kwh']:.6f} kWh, emissions: {energy_metrics['emissions_kg']:.6f} kg")
+    
+    # Use the LAST model (no best model loading - size is paramount)
+    print("\nUsing final model from last epoch (epoch 15)")
+    
+    # Final evaluation
+    print("\n" + "="*60)
+    print("FINAL EVALUATION")
+    print("="*60)
+    test_loss, test_acc, test_auc = evaluate(model, test_loader, dataset_name, "prune_then_train_final")
+    print(f"Final Test Results - Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, AUC: {test_auc:.4f}")
+    
+    params_m = count_parameters(model)
+    size_mb = model_size_mb(model)
+    flops = compute_flops(model)
+    inf_time, peak_ram = inference_time_per_batch(model, test_loader)
+    
+    print(f"Model size: {size_mb:.2f} MB, Params: {params_m:.2f}M")
+    print(f"FLOPs: {flops/1e6:.2f}M, Inference: {inf_time*1000:.2f}ms/batch, Peak RAM: {peak_ram:.2f}MB")
+    print(f"Final channel counts: L1={current_channels['layer1']}, L2={current_channels['layer2']}, "
+          f"L3={current_channels['layer3']}, L4={current_channels['layer4']}")
+    
+    # Save final model
+    model_path = os.path.join(save_dir, f"{dataset_name}_prune_then_train_trial{trial_num}_final.pth")
+    torch.save(model.state_dict(), model_path)
+    print(f"\nSaved final model to {model_path}")
+    
+    # Add final metrics with energy
+    all_metrics.append({
+        'method': 'prune_then_train',
+        'trial': trial_num,
+        'total_epochs': FIXED_EPOCHS,
+        'stage': 'final',
+        'train_loss': None,
+        'train_acc': None,
+        'val_loss': None,
+        'val_acc': None,
+        'val_auc': None,
+        'test_loss': test_loss,
+        'test_acc': test_acc,
+        'test_auc': test_auc,
+        'params_m': params_m,
+        'model_size_mb': size_mb,
+        'flops': flops,
+        'flops_m': flops / 1e6,
+        'inference_time_ms': inf_time * 1000,
+        'peak_ram_mb': peak_ram,
+        'training_energy_kwh': energy_metrics['energy_kwh'],
+        'training_emissions_kg': energy_metrics['emissions_kg'],
+        'training_duration_s': energy_metrics['duration_s'],
+        'channels_layer1': current_channels['layer1'],
+        'channels_layer2': current_channels['layer2'],
+        'channels_layer3': current_channels['layer3'],
+        'channels_layer4': current_channels['layer4'],
+        'weight_decay': WEIGHT_DECAY,
+    })
+    
+    # Save all metrics
+    metrics_df = pd.DataFrame(all_metrics)
+    metrics_path = os.path.join(save_dir, f"{dataset_name}_prune_then_train_trial{trial_num}_all_metrics.csv")
+    metrics_df.to_csv(metrics_path, index=False)
+    print(f"Saved prune-then-train metrics to {metrics_path}")
+    
+    return model, all_metrics[-1]
+
 # -------------------------
 # Main execution
 # -------------------------
@@ -1088,6 +1283,7 @@ def process_dataset(dataset_name, cfg):
     
     all_baseline_metrics = []
     all_progressive_metrics = []
+    all_prune_then_train_metrics = []
     
     # Run multiple trials
     for trial in range(1, NUM_TRIALS + 1):
@@ -1119,10 +1315,20 @@ def process_dataset(dataset_name, cfg):
         del baseline_model
         cleanup_memory()
         
+        # Phase 3: Prune-then-train
+        prune_then_train_model, prune_then_train_metrics = train_prune_then_finetune(
+            dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial
+        )
+        all_prune_then_train_metrics.append(prune_then_train_metrics)
+        
+        # Clean up
+        del prune_then_train_model
+        cleanup_memory()
+        
         print(f"\n✓ Trial {trial} completed")
     
     # Combine all trials
-    all_metrics_df = pd.DataFrame(all_baseline_metrics + all_progressive_metrics)
+    all_metrics_df = pd.DataFrame(all_baseline_metrics + all_progressive_metrics + all_prune_then_train_metrics)
     all_metrics_path = os.path.join(save_dir, f"{dataset_name}_all_trials_metrics.csv")
     all_metrics_df.to_csv(all_metrics_path, index=False)
     print(f"\nSaved all trials metrics to {all_metrics_path}")
@@ -1130,6 +1336,7 @@ def process_dataset(dataset_name, cfg):
     # Compute statistics across trials
     baseline_df = pd.DataFrame(all_baseline_metrics)
     progressive_df = pd.DataFrame(all_progressive_metrics)
+    prune_then_train_df = pd.DataFrame(all_prune_then_train_metrics)
     
     # Create summary with mean and std
     summary_rows = []
@@ -1167,6 +1374,23 @@ def process_dataset(dataset_name, cfg):
             progressive_summary[f'{col}_max'] = progressive_df[col].max()
     summary_rows.append(progressive_summary)
     
+    # Prune-then-train summary
+    prune_then_train_summary = {
+        'method': 'prune_then_train',
+        'dataset': dataset_name,
+        'num_trials': NUM_TRIALS,
+        'fixed_epochs': FIXED_EPOCHS,
+    }
+    for col in ['test_acc', 'test_auc', 'test_loss', 'params_m', 'model_size_mb', 'flops_m', 
+                'inference_time_ms', 'training_energy_kwh', 'training_emissions_kg',
+                'channels_layer1', 'channels_layer2', 'channels_layer3', 'channels_layer4']:
+        if col in prune_then_train_df.columns:
+            prune_then_train_summary[f'{col}_mean'] = prune_then_train_df[col].mean()
+            prune_then_train_summary[f'{col}_std'] = prune_then_train_df[col].std()
+            prune_then_train_summary[f'{col}_min'] = prune_then_train_df[col].min()
+            prune_then_train_summary[f'{col}_max'] = prune_then_train_df[col].max()
+    summary_rows.append(prune_then_train_summary)
+    
     # Save summary
     summary_df = pd.DataFrame(summary_rows)
     summary_path = os.path.join(save_dir, f"{dataset_name}_summary_statistics.csv")
@@ -1174,11 +1398,11 @@ def process_dataset(dataset_name, cfg):
     print(f"Saved summary statistics to {summary_path}")
     
     # Print comparison table
-    print("\n" + "="*120)
+    print("\n" + "="*140)
     print(f"SUMMARY COMPARISON - {dataset_name.upper()} ({NUM_TRIALS} trials, {FIXED_EPOCHS} epochs each)")
-    print("="*120)
-    print(f"{'Metric':<30} {'Baseline (Mean±Std)':<35} {'Progressive (Mean±Std)':<35} {'Difference':<20}")
-    print("-"*120)
+    print("="*140)
+    print(f"{'Metric':<30} {'Baseline (Mean±Std)':<35} {'Progressive (Mean±Std)':<35} {'Prune-Then-Train (Mean±Std)':<35}")
+    print("-"*140)
     
     metrics_to_compare = [
         ('test_acc', 'Test Accuracy', '{:.4f}', True),
@@ -1197,39 +1421,35 @@ def process_dataset(dataset_name, cfg):
         base_std = baseline_summary.get(f'{key}_std', float('nan'))
         prog_mean = progressive_summary.get(f'{key}_mean', float('nan'))
         prog_std = progressive_summary.get(f'{key}_std', float('nan'))
+        ptt_mean = prune_then_train_summary.get(f'{key}_mean', float('nan'))
+        ptt_std = prune_then_train_summary.get(f'{key}_std', float('nan'))
         
         base_str = f"{fmt.format(base_mean)} ± {fmt.format(base_std)}"
         prog_str = f"{fmt.format(prog_mean)} ± {fmt.format(prog_std)}"
+        ptt_str = f"{fmt.format(ptt_mean)} ± {fmt.format(ptt_std)}"
         
-        if not math.isnan(base_mean) and not math.isnan(prog_mean):
-            if 'acc' in key or 'auc' in key:
-                diff = (prog_mean - base_mean) * 100
-                diff_str = f"{diff:+.2f}% abs"
-            else:
-                pct = ((prog_mean - base_mean) / base_mean) * 100 if base_mean != 0 else 0
-                diff_str = f"{pct:+.1f}%"
-                
-                # Add indicator for better/worse
-                if higher_better:
-                    indicator = "✓" if prog_mean > base_mean else "✗"
-                else:
-                    indicator = "✓" if prog_mean < base_mean else "✗"
-                diff_str = f"{diff_str} {indicator}"
-        else:
-            diff_str = "N/A"
-        
-        print(f"{name:<30} {base_str:<35} {prog_str:<35} {diff_str:<20}")
+        print(f"{name:<30} {base_str:<35} {prog_str:<35} {ptt_str:<35}")
     
     # Channel reduction info
-    print(f"\n{'Final Channel Counts (Progressive)':<30}")
+    print(f"\n{'Final Channel Counts':<30}")
+    print(f"{'Stage':<15} {'Original':<15} {'Progressive':<25} {'Prune-Then-Train':<25}")
+    print("-"*80)
     for i, stage in enumerate(['layer1', 'layer2', 'layer3', 'layer4']):
         orig = ORIGINAL_PLANES[i]
-        final_mean = progressive_summary.get(f'channels_{stage}_mean', float('nan'))
-        final_std = progressive_summary.get(f'channels_{stage}_std', float('nan'))
-        reduction = ((orig - final_mean) / orig * 100) if not math.isnan(final_mean) else 0
-        print(f"  {stage}: {orig} → {final_mean:.1f}±{final_std:.1f} ({reduction:.1f}% reduction)")
+        prog_mean = progressive_summary.get(f'channels_{stage}_mean', float('nan'))
+        prog_std = progressive_summary.get(f'channels_{stage}_std', float('nan'))
+        ptt_mean = prune_then_train_summary.get(f'channels_{stage}_mean', float('nan'))
+        ptt_std = prune_then_train_summary.get(f'channels_{stage}_std', float('nan'))
+        
+        prog_reduction = ((orig - prog_mean) / orig * 100) if not math.isnan(prog_mean) else 0
+        ptt_reduction = ((orig - ptt_mean) / orig * 100) if not math.isnan(ptt_mean) else 0
+        
+        prog_str = f"{prog_mean:.1f}±{prog_std:.1f} ({prog_reduction:.1f}% reduced)"
+        ptt_str = f"{ptt_mean:.1f}±{ptt_std:.1f} ({ptt_reduction:.1f}% reduced)"
+        
+        print(f"{stage:<15} {orig:<15} {prog_str:<25} {ptt_str:<25}")
     
-    print("="*120)
+    print("="*140)
     
     return summary_df
 
@@ -1244,21 +1464,29 @@ def main():
     print(f"  Device: {DEVICE}")
     print(f"  Seed: {SEED}")
     print(f"  Number of Trials: {NUM_TRIALS}")
-    print(f"\n  Training Configuration (SAME for both methods):")
+    print(f"\n  Training Configuration (SAME for all methods):")
     print(f"    Fixed Epochs: {FIXED_EPOCHS}")
     print(f"    Initial LR: {INITIAL_LR}")
     print(f"    Weight Decay (L2): {WEIGHT_DECAY}")
     print(f"    Batch Normalization: True (built-in to ResNet)")
     print(f"    Pretrained: ImageNet weights")
-    print(f"\n  Progressive Pruning Specific:")
+    print(f"\n  Method 1: Baseline (No Pruning)")
+    print(f"    Full ResNet50 architecture")
+    print(f"    Channels: [64, 128, 256, 512]")
+    print(f"\n  Method 2: Progressive Pruning (During Training)")
     print(f"    Warmup Epochs: {WARMUP_EPOCHS}")
     print(f"    Epochs Between Prunes: {EPOCHS_BETWEEN_PRUNES}")
     print(f"    Number of Prune Steps: {NUM_PRUNE_STEPS}")
     print(f"    Prune Percent per Step: {PRUNE_PERCENT*100}%")
     print(f"    Pruning Schedule: epochs {[WARMUP_EPOCHS + i * EPOCHS_BETWEEN_PRUNES for i in range(1, NUM_PRUNE_STEPS + 1)]}")
     print(f"    LR Reduction After Prune: {LR_REDUCTION_AFTER_PRUNE}")
-    print(f"    Importance Calibration Batches: {IMPORTANCE_CAL_BATCHES}")
-    print(f"\n  Datasets: {list(DATASETS.keys())}")
+    print(f"    Final Target Channels: ~{[TARGET_PRUNED_CHANNELS[s] for s in STAGES]}")
+    print(f"\n  Method 3: Prune-Then-Train (One-Shot Pruning)")
+    print(f"    One-shot pruning at initialization")
+    print(f"    Target Channels: {[TARGET_PRUNED_CHANNELS[s] for s in STAGES]}")
+    print(f"    Train pruned model for {FIXED_EPOCHS} epochs")
+    print(f"\n  Importance Calibration: {IMPORTANCE_CAL_BATCHES} batches")
+    print(f"  Datasets: {list(DATASETS.keys())}")
     print(f"  Save Directory: {SAVE_DIR_BASE}")
     
     if not CODECARBON_AVAILABLE:
@@ -1289,13 +1517,20 @@ def main():
     print("EXPERIMENT COMPLETED")
     print("="*100)
     print("\nKey Takeaways:")
-    print("  - Both methods trained for exactly {} epochs".format(FIXED_EPOCHS))
-    print("  - Both methods used same regularization: L2={}, batch_norm=True, pretrained=ImageNet".format(WEIGHT_DECAY))
-    print("  - Progressive pruning performed {} pruning steps at epochs {}".format(
+    print("  - All three methods trained for exactly {} epochs".format(FIXED_EPOCHS))
+    print("  - All methods used same regularization: L2={}, batch_norm=True, pretrained=ImageNet".format(WEIGHT_DECAY))
+    print("\n  Method 1 - Baseline:")
+    print("    Full ResNet50, no pruning")
+    print("\n  Method 2 - Progressive Pruning:")
+    print("    Pruned {} times at epochs {}".format(
         NUM_PRUNE_STEPS, 
         [WARMUP_EPOCHS + i * EPOCHS_BETWEEN_PRUNES for i in range(1, NUM_PRUNE_STEPS + 1)]
     ))
-    print("  - Results are averaged over {} trials for statistical reliability".format(NUM_TRIALS))
+    print("    Gradual adaptation during training")
+    print("\n  Method 3 - Prune-Then-Train:")
+    print("    One-shot pruning at initialization")
+    print("    Target architecture: {}".format([TARGET_PRUNED_CHANNELS[s] for s in STAGES]))
+    print("\n  Results are averaged over {} trials for statistical reliability".format(NUM_TRIALS))
     print("="*100)
 
 if __name__ == "__main__":
