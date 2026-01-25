@@ -1390,16 +1390,17 @@ class PrunableViTWrapper(nn.Module):
                     return output_weighted.view(B, N, C)
                 return hook
             
-            # Hook for MLP
+            # Hook for MLP - apply on fc1 output (hidden dimension)
             def make_mlp_hook(layer_idx):
                 def hook(module, input, output):
                     # Apply MLP hidden dimension importance
+                    # fc1 output has shape (B, N, mlp_hidden_dim)
                     return output * self.mlp_importance[layer_idx].view(1, 1, -1)
                 return hook
             
             # Register hooks
             block.attn.proj.register_forward_hook(make_attn_hook(i))
-            block.mlp.fc2.register_forward_hook(make_mlp_hook(i))
+            block.mlp.fc1.register_forward_hook(make_mlp_hook(i))  # Changed from fc2 to fc1
     
     def forward(self, x):
         return self.base_model(x)
