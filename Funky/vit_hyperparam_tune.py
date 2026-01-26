@@ -916,7 +916,7 @@ def main():
     all_results = []
     all_epoch_logs = []
 
-    datasets = ['bloodmnist']  # Start with one dataset
+    datasets = ['dermamnist']  # Start with one dataset
 
     for dataset in datasets:
         npz_path = os.path.join(DATASET_DIR, f"{dataset}_224.npz")
