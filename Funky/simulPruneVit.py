@@ -11,6 +11,12 @@ Three methods compared:
 - Progressive Pruning: Gradual pruning during training
 - One-Shot Pruning: Prune at initialization then finetune
 
+FIXES APPLIED:
+- L1 regularization on gates to induce sparsity
+- Per-component pruning for balanced reduction
+- Improved sparsity scheduling
+- Gate statistics monitoring
+
 Date: 2026
 """
 
@@ -66,6 +72,9 @@ PRUNING_MOMENTUM = 0.9
 IMPORTANCE_CAL_BATCHES = 50
 LR_REDUCTION_AFTER_PRUNE = 0.5
 
+# CRITICAL: Gate regularization weight (induces sparsity)
+GATE_L1_WEIGHT = 1e-4
+
 # Deployment finetuning (after conversion to smaller model)
 DEPLOY_FINETUNE_EPOCHS = 5
 DEPLOY_FINETUNE_LR = 5e-5
@@ -79,6 +88,9 @@ PRUNE_EPOCHS_SCHEDULE = [
     WARMUP_EPOCHS + 1 + i * EPOCHS_BETWEEN_PRUNES 
     for i in range(NUM_PRUNE_STEPS)
 ]
+
+# Aggressive sparsity schedule (fixes slow pruning)
+SPARSITY_SCHEDULE = [0.2, 0.35, 0.45, 0.5]  # Cumulative sparsity per step
 
 # ==================== UTILITIES ====================
 
@@ -132,6 +144,40 @@ def compute_flops_vit(embed_dim, num_heads, depth, mlp_ratio=4, seq_len=197):
     total_flops = depth * (mhsa_flops + mlp_flops)
     
     return total_flops
+
+def print_gate_statistics(model):
+    """Print statistics about gate values - CRITICAL for debugging"""
+    print("\n" + "="*80)
+    print("GATE STATISTICS")
+    print("="*80)
+    
+    gate_info = {}
+    for name, param in model.named_parameters():
+        if 'gate' in name and 'weight' in name:
+            weights = param.data.cpu()
+            gate_type = None
+            if 'attn_gate' in name:
+                gate_type = 'Attention'
+            elif 'hidden_gate' in name:
+                gate_type = 'MLP'
+            elif 'res_gate' in name:
+                gate_type = 'Residual'
+            
+            if gate_type:
+                if gate_type not in gate_info:
+                    gate_info[gate_type] = []
+                gate_info[gate_type].append(weights)
+    
+    for gate_type, weight_list in gate_info.items():
+        all_weights = torch.cat([w.flatten() for w in weight_list])
+        print(f"\n{gate_type} Gates:")
+        print(f"  Total units: {all_weights.numel()}")
+        print(f"  Mean: {all_weights.mean():.4f}, Std: {all_weights.std():.4f}")
+        print(f"  Min: {all_weights.min():.4f}, Max: {all_weights.max():.4f}")
+        print(f"  Zeros: {(all_weights == 0).sum().item()} ({(all_weights == 0).sum().item() / all_weights.numel() * 100:.1f}%)")
+        print(f"  Near-zero (<0.01): {(all_weights.abs() < 0.01).sum().item()} ({(all_weights.abs() < 0.01).sum().item() / all_weights.numel() * 100:.1f}%)")
+    
+    print("="*80)
 
 # ==================== ENERGY TRACKING ====================
 
@@ -1070,44 +1116,54 @@ def collect_importance_scores(model, pruners, train_loader, max_batches=50):
     
     print("✓ Importance collection complete")
 
-def apply_pruning_simple(model, pruners, target_sparsity=0.5):
+def apply_pruning_per_component(model, pruners, target_sparsity=0.5):
     """
-    Simple pruning: calculate global threshold across all components
+    FIX: Prune each component type independently for balanced pruning
+    This ensures attention, MLP, and residual are all pruned equally
     """
-    print(f"\nApplying pruning (target sparsity: {target_sparsity:.1%})...")
+    print(f"\nApplying per-component pruning (target: {target_sparsity:.1%})...")
     
-    # Finalize scores
-    all_criteria = []
-    for pruner in pruners:
-        criteria = pruner.finalize_scores()
-        all_criteria.extend([c for layer in criteria for c in layer])
+    component_names = ['Attention Heads', 'MLP Hidden', 'Residual Dims']
     
-    # Calculate threshold
-    all_criteria_array = np.array(all_criteria)
-    num_to_prune = int(len(all_criteria_array) * target_sparsity)
-    threshold = np.sort(all_criteria_array)[num_to_prune]
-    
-    print(f"  Threshold: {threshold:.6f}")
-    print(f"  Pruning {num_to_prune}/{len(all_criteria_array)} units")
-    
-    # Apply pruning
-    for pruner in pruners:
-        criteria = pruner.finalize_scores()
-        pruner.prune(criteria, threshold)
-    
-    # Report
     for i, pruner in enumerate(pruners):
+        criteria = pruner.finalize_scores()
+        
+        # Flatten scores for THIS component only
+        all_scores = []
+        for layer_scores in criteria:
+            all_scores.extend(layer_scores.flatten().tolist())
+        
+        all_scores_array = np.array(all_scores)
+        
+        # Calculate threshold for THIS component
+        num_to_prune = int(len(all_scores_array) * target_sparsity)
+        if num_to_prune > 0:
+            threshold = np.sort(all_scores_array)[num_to_prune]
+        else:
+            threshold = -np.inf
+        
+        print(f"  {component_names[i]}:")
+        print(f"    Total units: {len(all_scores_array)}")
+        print(f"    Threshold: {threshold:.6f}")
+        print(f"    Pruning: {num_to_prune} units ({target_sparsity*100:.1f}%)")
+        
+        # Apply pruning
+        pruner.prune(criteria, threshold)
+        
         active = pruner.get_num_active()
         total = pruner.all_neuron_units
-        component_names = ['Attention Heads', 'MLP Hidden', 'Residual Dims']
-        print(f"  {component_names[i]}: {active}/{total} active ({active/total*100:.1f}%)")
+        print(f"    Result: {active}/{total} active ({active/total*100:.1f}%)")
 
 # ==================== TRAINING FUNCTIONS ====================
 
-def train_one_epoch(model, train_loader, optimizer, scheduler, epoch):
-    """Standard training epoch"""
+def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, gate_l1_weight=0.0):
+    """
+    Training epoch with L1 regularization on gates
+    FIX: Adds sparsity-inducing penalty to force gates toward zero
+    """
     model.train()
     running_loss = 0.0
+    running_gate_loss = 0.0
     correct = 0
     total = 0
     
@@ -1116,19 +1172,36 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, epoch):
         
         optimizer.zero_grad()
         outputs = model(images)
-        loss = nn.functional.cross_entropy(outputs, labels)
+        task_loss = nn.functional.cross_entropy(outputs, labels)
         
-        loss.backward()
+        # CRITICAL FIX: Add L1 regularization to gates
+        gate_l1_loss = 0.0
+        if gate_l1_weight > 0:
+            for name, param in model.named_parameters():
+                if 'gate' in name and 'weight' in name:
+                    gate_l1_loss += torch.abs(param).sum()
+        
+        total_loss = task_loss + gate_l1_weight * gate_l1_loss
+        
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
         
-        running_loss += loss.item()
+        running_loss += task_loss.item()
+        running_gate_loss += gate_l1_loss.item() if isinstance(gate_l1_loss, torch.Tensor) else 0.0
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
     
-    return running_loss / len(train_loader), correct / total
+    avg_loss = running_loss / len(train_loader)
+    avg_gate_loss = running_gate_loss / len(train_loader)
+    acc = correct / total
+    
+    if gate_l1_weight > 0:
+        print(f"    Task Loss: {avg_loss:.4f}, Gate L1: {avg_gate_loss:.4f}")
+    
+    return avg_loss, acc
 
 def finetune_deployment_model(deploy_model, train_loader, val_loader, epochs=5, lr=5e-5):
     """
@@ -1145,7 +1218,7 @@ def finetune_deployment_model(deploy_model, train_loader, val_loader, epochs=5, 
     best_state = None
     
     for epoch in range(1, epochs + 1):
-        train_loss, train_acc = train_one_epoch(deploy_model, train_loader, optimizer, scheduler, epoch)
+        train_loss, train_acc = train_one_epoch(deploy_model, train_loader, optimizer, scheduler, epoch, gate_l1_weight=0.0)
         val_acc, _, _, _, _ = evaluate_model(deploy_model, val_loader, DEVICE)
         
         print(f"  Epoch {epoch}/{epochs} - Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
@@ -1200,7 +1273,7 @@ def train_baseline_vit(dataset_name, model_name, train_loader, val_loader, test_
     for epoch in range(1, FIXED_EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
         
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scheduler, epoch)
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scheduler, epoch, gate_l1_weight=0.0)
         val_acc, val_auc, val_precision, val_recall, val_f1 = evaluate_model(model, val_loader, DEVICE)
         test_acc, test_auc, test_precision, test_recall, test_f1 = evaluate_model(model, test_loader, DEVICE)
         
@@ -1280,6 +1353,7 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
     
     prune_epochs = PRUNE_EPOCHS_SCHEDULE.copy()
     print(f"Pruning schedule: {prune_epochs}")
+    print(f"Sparsity schedule: {SPARSITY_SCHEDULE}")
     
     # Create model
     model = create_gated_vit_from_timm(model_name, num_classes, pretrained=True).to(DEVICE)
@@ -1308,8 +1382,6 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
     # Start energy tracking
     tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_progressive_trial{trial_num}")
     
-    cumulative_sparsity = 0.0
-    
     for epoch in range(1, FIXED_EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
         
@@ -1326,11 +1398,14 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
             # Collect importance
             collect_importance_scores(model, pruners, train_loader, max_batches=IMPORTANCE_CAL_BATCHES)
             
-            # Calculate cumulative sparsity
-            cumulative_sparsity += (1 - cumulative_sparsity) * (TARGET_FLOPS_REDUCTION / NUM_PRUNE_STEPS)
+            # FIX: Use aggressive sparsity schedule
+            target_sparsity = SPARSITY_SCHEDULE[prune_step - 1]
             
-            # Apply pruning
-            apply_pruning_simple(model, pruners, target_sparsity=cumulative_sparsity)
+            # FIX: Apply per-component pruning
+            apply_pruning_per_component(model, pruners, target_sparsity=target_sparsity)
+            
+            # Debug: Print gate statistics
+            print_gate_statistics(model)
             
             # Reduce LR
             current_lr *= LR_REDUCTION_AFTER_PRUNE
@@ -1342,8 +1417,11 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
         steps_per_epoch = len(train_loader)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps_per_epoch, eta_min=MIN_LR)
         
-        # Train
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scheduler, epoch)
+        # Train with gate regularization
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, optimizer, scheduler, epoch, 
+            gate_l1_weight=GATE_L1_WEIGHT
+        )
         
         # Validate
         val_acc, val_auc, val_precision, val_recall, val_f1 = evaluate_model(model, val_loader, DEVICE)
@@ -1366,6 +1444,10 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print(f"\n✓ Loaded best model from epoch {best_epoch}")
+    
+    # Final gate statistics
+    print("\nFinal gate statistics before deployment conversion:")
+    print_gate_statistics(model)
     
     # Convert to deployment model
     deploy_model, pruning_config = convert_to_deployment_model(
@@ -1458,8 +1540,11 @@ def train_prune_then_finetune(dataset_name, model_name, train_loader, val_loader
     print("\n*** ONE-SHOT PRUNING ***")
     collect_importance_scores(model, pruners, train_loader, max_batches=IMPORTANCE_CAL_BATCHES)
     
-    cumulative_sparsity = TARGET_FLOPS_REDUCTION
-    apply_pruning_simple(model, pruners, target_sparsity=cumulative_sparsity)
+    target_sparsity = TARGET_FLOPS_REDUCTION
+    apply_pruning_per_component(model, pruners, target_sparsity=target_sparsity)
+    
+    # Debug: Print gate statistics
+    print_gate_statistics(model)
     
     print(f"\nNow training pruned model for {FIXED_EPOCHS} epochs...")
     
@@ -1477,7 +1562,10 @@ def train_prune_then_finetune(dataset_name, model_name, train_loader, val_loader
     for epoch in range(1, FIXED_EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
         
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scheduler, epoch)
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, optimizer, scheduler, epoch,
+            gate_l1_weight=GATE_L1_WEIGHT
+        )
         val_acc, val_auc, val_precision, val_recall, val_f1 = evaluate_model(model, val_loader, DEVICE)
         test_acc, test_auc, test_precision, test_recall, test_f1 = evaluate_model(model, test_loader, DEVICE)
         
@@ -1498,6 +1586,10 @@ def train_prune_then_finetune(dataset_name, model_name, train_loader, val_loader
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print(f"\n✓ Loaded best model from epoch {best_epoch}")
+    
+    # Final gate statistics
+    print("\nFinal gate statistics before deployment conversion:")
+    print_gate_statistics(model)
     
     # Convert to deployment model
     deploy_model, pruning_config = convert_to_deployment_model(
@@ -1655,6 +1747,11 @@ def main():
     print(f"   - Training models use gates to identify important components")
     print(f"   - Deployment models are PHYSICALLY SMALLER (actual speedup)")
     print(f"   - Energy measured on deployment models (real-world applicable)")
+    print(f"\n🔧 FIXES APPLIED:")
+    print(f"   - L1 regularization on gates (weight={GATE_L1_WEIGHT})")
+    print(f"   - Per-component pruning for balanced reduction")
+    print(f"   - Aggressive sparsity schedule: {SPARSITY_SCHEDULE}")
+    print(f"   - Gate statistics monitoring")
     print(f"\nConfiguration:")
     print(f"  Device: {DEVICE}")
     print(f"  Fixed Epochs: {FIXED_EPOCHS}")
@@ -1683,6 +1780,7 @@ def main():
     print(f"   - Baseline: Full-size deployment model")
     print(f"   - Progressive/One-shot: Physically smaller deployment models")
     print(f"   - Energy measured on actual deployment models")
+    print(f"   - Gate regularization ensures actual pruning occurs")
     print(f"   - Results saved to: {SAVE_DIR}")
     print("="*100)
 
