@@ -781,24 +781,36 @@ def convert_to_deployment_model(gated_model, num_classes, save_masks=True, save_
     """
     Convert gated training model to deployment model
     This creates a PHYSICALLY SMALLER model
-    
-    Returns:
-        deploy_model: Smaller model without gates
-        pruning_config: Configuration dictionary for reproducibility
     """
     print("\n" + "="*80)
     print("CONVERTING TO DEPLOYMENT MODEL (Physical Compression)")
     print("="*80)
     
+    # CRITICAL FIX: Use absolute threshold instead of != 0
+    GATE_THRESHOLD = 0.01  # Gates below this are considered pruned
+    
     # Extract gate masks
-    res_mask = (gated_model.res_gate.weight.data != 0).cpu()
+    res_mask = (gated_model.res_gate.weight.data.abs() > GATE_THRESHOLD).cpu()
     new_embed_dim = res_mask.sum().item()
+    
+    print(f"DEBUG: Residual gate mask - keeping {new_embed_dim}/{len(res_mask)} dims")
+    print(f"  Gate weight range: [{gated_model.res_gate.weight.data.min():.4f}, {gated_model.res_gate.weight.data.max():.4f}]")
+    print(f"  Threshold: {GATE_THRESHOLD}")
     
     head_masks = []
     mlp_masks = []
-    for block in gated_model.blocks:
-        head_masks.append((block.attn.attn_gate.weight.data != 0).cpu())
-        mlp_masks.append((block.mlp.hidden_gate.weight.data != 0).cpu())
+    for i, block in enumerate(gated_model.blocks):
+        head_mask = (block.attn.attn_gate.weight.data.abs() > GATE_THRESHOLD).cpu()
+        mlp_mask = (block.mlp.hidden_gate.weight.data.abs() > GATE_THRESHOLD).cpu()
+        
+        head_masks.append(head_mask)
+        mlp_masks.append(mlp_mask)
+        
+        if i == 0:  # Debug first block
+            print(f"DEBUG: Block 0 attention - keeping {head_mask.sum()}/{len(head_mask)} heads")
+            print(f"  Gate weight range: [{block.attn.attn_gate.weight.data.min():.4f}, {block.attn.attn_gate.weight.data.max():.4f}]")
+            print(f"DEBUG: Block 0 MLP - keeping {mlp_mask.sum()}/{len(mlp_mask)} dims")
+            print(f"  Gate weight range: [{block.mlp.hidden_gate.weight.data.min():.4f}, {block.mlp.hidden_gate.weight.data.max():.4f}]")
     
     # Calculate per-layer dimensions
     per_layer_num_heads = [mask.sum().item() for mask in head_masks]
