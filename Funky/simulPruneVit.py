@@ -781,6 +781,10 @@ def convert_to_deployment_model(gated_model, num_classes, save_masks=True, save_
     """
     Convert gated training model to deployment model
     This creates a PHYSICALLY SMALLER model
+    
+    Returns:
+        deploy_model: Smaller model without gates
+        pruning_config: Configuration dictionary for reproducibility
     """
     print("\n" + "="*80)
     print("CONVERTING TO DEPLOYMENT MODEL (Physical Compression)")
@@ -789,28 +793,39 @@ def convert_to_deployment_model(gated_model, num_classes, save_masks=True, save_
     # CRITICAL FIX: Use absolute threshold instead of != 0
     GATE_THRESHOLD = 0.01  # Gates below this are considered pruned
     
-    # Extract gate masks
-    res_mask = (gated_model.res_gate.weight.data.abs() > GATE_THRESHOLD).cpu()
+    # Extract gate masks with debugging
+    res_gate_weights = gated_model.res_gate.weight.data
+    print(f"\nDEBUG - Residual Gates:")
+    print(f"  Weight range: [{res_gate_weights.min():.6f}, {res_gate_weights.max():.6f}]")
+    print(f"  Threshold: {GATE_THRESHOLD}")
+    print(f"  Weights > threshold: {(res_gate_weights.abs() > GATE_THRESHOLD).sum()}/{len(res_gate_weights)}")
+    
+    res_mask = (res_gate_weights.abs() > GATE_THRESHOLD).cpu()
     new_embed_dim = res_mask.sum().item()
     
-    print(f"DEBUG: Residual gate mask - keeping {new_embed_dim}/{len(res_mask)} dims")
-    print(f"  Gate weight range: [{gated_model.res_gate.weight.data.min():.4f}, {gated_model.res_gate.weight.data.max():.4f}]")
-    print(f"  Threshold: {GATE_THRESHOLD}")
+    print(f"  Result: Keeping {new_embed_dim}/{len(res_mask)} embedding dims ({new_embed_dim/len(res_mask)*100:.1f}%)")
     
     head_masks = []
     mlp_masks = []
+    
+    print(f"\nDEBUG - Per-Block Gates:")
     for i, block in enumerate(gated_model.blocks):
-        head_mask = (block.attn.attn_gate.weight.data.abs() > GATE_THRESHOLD).cpu()
-        mlp_mask = (block.mlp.hidden_gate.weight.data.abs() > GATE_THRESHOLD).cpu()
-        
+        # Attention heads
+        attn_gate_weights = block.attn.attn_gate.weight.data
+        head_mask = (attn_gate_weights.abs() > GATE_THRESHOLD).cpu()
         head_masks.append(head_mask)
+        
+        # MLP hidden dims
+        mlp_gate_weights = block.mlp.hidden_gate.weight.data
+        mlp_mask = (mlp_gate_weights.abs() > GATE_THRESHOLD).cpu()
         mlp_masks.append(mlp_mask)
         
-        if i == 0:  # Debug first block
-            print(f"DEBUG: Block 0 attention - keeping {head_mask.sum()}/{len(head_mask)} heads")
-            print(f"  Gate weight range: [{block.attn.attn_gate.weight.data.min():.4f}, {block.attn.attn_gate.weight.data.max():.4f}]")
-            print(f"DEBUG: Block 0 MLP - keeping {mlp_mask.sum()}/{len(mlp_mask)} dims")
-            print(f"  Gate weight range: [{block.mlp.hidden_gate.weight.data.min():.4f}, {block.mlp.hidden_gate.weight.data.max():.4f}]")
+        if i < 3 or i >= len(gated_model.blocks) - 1:  # Show first 3 and last block
+            print(f"  Block {i}:")
+            print(f"    Attention: {head_mask.sum()}/{len(head_mask)} heads (weights: [{attn_gate_weights.min():.4f}, {attn_gate_weights.max():.4f}])")
+            print(f"    MLP: {mlp_mask.sum()}/{len(mlp_mask)} dims (weights: [{mlp_gate_weights.min():.4f}, {mlp_gate_weights.max():.4f}])")
+        elif i == 3:
+            print(f"  ... (blocks 3-{len(gated_model.blocks)-2} omitted) ...")
     
     # Calculate per-layer dimensions
     per_layer_num_heads = [mask.sum().item() for mask in head_masks]
@@ -830,6 +845,14 @@ def convert_to_deployment_model(gated_model, num_classes, save_masks=True, save_
     print(f"  Embed dim: {new_embed_dim} ({new_embed_dim/gated_model.embed_dim*100:.1f}%)")
     print(f"  Avg heads: {np.mean(per_layer_num_heads):.1f} ({np.mean(per_layer_num_heads)/gated_model.num_heads*100:.1f}%)")
     print(f"  Avg MLP dim: {np.mean(per_layer_mlp_dim):.0f} ({np.mean(per_layer_mlp_dim)/(gated_model.embed_dim*4)*100:.1f}%)")
+    
+    # CRITICAL CHECK: If nothing was pruned, warn user
+    if new_embed_dim == gated_model.embed_dim and all(h == gated_model.num_heads for h in per_layer_num_heads):
+        print("\n" + "!"*80)
+        print("WARNING: NO PRUNING DETECTED!")
+        print("  All gates are above threshold - deployment model will be same size as training model")
+        print("  This is expected for baseline method, but indicates a problem for pruning methods")
+        print("!"*80)
     
     # Create deployment model
     deploy_model = DeployVisionTransformer(
@@ -871,7 +894,10 @@ def convert_to_deployment_model(gated_model, num_classes, save_masks=True, save_
         
         # Transfer each block
         for i, (block, head_mask, mlp_mask) in enumerate(zip(gated_model.blocks, head_masks, mlp_masks)):
-            print(f"  Block {i}: {per_layer_num_heads[i]} heads, {per_layer_mlp_dim[i]} MLP dims")
+            if i < 2 or i >= len(gated_model.blocks) - 1:
+                print(f"  Block {i}: {per_layer_num_heads[i]} heads, {per_layer_mlp_dim[i]} MLP dims")
+            elif i == 2:
+                print(f"  ... (blocks 2-{len(gated_model.blocks)-2} pruned similarly) ...")
             
             # Norm layers
             deploy_dict[f'blocks.{i}.norm1.weight'].copy_(gated_dict[f'blocks.{i}.norm1.weight'][res_mask])
