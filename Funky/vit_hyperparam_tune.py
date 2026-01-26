@@ -1,6 +1,6 @@
 """
 ViT Hyperparameter Tuning - Baseline & Progressive Pruning
-Clean output: acc/AUC per epoch, comprehensive CSV tracking
+CORRECTED: Both methods convert to deployment model and finetune for fair comparison
 """
 
 import os
@@ -18,7 +18,10 @@ import copy
 import gc
 from functools import partial
 import time
-from datetime import datetime
+import warnings
+
+# Suppress the backward hook warning
+warnings.filterwarnings('ignore', category=FutureWarning, module='torch.nn.modules.module')
 
 # ==================== CONFIGURATION ====================
 
@@ -546,15 +549,15 @@ def prepare_pruning_list(model, pruning_layer_type):
         if hasattr(m, "do_not_update"):
             if pruning_layer_type == 0 and 'attn_gate' in module_name:
                 m.register_forward_hook(forward_hook)
-                m.register_backward_hook(backward_hook)
+                m.register_full_backward_hook(backward_hook)
                 pruning_modules.append(m)
             elif pruning_layer_type == 1 and 'hidden_gate' in module_name:
                 m.register_forward_hook(forward_hook)
-                m.register_backward_hook(backward_hook)
+                m.register_full_backward_hook(backward_hook)
                 pruning_modules.append(m)
             elif pruning_layer_type == 2 and 'res_gate' in module_name:
                 m.register_forward_hook(forward_hook)
-                m.register_backward_hook(backward_hook)
+                m.register_full_backward_hook(backward_hook)
                 pruning_modules.append(m)
     return pruning_modules
 
@@ -774,12 +777,14 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, gate_l1_weight=0.
     return running_loss / len(train_loader), correct / total
 
 def finetune_deploy(deploy_model, train_loader, val_loader, epochs, lr, weight_decay):
+    """Finetune deployment model after conversion"""
     optimizer = optim.AdamW(deploy_model.parameters(), lr=lr, weight_decay=weight_decay)
     total_steps = epochs * len(train_loader)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=MIN_LR)
     best_val_acc = 0.0
     best_state = None
 
+    print(f"  [Finetuning deployment model for {epochs} epochs]")
     for epoch in range(1, epochs + 1):
         train_one_epoch(deploy_model, train_loader, optimizer, scheduler, gate_l1_weight=0.0)
         val_acc, _ = evaluate_model(deploy_model, val_loader, DEVICE)
@@ -789,13 +794,19 @@ def finetune_deploy(deploy_model, train_loader, val_loader, epochs, lr, weight_d
 
     if best_state is not None:
         deploy_model.load_state_dict(best_state)
+    print(f"  [Deployment model finetuned: best val acc = {best_val_acc:.4f}]")
     return deploy_model
 
 # ==================== BASELINE TRAINING ====================
 
 def train_baseline(config, train_loader, val_loader, test_loader, num_classes, epoch_log):
+    """
+    Baseline training - NO pruning, but DOES convert to deployment model and finetune
+    This ensures fair comparison with progressive pruning
+    """
     model = create_gated_vit(num_classes, pretrained=True).to(DEVICE)
 
+    # Freeze gates (no pruning for baseline)
     for name, param in model.named_parameters():
         if 'gate' in name:
             param.requires_grad = False
@@ -822,20 +833,31 @@ def train_baseline(config, train_loader, val_loader, test_loader, num_classes, e
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
-    deploy_model, _ = convert_to_deployment(model, num_classes)
+    # Convert to deployment model (no pruning, so same size)
+    deploy_model, deploy_config = convert_to_deployment(model, num_classes)
+    
+    # CRITICAL FIX: Finetune deployment model (same as progressive for fair comparison)
+    deploy_model = finetune_deploy(deploy_model, train_loader, val_loader,
+                                    config['DEPLOY_FINETUNE_EPOCHS'], config['DEPLOY_FINETUNE_LR'],
+                                    config['WEIGHT_DECAY'])
+    
+    # Final evaluation on finetuned deployment model
     test_acc, test_auc = evaluate_model(deploy_model, test_loader, DEVICE)
 
     return {
         'test_acc': test_acc, 'test_auc': test_auc, 'best_val_acc': best_val_acc,
         'params_m': count_parameters(deploy_model), 'size_mb': model_size_mb(deploy_model),
-        'flops_g': deploy_model.compute_flops() / 1e9, 'deploy_embed': deploy_model.embed_dim,
-        'deploy_avg_heads': np.mean(deploy_model.per_layer_num_heads),
-        'deploy_avg_mlp': np.mean(deploy_model.per_layer_mlp_dim)
+        'flops_g': deploy_model.compute_flops() / 1e9, 'deploy_embed': deploy_config['embed_dim'],
+        'deploy_avg_heads': deploy_config['avg_heads'], 'deploy_avg_mlp': deploy_config['avg_mlp']
     }
 
 # ==================== PROGRESSIVE PRUNING ====================
 
 def train_progressive(config, train_loader, val_loader, test_loader, num_classes, epoch_log):
+    """
+    Progressive pruning with deployment conversion and finetuning
+    Shows DEPLOYMENT MODEL performance after each pruning step
+    """
     prune_epochs = [config['WARMUP_EPOCHS'] + 1 + i * config['EPOCHS_BETWEEN_PRUNES']
                     for i in range(config['NUM_PRUNE_STEPS'])]
 
@@ -854,6 +876,10 @@ def train_progressive(config, train_loader, val_loader, test_loader, num_classes
     best_val_acc_after_prune = 0.0
     best_model_after_prune = None
     final_prune_epoch = max(prune_epochs)
+    
+    # Track current deployment model for per-epoch evaluation
+    current_deploy_model = None
+    last_prune_epoch = 0
 
     for epoch in range(1, config['TOTAL_EPOCHS'] + 1):
         if epoch in prune_epochs:
@@ -869,20 +895,32 @@ def train_progressive(config, train_loader, val_loader, test_loader, num_classes
             current_lr *= config['LR_REDUCTION_AFTER_PRUNE']
             for param_group in optimizer.param_groups:
                 param_group['lr'] = current_lr
+            
+            # Convert to deployment model to show actual compressed performance
+            current_deploy_model, _ = convert_to_deployment(model, num_classes)
+            last_prune_epoch = epoch
 
         steps_per_epoch = len(train_loader)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps_per_epoch, eta_min=MIN_LR)
 
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scheduler,
                                                  gate_l1_weight=config['GATE_L1_WEIGHT'])
-        val_acc, val_auc = evaluate_model(model, val_loader, DEVICE)
-        test_acc, test_auc = evaluate_model(model, test_loader, DEVICE)
+        
+        # Evaluate on DEPLOYMENT MODEL if we've pruned, otherwise gated model
+        if current_deploy_model is not None:
+            val_acc, val_auc = evaluate_model(current_deploy_model, val_loader, DEVICE)
+            test_acc, test_auc = evaluate_model(current_deploy_model, test_loader, DEVICE)
+            eval_model_type = 'deploy'
+        else:
+            val_acc, val_auc = evaluate_model(model, val_loader, DEVICE)
+            test_acc, test_auc = evaluate_model(model, test_loader, DEVICE)
+            eval_model_type = 'gated'
 
         gate_stats = get_gate_stats(model)
-        print(f"  E{epoch:02d} | Acc: {val_acc:.4f} | AUC: {val_auc:.4f} | Sparse: {gate_stats['res_zeros_pct']:.1f}%")
+        print(f"  E{epoch:02d} | Acc: {val_acc:.4f} | AUC: {val_auc:.4f} | Sparse: {gate_stats['res_zeros_pct']:.1f}% | {eval_model_type}")
 
         epoch_log.append({'epoch': epoch, 'val_acc': val_acc, 'val_auc': val_auc, 'test_acc': test_acc,
-                          'test_auc': test_auc, **gate_stats})
+                          'test_auc': test_auc, 'eval_model': eval_model_type, **gate_stats})
 
         if epoch > final_prune_epoch and val_acc > best_val_acc_after_prune:
             best_val_acc_after_prune = val_acc
@@ -891,11 +929,15 @@ def train_progressive(config, train_loader, val_loader, test_loader, num_classes
     if best_model_after_prune is not None:
         model.load_state_dict(best_model_after_prune)
 
+    # Final deployment model (physically smaller)
     deploy_model, deploy_config = convert_to_deployment(model, num_classes)
+    
+    # Finetune deployment model
     deploy_model = finetune_deploy(deploy_model, train_loader, val_loader,
                                     config['DEPLOY_FINETUNE_EPOCHS'], config['DEPLOY_FINETUNE_LR'],
                                     config['WEIGHT_DECAY'])
 
+    # Final evaluation on finetuned deployment model
     test_acc, test_auc = evaluate_model(deploy_model, test_loader, DEVICE)
 
     return {
@@ -912,6 +954,7 @@ def main():
 
     print(f"Device: {DEVICE}")
     print(f"Configs: {len(CONFIGS)}")
+    print("CORRECTED: Both baseline and progressive convert to deployment + finetune")
 
     all_results = []
     all_epoch_logs = []
@@ -943,7 +986,7 @@ def main():
                 for e in epoch_log:
                     e.update({'config': config['name'], 'method': 'baseline', 'dataset': ds_name})
                 all_epoch_logs.extend(epoch_log)
-                print(f"  Final: Acc={result['test_acc']:.4f} AUC={result['test_auc']:.4f}")
+                print(f"  Final (after deploy finetune): Acc={result['test_acc']:.4f} AUC={result['test_auc']:.4f}")
             except Exception as ex:
                 print(f"  ERROR: {ex}")
             cleanup_memory()
@@ -961,7 +1004,7 @@ def main():
                 for e in epoch_log:
                     e.update({'config': config['name'], 'method': 'progressive', 'dataset': ds_name})
                 all_epoch_logs.extend(epoch_log)
-                print(f"  Final: Acc={result['test_acc']:.4f} AUC={result['test_auc']:.4f} Params={result['params_m']:.2f}M")
+                print(f"  Final (after deploy finetune): Acc={result['test_acc']:.4f} AUC={result['test_auc']:.4f} Params={result['params_m']:.2f}M")
             except Exception as ex:
                 print(f"  ERROR: {ex}")
             cleanup_memory()
