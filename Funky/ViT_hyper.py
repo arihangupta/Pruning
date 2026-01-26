@@ -581,7 +581,7 @@ class StructuredPruner:
             else:
                 self.pruning_scores["averaged"][layer] = (self.momentum * self.pruning_scores["averaged"][layer] +
                                                           (1 - self.momentum) * contribution)
-        criteria = [score.cpu().numpy() if torch.is_tensor(score) else score
+        criteria = [score.detach().cpu().numpy() if torch.is_tensor(score) else score
                     for score in self.pruning_scores['averaged']]
         return criteria
 
@@ -793,8 +793,8 @@ def finetune_deploy(deploy_model, train_loader, val_loader, epochs, lr, weight_d
 
 def train_baseline(config, train_loader, val_loader, test_loader, num_classes, epoch_log):
     """
-    Baseline training - NO pruning, but DOES convert to deployment model and finetune
-    This ensures fair comparison with progressive pruning
+    Baseline training - NO pruning, trains for TOTAL_EPOCHS only.
+    Converts to deployment model at the end for fair size/FLOPs comparison.
     """
     model = create_gated_vit(num_classes, pretrained=True).to(DEVICE)
 
@@ -825,15 +825,10 @@ def train_baseline(config, train_loader, val_loader, test_loader, num_classes, e
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
-    # Convert to deployment model (no pruning, so same size)
+    # Convert to deployment model (no pruning, so same size - just removes gate layers)
     deploy_model, deploy_config = convert_to_deployment(model, num_classes)
-    
-    # CRITICAL FIX: Finetune deployment model (same as progressive for fair comparison)
-    deploy_model = finetune_deploy(deploy_model, train_loader, val_loader,
-                                    config['DEPLOY_FINETUNE_EPOCHS'], config['DEPLOY_FINETUNE_LR'],
-                                    config['WEIGHT_DECAY'])
-    
-    # Final evaluation on finetuned deployment model
+
+    # Final evaluation (no additional finetuning - all training within TOTAL_EPOCHS)
     test_acc, test_auc = evaluate_model(deploy_model, test_loader, DEVICE)
 
     return {
@@ -959,19 +954,13 @@ def train_progressive(config, train_loader, val_loader, test_loader, num_classes
     # If we never converted to deploy (shouldn't happen with proper config), do it now
     if deploy_model is None:
         print("  [WARNING: No deployment conversion happened, converting now]")
-        deploy_model, deploy_config = convert_to_deployment(model, num_classes)
+        deploy_model, _ = convert_to_deployment(model, num_classes)
     elif best_deploy_state is not None:
-        # Restore best deployment model state before final finetuning
+        # Restore best deployment model state
         deploy_model.load_state_dict(best_deploy_state)
         print(f"  [Restored best deployment model with val_acc={best_deploy_val_acc:.4f}]")
 
-    # Final deployment finetuning (extra polish)
-    print(f"  [Final deployment finetuning for {config['DEPLOY_FINETUNE_EPOCHS']} epochs]")
-    deploy_model = finetune_deploy(deploy_model, train_loader, val_loader,
-                                    config['DEPLOY_FINETUNE_EPOCHS'], config['DEPLOY_FINETUNE_LR'],
-                                    config['WEIGHT_DECAY'])
-
-    # Final evaluation
+    # Final evaluation (no additional finetuning - all training within TOTAL_EPOCHS)
     test_acc, test_auc = evaluate_model(deploy_model, test_loader, DEVICE)
 
     deploy_config_final = {
