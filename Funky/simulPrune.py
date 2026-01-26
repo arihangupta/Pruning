@@ -23,7 +23,7 @@ except ImportError:
     EmissionsTracker = None
     CODECARBON_AVAILABLE = False
 
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/progressive_pruning_results"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/multipleTrials/CNN"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
@@ -51,7 +51,7 @@ EPOCHS_BETWEEN_PRUNES = 3
 NUM_PRUNE_STEPS = 4
 PRUNE_PERCENT = 0.10
 LR_REDUCTION_AFTER_PRUNE = 0.5
-NUM_TRIALS = 1
+NUM_TRIALS = 3
 IMPORTANCE_CAL_BATCHES = 50
 PRUNE_THEN_TRAIN_TARGETS = {"layer1": 42, "layer2": 84, "layer3": 168, "layer4": 336}
 TIMING_BATCHES = 100

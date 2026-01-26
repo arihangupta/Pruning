@@ -51,7 +51,7 @@ except ImportError:
 # ==================== CONFIGURATION ====================
 
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
-SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/vit_deployment_pruning"
+SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/multipleTrials/vit"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
@@ -77,10 +77,10 @@ GATE_L1_WEIGHT = 1e-4
 
 # Deployment finetuning (after conversion to smaller model)
 DEPLOY_FINETUNE_EPOCHS = 5
-DEPLOY_FINETUNE_LR = 5e-5
+DEPLOY_FINETUNE_LR = 5e-4
 
 # Experimental configuration
-NUM_TRIALS = 1
+NUM_TRIALS = 3
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
