@@ -1417,6 +1417,12 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
     best_model_state = None
     best_epoch = 0
     
+    # CRITICAL FIX: Track best model AFTER final pruning
+    final_prune_epoch = max(prune_epochs)
+    best_val_acc_after_pruning = 0.0
+    best_model_after_pruning = None
+    best_epoch_after_pruning = 0
+    
     # Start energy tracking
     tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_progressive_trial{trial_num}")
     
@@ -1468,20 +1474,31 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
         print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
         print(f"  Val   - Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
         
+        # Track overall best (for logging)
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_model_state = copy.deepcopy(model.state_dict())
             best_epoch = epoch
-            print(f"  ✓ New best validation accuracy: {val_acc:.4f}")
+            print(f"  ✓ New best validation accuracy (overall): {val_acc:.4f}")
+        
+        # CRITICAL FIX: Track best AFTER final pruning (for deployment)
+        if epoch > final_prune_epoch and val_acc > best_val_acc_after_pruning:
+            best_val_acc_after_pruning = val_acc
+            best_model_after_pruning = copy.deepcopy(model.state_dict())
+            best_epoch_after_pruning = epoch
+            print(f"  ✓ New best validation accuracy (post-pruning): {val_acc:.4f}")
         
         all_metrics.append({
             'trial': trial_num, 'epoch': epoch, 'train_loss': train_loss, 'train_acc': train_acc,
             'val_acc': val_acc, 'test_acc': test_acc, 'params_m': count_parameters(model), 'lr': current_lr
         })
     
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print(f"\n✓ Loaded best model from epoch {best_epoch}")
+    # CRITICAL FIX: Load best model AFTER pruning (not overall best)
+    if best_model_after_pruning is not None:
+        model.load_state_dict(best_model_after_pruning)
+        print(f"\n✓ Loaded best post-pruning model from epoch {best_epoch_after_pruning} (val_acc={best_val_acc_after_pruning:.4f})")
+    else:
+        print(f"\n✓ Using final epoch model (no checkpoints after pruning)")
     
     # Final gate statistics
     print("\nFinal gate statistics before deployment conversion:")
@@ -1523,8 +1540,8 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
         'model': model_name,
         'trial': trial_num,
         'total_epochs': FIXED_EPOCHS,
-        'best_epoch': best_epoch,
-        'best_val_acc': best_val_acc,
+        'best_epoch': best_epoch_after_pruning,  # Report post-pruning best
+        'best_val_acc': best_val_acc_after_pruning,
         'test_acc': test_acc,
         'test_auc': test_auc,
         'test_precision': test_precision,
