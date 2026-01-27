@@ -68,7 +68,6 @@ IMG_SIZE = 224
 
 # Training configuration (from gentle_40pct - best performing config)
 FIXED_EPOCHS = 20
-BATCH_SIZE = 64
 INITIAL_LR = 1e-4
 WEIGHT_DECAY = 1e-4
 MIN_LR = 1e-6
@@ -89,16 +88,20 @@ GATE_L1_WEIGHT = 3e-5  # Lower L1 weight for gentler pruning
 DEPLOY_FINETUNE_EPOCHS = 0
 DEPLOY_FINETUNE_LR = 1e-4
 
+# Use mixed precision training (reduces memory usage significantly)
+USE_AMP = True
+
 # ==================== EXPERIMENT CONFIGURATION ====================
 # Number of replicates for each (model, method) combination
 # Total runs = NUM_TRIALS × len(MODELS_TO_RUN) × 3 methods × len(datasets)
 # Default: 3 trials × 2 models × 3 methods × 3 datasets = 54 total runs
 NUM_TRIALS = 3
 
-# Models to test (ViT-Tiny and ViT-Base)
+# Models to test (ViT-Tiny and ViT-Base) with model-specific batch sizes
+# ViT-Base needs smaller batch size due to larger memory footprint (~86M vs ~5.7M params)
 MODEL_CONFIGS = {
-    'vit_tiny_patch16_224': {'embed_dim': 192, 'depth': 12, 'num_heads': 3, 'mlp_ratio': 4},
-    'vit_base_patch16_224': {'embed_dim': 768, 'depth': 12, 'num_heads': 12, 'mlp_ratio': 4},
+    'vit_tiny_patch16_224': {'embed_dim': 192, 'depth': 12, 'num_heads': 3, 'mlp_ratio': 4, 'batch_size': 64},
+    'vit_base_patch16_224': {'embed_dim': 768, 'depth': 12, 'num_heads': 12, 'mlp_ratio': 4, 'batch_size': 16},
 }
 
 # Which models to run (can be modified via command line)
@@ -267,31 +270,31 @@ class NumpyMemmapDataset(Dataset):
         x = self.normalize(x)
         return x, label
 
-def load_dataset(npz_path):
-    """Load dataset from NPZ file"""
-    print(f"Loading {npz_path}...")
+def load_dataset(npz_path, batch_size=64):
+    """Load dataset from NPZ file with specified batch size"""
+    print(f"Loading {npz_path} (batch_size={batch_size})...")
     data = np.load(npz_path, mmap_mode="r")
-    
+
     X_train, y_train = data["train_images"], data["train_labels"].flatten()
     X_val, y_val = data["val_images"], data["val_labels"].flatten()
     X_test, y_test = data["test_images"], data["test_labels"].flatten()
-    
+
     print(f"Dataset sizes: train={len(y_train)}, val={len(y_val)}, test={len(y_test)}")
-    
+
     train_ds = NumpyMemmapDataset(X_train, y_train, img_size=IMG_SIZE, is_train=True)
     val_ds = NumpyMemmapDataset(X_val, y_val, img_size=IMG_SIZE, is_train=False)
     test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, is_train=False)
-    
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
+    val_loader = DataLoader(val_ds, batch_size=batch_size * 2, shuffle=False,
                             num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
+    test_loader = DataLoader(test_ds, batch_size=batch_size * 2, shuffle=False,
                              num_workers=4, pin_memory=True)
-    
+
     num_classes = int(len(np.unique(np.concatenate([y_train, y_val, y_test]))))
     dataset_name = os.path.splitext(os.path.basename(npz_path))[0].replace('_224', '')
-    
+
     return train_loader, val_loader, test_loader, num_classes, dataset_name
 
 # ==================== METRICS ====================
@@ -1217,51 +1220,64 @@ def apply_pruning_per_component(model, pruners, target_sparsity=0.5):
 
 # ==================== TRAINING FUNCTIONS ====================
 
-def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, gate_l1_weight=0.0):
+def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, gate_l1_weight=0.0, scaler=None):
     """
-    Training epoch with L1 regularization on gates
-    FIX: Adds sparsity-inducing penalty to force gates toward zero
+    Training epoch with L1 regularization on gates and optional AMP (mixed precision)
     """
     model.train()
     running_loss = 0.0
     running_gate_loss = 0.0
     correct = 0
     total = 0
-    
+
+    use_amp = scaler is not None
+
     for images, labels in train_loader:
         images, labels = images.to(DEVICE), labels.to(DEVICE)
-        
+
         optimizer.zero_grad()
-        outputs = model(images)
-        task_loss = nn.functional.cross_entropy(outputs, labels)
-        
-        # CRITICAL FIX: Add L1 regularization to gates
-        gate_l1_loss = 0.0
-        if gate_l1_weight > 0:
-            for name, param in model.named_parameters():
-                if 'gate' in name and 'weight' in name:
-                    gate_l1_loss += torch.abs(param).sum()
-        
-        total_loss = task_loss + gate_l1_weight * gate_l1_loss
-        
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+
+        # Mixed precision forward pass
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            outputs = model(images)
+            task_loss = nn.functional.cross_entropy(outputs, labels)
+
+            # L1 regularization on gates
+            gate_l1_loss = 0.0
+            if gate_l1_weight > 0:
+                for name, param in model.named_parameters():
+                    if 'gate' in name and 'weight' in name:
+                        gate_l1_loss += torch.abs(param).sum()
+
+            total_loss = task_loss + gate_l1_weight * gate_l1_loss
+
+        # Backward with or without scaler
+        if use_amp:
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
         scheduler.step()
-        
+
         running_loss += task_loss.item()
         running_gate_loss += gate_l1_loss.item() if isinstance(gate_l1_loss, torch.Tensor) else 0.0
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
-    
+
     avg_loss = running_loss / len(train_loader)
     avg_gate_loss = running_gate_loss / len(train_loader)
     acc = correct / total
-    
+
     if gate_l1_weight > 0:
         print(f"    Task Loss: {avg_loss:.4f}, Gate L1: {avg_gate_loss:.4f}")
-    
+
     return avg_loss, acc
 
 def finetune_deployment_model(deploy_model, train_loader, val_loader, epochs=5, lr=5e-5):
@@ -1305,36 +1321,40 @@ def train_baseline_vit(dataset_name, model_name, train_loader, val_loader, test_
     print("\n" + "="*80)
     print(f"METHOD 1: BASELINE - {dataset_name.upper()} - {model_name} - TRIAL {trial_num}")
     print("="*80)
-    
+
     # Create gated model (gates stay at 1.0)
     model = create_gated_vit_from_timm(model_name, num_classes, pretrained=True).to(DEVICE)
     print(f"Parameters: {count_parameters(model):.2f}M")
-    
+
     # Freeze gates
     for name, param in model.named_parameters():
         if 'gate' in name:
             param.requires_grad = False
-    
+
     # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
     total_steps = FIXED_EPOCHS * len(train_loader)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=MIN_LR)
-    
+
+    # AMP scaler for mixed precision
+    scaler = torch.cuda.amp.GradScaler() if USE_AMP and DEVICE.type == 'cuda' else None
+
     # Track metrics
     history = []
     best_val_acc = 0.0
     best_model_state = None
     best_epoch = 0
-    
+
     # Start energy tracking
     tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_baseline_trial{trial_num}")
-    
-    print(f"\nTraining for {FIXED_EPOCHS} epochs...")
-    
+
+    print(f"\nTraining for {FIXED_EPOCHS} epochs (AMP={scaler is not None})...")
+
     for epoch in range(1, FIXED_EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
-        
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scheduler, epoch, gate_l1_weight=0.0)
+
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scheduler, epoch,
+                                                 gate_l1_weight=0.0, scaler=scaler)
         val_acc, val_auc, val_precision, val_recall, val_f1 = evaluate_model(model, val_loader, DEVICE)
         test_acc, test_auc, test_precision, test_recall, test_f1 = evaluate_model(model, test_loader, DEVICE)
         
@@ -1445,6 +1465,9 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
     total_steps = FIXED_EPOCHS * len(train_loader)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=MIN_LR)
 
+    # AMP scaler for mixed precision
+    scaler = torch.cuda.amp.GradScaler() if USE_AMP and DEVICE.type == 'cuda' else None
+
     # Track metrics
     all_metrics = []
     deploy_model = None
@@ -1456,6 +1479,8 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
 
     # Start energy tracking
     tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_progressive_trial{trial_num}")
+
+    print(f"Training with AMP={scaler is not None}")
 
     for epoch in range(1, FIXED_EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
@@ -1511,7 +1536,8 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
 
         # Train
         train_loss, train_acc = train_one_epoch(
-            active_model, train_loader, optimizer, scheduler, epoch, gate_l1_weight=gate_l1
+            active_model, train_loader, optimizer, scheduler, epoch,
+            gate_l1_weight=gate_l1, scaler=scaler
         )
 
         # Evaluate
@@ -1632,13 +1658,17 @@ def train_small_model_from_scratch(dataset_name, model_name, train_loader, val_l
     total_steps = FIXED_EPOCHS * len(train_loader)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=MIN_LR)
 
+    # AMP scaler for mixed precision
+    scaler = torch.cuda.amp.GradScaler() if USE_AMP and DEVICE.type == 'cuda' else None
+    use_amp = scaler is not None
+
     # Track metrics
     all_metrics = []
     best_val_acc = 0.0
     best_model_state = None
     best_epoch = 0
 
-    print(f"\nTraining small model for {FIXED_EPOCHS} epochs (same as baseline)...")
+    print(f"\nTraining small model for {FIXED_EPOCHS} epochs (AMP={use_amp})...")
 
     for epoch in range(1, FIXED_EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
@@ -1653,12 +1683,22 @@ def train_small_model_from_scratch(dataset_name, model_name, train_loader, val_l
             images, labels = images.to(DEVICE), labels.to(DEVICE)
 
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = nn.functional.cross_entropy(outputs, labels)
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                outputs = model(images)
+                loss = nn.functional.cross_entropy(outputs, labels)
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
             scheduler.step()
 
             running_loss += loss.item()
@@ -1937,18 +1977,27 @@ def main():
             print(f"\nDataset not found: {npz_path}")
             continue
 
-        train_loader, val_loader, test_loader, num_classes, dataset_name = load_dataset(npz_path)
-
-        # Run experiments for each model
+        # Run experiments for each model (with model-specific batch size)
         for model_name in models_to_run:
+            # Get model-specific batch size
+            model_batch_size = MODEL_CONFIGS.get(model_name, {}).get('batch_size', 64)
+
+            # Load dataset with model-specific batch size
+            train_loader, val_loader, test_loader, num_classes, dataset_name = load_dataset(
+                npz_path, batch_size=model_batch_size
+            )
+
             print(f"\n" + "#"*100)
-            print(f"# RUNNING: {dataset_name} with {model_name}")
+            print(f"# RUNNING: {dataset_name} with {model_name} (batch_size={model_batch_size})")
             print(f"# Trials: {NUM_TRIALS}, Methods: 3 (baseline, progressive, small_model)")
             print(f"#"*100)
 
             baseline_metrics, progressive_metrics, small_model_metrics = process_dataset(
                 dataset_name, model_name, train_loader, val_loader, test_loader, num_classes, SAVE_DIR
             )
+
+            # Clear GPU memory between models
+            cleanup_memory()
 
             all_results.extend(baseline_metrics)
             all_results.extend(progressive_metrics)
