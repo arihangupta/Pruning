@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/arihangupta/Pruning diff Funky/simulPruneVit.py)",
+      "Bash(python3 -m py_compile:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}

@@ -7,21 +7,28 @@ This implementation follows the Hikvision paper methodology with complete deploy
 3. Measure energy on deployment models (real speedup)
 
 Three methods compared:
-- Baseline: No pruning
-- Progressive Pruning: Gradual pruning during training
-- One-Shot Pruning: Prune at initialization then finetune
+- Baseline: Full ViT-Tiny trained for 20 epochs
+- Progressive Pruning: Gradual pruning during training → physically smaller model
+- Small Model From Scratch: Same dimensions as pruned model, initialized from pretrained,
+  trained with baseline hyperparameters (fair comparison to see if pruning helps)
 
-FIXES APPLIED:
-- L1 regularization on gates to induce sparsity
-- Per-component pruning for balanced reduction
-- Improved sparsity scheduling
-- Gate statistics monitoring
+Configuration: gentle_40pct (best performing from hyperparameter tuning)
+- 40% target sparsity (keep 60% of dimensions)
+- Gentle sparsity schedule: [0.08, 0.16, 0.28, 0.4]
+- Low gate L1 weight: 3e-5
+- 20 total epochs, no deployment finetuning
+
+Metrics tracked:
+- Accuracy, AUC, Precision, Recall, F1
+- Parameters, FLOPs, Model Size
+- Training & Inference Energy (CodeCarbon)
 
 Date: 2026
 """
 
 import os
 import sys
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -31,7 +38,7 @@ import torchvision.transforms as transforms
 from tqdm import tqdm
 import timm
 from sklearn.metrics import (
-    precision_score, recall_score, f1_score, 
+    precision_score, recall_score, f1_score,
     roc_auc_score, confusion_matrix
 )
 from sklearn.preprocessing import label_binarize
@@ -46,41 +53,59 @@ try:
     CODECARBON_AVAILABLE = True
 except ImportError:
     CODECARBON_AVAILABLE = False
-    print("⚠️  CodeCarbon not available - energy metrics will be NaN")
+    print("CodeCarbon not available - energy metrics will be NaN")
 
 # ==================== CONFIGURATION ====================
 
+# Paths
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/multipleTrials/vit"
+
+# Hardware
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
 
-# Training configuration
-FIXED_EPOCHS = 15
+# Training configuration (from gentle_40pct - best performing config)
+FIXED_EPOCHS = 20
 BATCH_SIZE = 64
 INITIAL_LR = 1e-4
 WEIGHT_DECAY = 1e-4
 MIN_LR = 1e-6
 
-# Pruning configuration
-WARMUP_EPOCHS = 2
-EPOCHS_BETWEEN_PRUNES = 3
+# Pruning configuration (from gentle_40pct in ViT_hyper.py)
+WARMUP_EPOCHS = 3
+EPOCHS_BETWEEN_PRUNES = 4
 NUM_PRUNE_STEPS = 4
-TARGET_FLOPS_REDUCTION = 0.5
+TARGET_FLOPS_REDUCTION = 0.4  # 40% max compression (keep 60%)
 PRUNING_MOMENTUM = 0.9
 IMPORTANCE_CAL_BATCHES = 50
-LR_REDUCTION_AFTER_PRUNE = 0.5
+LR_REDUCTION_AFTER_PRUNE = 0.85  # Gentler LR reduction
 
-# CRITICAL: Gate regularization weight (induces sparsity)
-GATE_L1_WEIGHT = 1e-4
+# Gate regularization weight (from gentle_40pct)
+GATE_L1_WEIGHT = 3e-5  # Lower L1 weight for gentler pruning
 
-# Deployment finetuning (after conversion to smaller model)
-DEPLOY_FINETUNE_EPOCHS = 5
-DEPLOY_FINETUNE_LR = 5e-4
+# No separate deployment finetuning - convert mid-training and continue
+DEPLOY_FINETUNE_EPOCHS = 0
+DEPLOY_FINETUNE_LR = 1e-4
 
-# Experimental configuration
+# ==================== EXPERIMENT CONFIGURATION ====================
+# Number of replicates for each (model, method) combination
+# Total runs = NUM_TRIALS × len(MODELS_TO_RUN) × 3 methods × len(datasets)
+# Default: 3 trials × 2 models × 3 methods × 3 datasets = 54 total runs
 NUM_TRIALS = 3
+
+# Models to test (ViT-Tiny and ViT-Base)
+MODEL_CONFIGS = {
+    'vit_tiny_patch16_224': {'embed_dim': 192, 'depth': 12, 'num_heads': 3, 'mlp_ratio': 4},
+    'vit_base_patch16_224': {'embed_dim': 768, 'depth': 12, 'num_heads': 12, 'mlp_ratio': 4},
+}
+
+# Which models to run (can be modified via command line)
+MODELS_TO_RUN = ['vit_tiny_patch16_224', 'vit_base_patch16_224']
+
+# Datasets to process
+DATASETS = ['bloodmnist', 'pathmnist', 'dermamnist']
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -89,8 +114,8 @@ PRUNE_EPOCHS_SCHEDULE = [
     for i in range(NUM_PRUNE_STEPS)
 ]
 
-# Aggressive sparsity schedule (fixes slow pruning)
-SPARSITY_SCHEDULE = [0.2, 0.35, 0.45, 0.5]  # Cumulative sparsity per step
+# Gentle sparsity schedule (from gentle_40pct - stops at 40%)
+SPARSITY_SCHEDULE = [0.08, 0.16, 0.28, 0.4]  # Cumulative sparsity per step
 
 # ==================== UTILITIES ====================
 
@@ -145,39 +170,27 @@ def compute_flops_vit(embed_dim, num_heads, depth, mlp_ratio=4, seq_len=197):
     
     return total_flops
 
-def print_gate_statistics(model):
-    """Print statistics about gate values - CRITICAL for debugging"""
-    print("\n" + "="*80)
-    print("GATE STATISTICS")
-    print("="*80)
-    
-    gate_info = {}
+def get_gate_sparsity(model):
+    """Get sparsity statistics for gates"""
+    gate_info = {'attn': [], 'mlp': [], 'res': []}
     for name, param in model.named_parameters():
         if 'gate' in name and 'weight' in name:
-            weights = param.data.cpu()
-            gate_type = None
+            w = param.data.cpu()
             if 'attn_gate' in name:
-                gate_type = 'Attention'
+                gate_info['attn'].append(w)
             elif 'hidden_gate' in name:
-                gate_type = 'MLP'
+                gate_info['mlp'].append(w)
             elif 'res_gate' in name:
-                gate_type = 'Residual'
-            
-            if gate_type:
-                if gate_type not in gate_info:
-                    gate_info[gate_type] = []
-                gate_info[gate_type].append(weights)
-    
-    for gate_type, weight_list in gate_info.items():
-        all_weights = torch.cat([w.flatten() for w in weight_list])
-        print(f"\n{gate_type} Gates:")
-        print(f"  Total units: {all_weights.numel()}")
-        print(f"  Mean: {all_weights.mean():.4f}, Std: {all_weights.std():.4f}")
-        print(f"  Min: {all_weights.min():.4f}, Max: {all_weights.max():.4f}")
-        print(f"  Zeros: {(all_weights == 0).sum().item()} ({(all_weights == 0).sum().item() / all_weights.numel() * 100:.1f}%)")
-        print(f"  Near-zero (<0.01): {(all_weights.abs() < 0.01).sum().item()} ({(all_weights.abs() < 0.01).sum().item() / all_weights.numel() * 100:.1f}%)")
-    
-    print("="*80)
+                gate_info['res'].append(w)
+
+    stats = {}
+    for k, v in gate_info.items():
+        if v:
+            all_w = torch.cat([x.flatten() for x in v])
+            stats[k] = (all_w.abs() < 0.01).sum().item() / all_w.numel() * 100
+        else:
+            stats[k] = 0
+    return stats
 
 # ==================== ENERGY TRACKING ====================
 
@@ -772,97 +785,65 @@ def create_gated_vit_from_timm(model_name, num_classes, pretrained=True):
                         model_dict[src_key].copy_(timm_dict[src_key])
         
         print("  ✓ Pretrained weights loaded")
-    
+
     return model
 
-# ==================== DEPLOYMENT CONVERSION ====================
 
-def convert_to_deployment_model(gated_model, num_classes, save_masks=True, save_dir=None):
+def create_small_vit_from_pretrained(model_name, num_classes, target_sparsity=0.4, pretrained=True):
     """
-    Convert gated training model to deployment model
-    This creates a PHYSICALLY SMALLER model
-    
+    Create a small DeployVisionTransformer with dimensions matching progressive pruning output.
+    Initialize from ImageNet pretrained weights where possible.
+
+    Args:
+        model_name: Base model name ('vit_tiny_patch16_224' or 'vit_base_patch16_224')
+        num_classes: Number of output classes
+        target_sparsity: Target sparsity (0.4 = keep 60% of each dimension)
+        pretrained: Whether to initialize from pretrained weights
+
     Returns:
-        deploy_model: Smaller model without gates
-        pruning_config: Configuration dictionary for reproducibility
+        deploy_model: Small DeployVisionTransformer
+        config: Configuration dictionary
     """
-    print("\n" + "="*80)
-    print("CONVERTING TO DEPLOYMENT MODEL (Physical Compression)")
-    print("="*80)
-    
-    # CRITICAL FIX: Use absolute threshold instead of != 0
-    GATE_THRESHOLD = 0.01  # Gates below this are considered pruned
-    
-    # Extract gate masks with debugging
-    res_gate_weights = gated_model.res_gate.weight.data
-    print(f"\nDEBUG - Residual Gates:")
-    print(f"  Weight range: [{res_gate_weights.min():.6f}, {res_gate_weights.max():.6f}]")
-    print(f"  Threshold: {GATE_THRESHOLD}")
-    print(f"  Weights > threshold: {(res_gate_weights.abs() > GATE_THRESHOLD).sum()}/{len(res_gate_weights)}")
-    
-    res_mask = (res_gate_weights.abs() > GATE_THRESHOLD).cpu()
-    new_embed_dim = res_mask.sum().item()
-    
-    print(f"  Result: Keeping {new_embed_dim}/{len(res_mask)} embedding dims ({new_embed_dim/len(res_mask)*100:.1f}%)")
-    
-    head_masks = []
-    mlp_masks = []
-    
-    print(f"\nDEBUG - Per-Block Gates:")
-    for i, block in enumerate(gated_model.blocks):
-        # Attention heads
-        attn_gate_weights = block.attn.attn_gate.weight.data
-        head_mask = (attn_gate_weights.abs() > GATE_THRESHOLD).cpu()
-        head_masks.append(head_mask)
-        
-        # MLP hidden dims
-        mlp_gate_weights = block.mlp.hidden_gate.weight.data
-        mlp_mask = (mlp_gate_weights.abs() > GATE_THRESHOLD).cpu()
-        mlp_masks.append(mlp_mask)
-        
-        if i < 3 or i >= len(gated_model.blocks) - 1:  # Show first 3 and last block
-            print(f"  Block {i}:")
-            print(f"    Attention: {head_mask.sum()}/{len(head_mask)} heads (weights: [{attn_gate_weights.min():.4f}, {attn_gate_weights.max():.4f}])")
-            print(f"    MLP: {mlp_mask.sum()}/{len(mlp_mask)} dims (weights: [{mlp_gate_weights.min():.4f}, {mlp_gate_weights.max():.4f}])")
-        elif i == 3:
-            print(f"  ... (blocks 3-{len(gated_model.blocks)-2} omitted) ...")
-    
-    # Calculate per-layer dimensions
-    per_layer_num_heads = [mask.sum().item() for mask in head_masks]
-    per_layer_mlp_dim = [mask.sum().item() for mask in mlp_masks]
-    
-    # Original head dimension (doesn't change)
-    head_dim = gated_model.embed_dim // gated_model.num_heads
-    
-    # Report compression
-    print(f"\nOriginal architecture:")
-    print(f"  Embed dim: {gated_model.embed_dim}")
-    print(f"  Num heads: {gated_model.num_heads}")
-    print(f"  MLP ratio: {gated_model.mlp_ratio}")
-    print(f"  Depth: {gated_model.depth}")
-    
-    print(f"\nDeployment architecture:")
-    print(f"  Embed dim: {new_embed_dim} ({new_embed_dim/gated_model.embed_dim*100:.1f}%)")
-    print(f"  Avg heads: {np.mean(per_layer_num_heads):.1f} ({np.mean(per_layer_num_heads)/gated_model.num_heads*100:.1f}%)")
-    print(f"  Avg MLP dim: {np.mean(per_layer_mlp_dim):.0f} ({np.mean(per_layer_mlp_dim)/(gated_model.embed_dim*4)*100:.1f}%)")
-    
-    # CRITICAL CHECK: If nothing was pruned, warn user
-    if new_embed_dim == gated_model.embed_dim and all(h == gated_model.num_heads for h in per_layer_num_heads):
-        print("\n" + "!"*80)
-        print("WARNING: NO PRUNING DETECTED!")
-        print("  All gates are above threshold - deployment model will be same size as training model")
-        print("  This is expected for baseline method, but indicates a problem for pruning methods")
-        print("!"*80)
-    
-    # Create deployment model
-    deploy_model = DeployVisionTransformer(
+    # Get original model dimensions
+    model_configs = {
+        'vit_tiny_patch16_224': {'embed_dim': 192, 'num_heads': 3, 'mlp_ratio': 4, 'depth': 12},
+        'vit_base_patch16_224': {'embed_dim': 768, 'num_heads': 12, 'mlp_ratio': 4, 'depth': 12},
+    }
+
+    if model_name not in model_configs:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    cfg = model_configs[model_name]
+    orig_embed_dim = cfg['embed_dim']
+    orig_num_heads = cfg['num_heads']
+    orig_mlp_ratio = cfg['mlp_ratio']
+    orig_depth = cfg['depth']
+    orig_head_dim = orig_embed_dim // orig_num_heads
+
+    # Calculate pruned dimensions (keep 1 - target_sparsity of each)
+    keep_ratio = 1.0 - target_sparsity
+
+    new_embed_dim = int(orig_embed_dim * keep_ratio)
+    new_num_heads = max(1, round(orig_num_heads * keep_ratio))  # At least 1 head
+    new_mlp_dim = int(orig_embed_dim * orig_mlp_ratio * keep_ratio)
+
+    # Use same dimensions for all layers (uniform pruning)
+    per_layer_num_heads = [new_num_heads] * orig_depth
+    per_layer_mlp_dim = [new_mlp_dim] * orig_depth
+
+    print(f"\nCreating small ViT matching {target_sparsity:.0%} pruned progressive model:")
+    print(f"  Original: embed_dim={orig_embed_dim}, heads={orig_num_heads}, mlp_dim={orig_embed_dim * orig_mlp_ratio}")
+    print(f"  Small:    embed_dim={new_embed_dim}, heads={new_num_heads}, mlp_dim={new_mlp_dim}")
+
+    # Create small deployment model
+    model = DeployVisionTransformer(
         img_size=IMG_SIZE,
         patch_size=16,
         in_chans=3,
         num_classes=num_classes,
         embed_dim=new_embed_dim,
-        depth=gated_model.depth,
-        head_dim=head_dim,
+        depth=orig_depth,
+        head_dim=orig_head_dim,
         per_layer_num_heads=per_layer_num_heads,
         per_layer_mlp_dim=per_layer_mlp_dim,
         qkv_bias=True,
@@ -870,138 +851,180 @@ def convert_to_deployment_model(gated_model, num_classes, save_masks=True, save_
         attn_drop_rate=0.0,
         drop_path_rate=0.1
     ).to(DEVICE)
-    
+
+    if pretrained:
+        print(f"  Initializing from ImageNet pretrained {model_name} (partial transfer)...")
+        timm_model = timm.create_model(model_name, pretrained=True, num_classes=num_classes)
+        timm_dict = timm_model.state_dict()
+        model_dict = model.state_dict()
+
+        with torch.no_grad():
+            # Patch embedding - take first new_embed_dim channels
+            orig_proj_weight = timm_dict['patch_embed.proj.weight']  # [192, 3, 16, 16]
+            model_dict['patch_embed.proj.weight'].copy_(orig_proj_weight[:new_embed_dim])
+            model_dict['patch_embed.proj.bias'].copy_(timm_dict['patch_embed.proj.bias'][:new_embed_dim])
+
+            # Position embedding - take first new_embed_dim dims
+            orig_pos_embed = timm_dict['pos_embed']  # [1, 197, 192]
+            model_dict['pos_embed'].copy_(orig_pos_embed[:, :, :new_embed_dim])
+
+            # CLS token
+            orig_cls = timm_dict['cls_token']  # [1, 1, 192]
+            model_dict['cls_token'].copy_(orig_cls[:, :, :new_embed_dim])
+
+            # Transfer block weights (partial)
+            for i in range(orig_depth):
+                # Norm layers
+                model_dict[f'blocks.{i}.norm1.weight'].copy_(timm_dict[f'blocks.{i}.norm1.weight'][:new_embed_dim])
+                model_dict[f'blocks.{i}.norm1.bias'].copy_(timm_dict[f'blocks.{i}.norm1.bias'][:new_embed_dim])
+                model_dict[f'blocks.{i}.norm2.weight'].copy_(timm_dict[f'blocks.{i}.norm2.weight'][:new_embed_dim])
+                model_dict[f'blocks.{i}.norm2.bias'].copy_(timm_dict[f'blocks.{i}.norm2.bias'][:new_embed_dim])
+
+                # Attention QKV - need to select heads and embed dims
+                orig_qkv_weight = timm_dict[f'blocks.{i}.attn.qkv.weight']  # [576, 192]
+                orig_qkv_bias = timm_dict[f'blocks.{i}.attn.qkv.bias']  # [576]
+
+                # Reshape to [3, num_heads, head_dim, embed_dim]
+                q_w, k_w, v_w = orig_qkv_weight.chunk(3, dim=0)
+                q_b, k_b, v_b = orig_qkv_bias.chunk(3, dim=0)
+
+                q_w = q_w.view(orig_num_heads, orig_head_dim, orig_embed_dim)[:new_num_heads, :, :new_embed_dim]
+                k_w = k_w.view(orig_num_heads, orig_head_dim, orig_embed_dim)[:new_num_heads, :, :new_embed_dim]
+                v_w = v_w.view(orig_num_heads, orig_head_dim, orig_embed_dim)[:new_num_heads, :, :new_embed_dim]
+                q_b = q_b.view(orig_num_heads, orig_head_dim)[:new_num_heads]
+                k_b = k_b.view(orig_num_heads, orig_head_dim)[:new_num_heads]
+                v_b = v_b.view(orig_num_heads, orig_head_dim)[:new_num_heads]
+
+                new_qkv_weight = torch.cat([q_w.flatten(0, 1), k_w.flatten(0, 1), v_w.flatten(0, 1)], dim=0)
+                new_qkv_bias = torch.cat([q_b.flatten(), k_b.flatten(), v_b.flatten()], dim=0)
+
+                model_dict[f'blocks.{i}.attn.qkv.weight'].copy_(new_qkv_weight)
+                model_dict[f'blocks.{i}.attn.qkv.bias'].copy_(new_qkv_bias)
+
+                # Attention projection
+                orig_proj_weight = timm_dict[f'blocks.{i}.attn.proj.weight']  # [192, 192]
+                orig_proj_weight = orig_proj_weight.view(orig_embed_dim, orig_num_heads, orig_head_dim)
+                new_proj_weight = orig_proj_weight[:new_embed_dim, :new_num_heads, :].flatten(1)
+                model_dict[f'blocks.{i}.attn.proj.weight'].copy_(new_proj_weight)
+                model_dict[f'blocks.{i}.attn.proj.bias'].copy_(timm_dict[f'blocks.{i}.attn.proj.bias'][:new_embed_dim])
+
+                # MLP fc1
+                orig_fc1_weight = timm_dict[f'blocks.{i}.mlp.fc1.weight']  # [768, 192]
+                model_dict[f'blocks.{i}.mlp.fc1.weight'].copy_(orig_fc1_weight[:new_mlp_dim, :new_embed_dim])
+                model_dict[f'blocks.{i}.mlp.fc1.bias'].copy_(timm_dict[f'blocks.{i}.mlp.fc1.bias'][:new_mlp_dim])
+
+                # MLP fc2
+                orig_fc2_weight = timm_dict[f'blocks.{i}.mlp.fc2.weight']  # [192, 768]
+                model_dict[f'blocks.{i}.mlp.fc2.weight'].copy_(orig_fc2_weight[:new_embed_dim, :new_mlp_dim])
+                model_dict[f'blocks.{i}.mlp.fc2.bias'].copy_(timm_dict[f'blocks.{i}.mlp.fc2.bias'][:new_embed_dim])
+
+            # Final norm
+            model_dict['norm.weight'].copy_(timm_dict['norm.weight'][:new_embed_dim])
+            model_dict['norm.bias'].copy_(timm_dict['norm.bias'][:new_embed_dim])
+
+            # Head - random init since num_classes may differ
+            # (already initialized by model's _init_weights)
+
+        print("  ✓ Partial pretrained weights loaded")
+
+    config = {
+        'embed_dim': new_embed_dim,
+        'num_heads': new_num_heads,
+        'mlp_dim': new_mlp_dim,
+        'depth': orig_depth,
+        'head_dim': orig_head_dim,
+        'target_sparsity': target_sparsity,
+        'per_layer_num_heads': per_layer_num_heads,
+        'per_layer_mlp_dim': per_layer_mlp_dim
+    }
+
+    print(f"  Parameters: {count_parameters(model):.2f}M")
+    print(f"  Model size: {model_size_mb(model):.2f}MB")
+
+    return model, config
+
+
+# ==================== DEPLOYMENT CONVERSION ====================
+
+def convert_to_deployment_model(gated_model, num_classes, save_masks=False, save_dir=None):
+    """Convert gated model to physically smaller deployment model."""
+    GATE_THRESHOLD = 0.01
+
+    # Extract masks
+    res_gate_weights = gated_model.res_gate.weight.data
+    res_mask = (res_gate_weights.abs() > GATE_THRESHOLD).cpu()
+    new_embed_dim = res_mask.sum().item()
+
+    head_masks, mlp_masks = [], []
+    for block in gated_model.blocks:
+        head_masks.append((block.attn.attn_gate.weight.data.abs() > GATE_THRESHOLD).cpu())
+        mlp_masks.append((block.mlp.hidden_gate.weight.data.abs() > GATE_THRESHOLD).cpu())
+
+    per_layer_num_heads = [m.sum().item() for m in head_masks]
+    per_layer_mlp_dim = [m.sum().item() for m in mlp_masks]
+    head_dim = gated_model.embed_dim // gated_model.num_heads
+
+    # Create deployment model
+    deploy_model = DeployVisionTransformer(
+        img_size=IMG_SIZE, patch_size=16, in_chans=3, num_classes=num_classes,
+        embed_dim=new_embed_dim, depth=gated_model.depth, head_dim=head_dim,
+        per_layer_num_heads=per_layer_num_heads, per_layer_mlp_dim=per_layer_mlp_dim,
+        qkv_bias=True, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1
+    ).to(DEVICE)
+
     # Transfer weights
-    print("\nTransferring weights from gated model...")
-    
     with torch.no_grad():
-        # Transfer patch embedding (only surviving embed dims)
         gated_dict = gated_model.state_dict()
         deploy_dict = deploy_model.state_dict()
-        
-        # Patch embedding projection
-        orig_proj_weight = gated_dict['patch_embed.proj.weight']  # [embed_dim, 3, 16, 16]
-        deploy_dict['patch_embed.proj.weight'].copy_(orig_proj_weight[res_mask])
+
+        deploy_dict['patch_embed.proj.weight'].copy_(gated_dict['patch_embed.proj.weight'][res_mask])
         deploy_dict['patch_embed.proj.bias'].copy_(gated_dict['patch_embed.proj.bias'][res_mask])
-        
-        # Position embedding
-        orig_pos_embed = gated_dict['pos_embed']  # [1, n_patches+1, embed_dim]
-        deploy_dict['pos_embed'].copy_(orig_pos_embed[:, :, res_mask])
-        
-        # CLS token
-        orig_cls = gated_dict['cls_token']  # [1, 1, embed_dim]
-        deploy_dict['cls_token'].copy_(orig_cls[:, :, res_mask])
-        
-        # Transfer each block
-        for i, (block, head_mask, mlp_mask) in enumerate(zip(gated_model.blocks, head_masks, mlp_masks)):
-            if i < 2 or i >= len(gated_model.blocks) - 1:
-                print(f"  Block {i}: {per_layer_num_heads[i]} heads, {per_layer_mlp_dim[i]} MLP dims")
-            elif i == 2:
-                print(f"  ... (blocks 2-{len(gated_model.blocks)-2} pruned similarly) ...")
-            
-            # Norm layers
+        deploy_dict['pos_embed'].copy_(gated_dict['pos_embed'][:, :, res_mask])
+        deploy_dict['cls_token'].copy_(gated_dict['cls_token'][:, :, res_mask])
+
+        orig_num_heads = gated_model.num_heads
+        for i, (head_mask, mlp_mask) in enumerate(zip(head_masks, mlp_masks)):
             deploy_dict[f'blocks.{i}.norm1.weight'].copy_(gated_dict[f'blocks.{i}.norm1.weight'][res_mask])
             deploy_dict[f'blocks.{i}.norm1.bias'].copy_(gated_dict[f'blocks.{i}.norm1.bias'][res_mask])
             deploy_dict[f'blocks.{i}.norm2.weight'].copy_(gated_dict[f'blocks.{i}.norm2.weight'][res_mask])
             deploy_dict[f'blocks.{i}.norm2.bias'].copy_(gated_dict[f'blocks.{i}.norm2.bias'][res_mask])
-            
-            # Attention QKV
-            orig_qkv_weight = gated_dict[f'blocks.{i}.attn.qkv.weight']  # [3*embed_dim, embed_dim]
-            orig_qkv_bias = gated_dict[f'blocks.{i}.attn.qkv.bias']  # [3*embed_dim]
-            
-            # Split into Q, K, V
-            q_w, k_w, v_w = orig_qkv_weight.chunk(3, dim=0)
-            q_b, k_b, v_b = orig_qkv_bias.chunk(3, dim=0)
-            
-            # Reshape to [num_heads, head_dim, embed_dim] for selection
-            orig_num_heads = gated_model.num_heads
-            q_w = q_w.view(orig_num_heads, head_dim, gated_model.embed_dim)
-            k_w = k_w.view(orig_num_heads, head_dim, gated_model.embed_dim)
-            v_w = v_w.view(orig_num_heads, head_dim, gated_model.embed_dim)
-            q_b = q_b.view(orig_num_heads, head_dim)
-            k_b = k_b.view(orig_num_heads, head_dim)
-            v_b = v_b.view(orig_num_heads, head_dim)
-            
-            # Select surviving heads and embed dims
-            q_w = q_w[head_mask][:, :, res_mask]
-            k_w = k_w[head_mask][:, :, res_mask]
-            v_w = v_w[head_mask][:, :, res_mask]
-            q_b = q_b[head_mask]
-            k_b = k_b[head_mask]
-            v_b = v_b[head_mask]
-            
-            # Concatenate back
-            new_qkv_weight = torch.cat([q_w.flatten(0, 1), k_w.flatten(0, 1), v_w.flatten(0, 1)], dim=0)
-            new_qkv_bias = torch.cat([q_b.flatten(), k_b.flatten(), v_b.flatten()], dim=0)
-            
-            deploy_dict[f'blocks.{i}.attn.qkv.weight'].copy_(new_qkv_weight)
-            deploy_dict[f'blocks.{i}.attn.qkv.bias'].copy_(new_qkv_bias)
-            
-            # Attention projection
-            orig_proj_weight = gated_dict[f'blocks.{i}.attn.proj.weight']  # [embed_dim, embed_dim]
-            orig_proj_weight = orig_proj_weight.view(gated_model.embed_dim, orig_num_heads, head_dim)
-            new_proj_weight = orig_proj_weight[res_mask][:, head_mask, :].flatten(1)
-            deploy_dict[f'blocks.{i}.attn.proj.weight'].copy_(new_proj_weight)
+
+            # QKV
+            q_w, k_w, v_w = gated_dict[f'blocks.{i}.attn.qkv.weight'].chunk(3, dim=0)
+            q_b, k_b, v_b = gated_dict[f'blocks.{i}.attn.qkv.bias'].chunk(3, dim=0)
+            q_w = q_w.view(orig_num_heads, head_dim, gated_model.embed_dim)[head_mask][:, :, res_mask]
+            k_w = k_w.view(orig_num_heads, head_dim, gated_model.embed_dim)[head_mask][:, :, res_mask]
+            v_w = v_w.view(orig_num_heads, head_dim, gated_model.embed_dim)[head_mask][:, :, res_mask]
+            q_b = q_b.view(orig_num_heads, head_dim)[head_mask]
+            k_b = k_b.view(orig_num_heads, head_dim)[head_mask]
+            v_b = v_b.view(orig_num_heads, head_dim)[head_mask]
+            deploy_dict[f'blocks.{i}.attn.qkv.weight'].copy_(torch.cat([q_w.flatten(0,1), k_w.flatten(0,1), v_w.flatten(0,1)], dim=0))
+            deploy_dict[f'blocks.{i}.attn.qkv.bias'].copy_(torch.cat([q_b.flatten(), k_b.flatten(), v_b.flatten()], dim=0))
+
+            # Proj
+            proj_w = gated_dict[f'blocks.{i}.attn.proj.weight'].view(gated_model.embed_dim, orig_num_heads, head_dim)
+            deploy_dict[f'blocks.{i}.attn.proj.weight'].copy_(proj_w[res_mask][:, head_mask, :].flatten(1))
             deploy_dict[f'blocks.{i}.attn.proj.bias'].copy_(gated_dict[f'blocks.{i}.attn.proj.bias'][res_mask])
-            
-            # MLP fc1
-            orig_fc1_weight = gated_dict[f'blocks.{i}.mlp.fc1.weight']  # [mlp_dim, embed_dim]
-            new_fc1_weight = orig_fc1_weight[mlp_mask][:, res_mask]
-            deploy_dict[f'blocks.{i}.mlp.fc1.weight'].copy_(new_fc1_weight)
+
+            # MLP
+            deploy_dict[f'blocks.{i}.mlp.fc1.weight'].copy_(gated_dict[f'blocks.{i}.mlp.fc1.weight'][mlp_mask][:, res_mask])
             deploy_dict[f'blocks.{i}.mlp.fc1.bias'].copy_(gated_dict[f'blocks.{i}.mlp.fc1.bias'][mlp_mask])
-            
-            # MLP fc2
-            orig_fc2_weight = gated_dict[f'blocks.{i}.mlp.fc2.weight']  # [embed_dim, mlp_dim]
-            new_fc2_weight = orig_fc2_weight[res_mask][:, mlp_mask]
-            deploy_dict[f'blocks.{i}.mlp.fc2.weight'].copy_(new_fc2_weight)
+            deploy_dict[f'blocks.{i}.mlp.fc2.weight'].copy_(gated_dict[f'blocks.{i}.mlp.fc2.weight'][res_mask][:, mlp_mask])
             deploy_dict[f'blocks.{i}.mlp.fc2.bias'].copy_(gated_dict[f'blocks.{i}.mlp.fc2.bias'][res_mask])
-        
-        # Final norm
+
         deploy_dict['norm.weight'].copy_(gated_dict['norm.weight'][res_mask])
         deploy_dict['norm.bias'].copy_(gated_dict['norm.bias'][res_mask])
-        
-        # Head
-        orig_head_weight = gated_dict['head.weight']  # [num_classes, embed_dim]
-        deploy_dict['head.weight'].copy_(orig_head_weight[:, res_mask])
+        deploy_dict['head.weight'].copy_(gated_dict['head.weight'][:, res_mask])
         deploy_dict['head.bias'].copy_(gated_dict['head.bias'])
-    
-    print("✓ Weight transfer complete")
-    
-    # Create pruning config for reproducibility
+
     pruning_config = {
         'original_embed_dim': gated_model.embed_dim,
         'original_num_heads': gated_model.num_heads,
-        'original_mlp_ratio': gated_model.mlp_ratio,
         'deploy_embed_dim': new_embed_dim,
         'deploy_per_layer_num_heads': per_layer_num_heads,
         'deploy_per_layer_mlp_dim': per_layer_mlp_dim,
-        'head_masks': [mask.numpy() for mask in head_masks],
-        'mlp_masks': [mask.numpy() for mask in mlp_masks],
-        'res_mask': res_mask.numpy()
     }
-    
-    # Save masks if requested
-    if save_masks and save_dir is not None:
-        mask_path = os.path.join(save_dir, 'pruning_config.pt')
-        torch.save(pruning_config, mask_path)
-        print(f"✓ Pruning config saved to {mask_path}")
-    
-    # Report size reduction
-    orig_params = count_parameters(gated_model)
-    deploy_params = count_parameters(deploy_model)
-    print(f"\nParameter reduction: {orig_params:.2f}M → {deploy_params:.2f}M ({deploy_params/orig_params*100:.1f}%)")
-    
-    orig_size = model_size_mb(gated_model)
-    deploy_size = model_size_mb(deploy_model)
-    print(f"Model size reduction: {orig_size:.2f}MB → {deploy_size:.2f}MB ({deploy_size/orig_size*100:.1f}%)")
-    
-    orig_flops = compute_flops_vit(gated_model.embed_dim, gated_model.num_heads, 
-                                    gated_model.depth, gated_model.mlp_ratio)
-    deploy_flops = deploy_model.compute_flops()
-    print(f"FLOPs reduction: {orig_flops/1e9:.2f}G → {deploy_flops/1e9:.2f}G ({deploy_flops/orig_flops*100:.1f}%)")
-    
-    print("="*80)
-    
+
     return deploy_model, pruning_config
 
 # ==================== TAYLOR IMPORTANCE SCORING ====================
@@ -1094,7 +1117,7 @@ class StructuredPruner:
                 )
         
         criteria = [
-            score.cpu().numpy() if torch.is_tensor(score) else score
+            score.detach().cpu().numpy() if torch.is_tensor(score) else score
             for score in self.pruning_scores['averaged']
         ]
         
@@ -1382,21 +1405,30 @@ def train_baseline_vit(dataset_name, model_name, train_loader, val_loader, test_
 def train_progressive_structured_pruning(dataset_name, model_name, train_loader, val_loader, test_loader,
                                         num_classes, save_dir, trial_num):
     """
-    METHOD 2: Progressive Structured Pruning
-    Converts to deployment model after pruning
+    METHOD 2: Progressive Structured Pruning (gentle_40pct from ViT_hyper.py)
+
+    Flow:
+    1. Train gated model with progressive pruning (multiple steps to 40% sparsity)
+    2. After final prune, convert to deployment model (physically smaller)
+    3. Continue training deployment model for remaining epochs
+    4. Track and restore best deployment model
     """
     print("\n" + "="*80)
     print(f"METHOD 2: PROGRESSIVE STRUCTURED PRUNING - {dataset_name.upper()} - {model_name} - TRIAL {trial_num}")
     print("="*80)
-    
+
     prune_epochs = PRUNE_EPOCHS_SCHEDULE.copy()
+    final_prune_epoch = max(prune_epochs)
+    convert_to_deploy_epoch = final_prune_epoch + 1  # Convert right after final prune
+
     print(f"Pruning schedule: {prune_epochs}")
     print(f"Sparsity schedule: {SPARSITY_SCHEDULE}")
-    
-    # Create model
+    print(f"Convert to deployment after epoch: {final_prune_epoch}")
+
+    # Create gated model
     model = create_gated_vit_from_timm(model_name, num_classes, pretrained=True).to(DEVICE)
     print(f"Initial parameters: {count_parameters(model):.2f}M")
-    
+
     # Setup pruners
     pruners = []
     for component_type in [0, 1, 2]:
@@ -1404,144 +1436,140 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
         if len(modules) > 0:
             pruner = StructuredPruner(model, modules, pruning_momentum=PRUNING_MOMENTUM)
             pruners.append(pruner)
-    
+
     print(f"Created {len(pruners)} pruning engines")
-    
-    # Optimizer
+
+    # Optimizer and scheduler for gated phase
     optimizer = optim.AdamW(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
     current_lr = INITIAL_LR
-    
+    total_steps = FIXED_EPOCHS * len(train_loader)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=MIN_LR)
+
     # Track metrics
     all_metrics = []
-    best_val_acc = 0.0
-    best_model_state = None
-    best_epoch = 0
-    
-    # CRITICAL FIX: Track best model AFTER final pruning
-    final_prune_epoch = max(prune_epochs)
-    best_val_acc_after_pruning = 0.0
-    best_model_after_pruning = None
-    best_epoch_after_pruning = 0
-    
+    deploy_model = None
+    using_deploy = False
+    best_deploy_val_acc = 0.0
+    best_deploy_state = None
+    best_deploy_epoch = 0
+    pruning_config = None
+
     # Start energy tracking
     tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_progressive_trial{trial_num}")
-    
+
     for epoch in range(1, FIXED_EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
-        
-        # Check if pruning epoch
-        if epoch in prune_epochs:
+
+        # Pruning steps (only during gated phase)
+        if not using_deploy and epoch in prune_epochs:
             prune_step = prune_epochs.index(epoch) + 1
-            print(f"\n*** PRUNING STEP {prune_step}/{NUM_PRUNE_STEPS} ***")
-            
+            target_sparsity = SPARSITY_SCHEDULE[prune_step - 1]
+            print(f"  [Pruning step {prune_step}/{NUM_PRUNE_STEPS} -> {target_sparsity*100:.0f}% sparsity]")
+
             # Reset pruners
             for pruner in pruners:
                 pruner.iterations_done = 0
                 pruner.pruning_scores['score'] = [list() for _ in range(len(pruner.pruning_parameters))]
-            
-            # Collect importance
+
+            # Collect importance and prune
             collect_importance_scores(model, pruners, train_loader, max_batches=IMPORTANCE_CAL_BATCHES)
-            
-            # FIX: Use aggressive sparsity schedule
-            target_sparsity = SPARSITY_SCHEDULE[prune_step - 1]
-            
-            # FIX: Apply per-component pruning
             apply_pruning_per_component(model, pruners, target_sparsity=target_sparsity)
-            
-            # Debug: Print gate statistics
-            print_gate_statistics(model)
-            
-            # Reduce LR
+
+            # Print gate statistics
+            gate_stats = get_gate_sparsity(model)
+            print(f"  Gate sparsity: Attn={gate_stats['attn']:.1f}%, MLP={gate_stats['mlp']:.1f}%, Res={gate_stats['res']:.1f}%")
+
+            # Reduce LR after pruning
             current_lr *= LR_REDUCTION_AFTER_PRUNE
             for param_group in optimizer.param_groups:
                 param_group['lr'] = current_lr
             print(f"  LR reduced to {current_lr:.6f}")
-        
-        # Setup scheduler
-        steps_per_epoch = len(train_loader)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps_per_epoch, eta_min=MIN_LR)
-        
-        # Train with gate regularization
+
+        # Convert to deployment model after final pruning
+        if epoch == convert_to_deploy_epoch and not using_deploy:
+            print(f"  [All pruning complete - converting to deployment model]")
+
+            # Final gate statistics before conversion
+            gate_stats = get_gate_sparsity(model)
+            print(f"  Final gate sparsity: Attn={gate_stats['attn']:.1f}%, MLP={gate_stats['mlp']:.1f}%, Res={gate_stats['res']:.1f}%")
+
+            # Convert to deployment
+            deploy_model, pruning_config = convert_to_deployment_model(model, num_classes)
+            using_deploy = True
+
+            # Create new optimizer and scheduler for deployment model
+            remaining_epochs = FIXED_EPOCHS - epoch + 1
+            remaining_steps = remaining_epochs * len(train_loader)
+            optimizer = optim.AdamW(deploy_model.parameters(), lr=current_lr, weight_decay=WEIGHT_DECAY)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_steps, eta_min=MIN_LR)
+
+            print(f"  [Deployment: {count_parameters(deploy_model):.2f}M params (was {count_parameters(model):.2f}M)]")
+
+        # Select active model
+        active_model = deploy_model if using_deploy else model
+        gate_l1 = 0.0 if using_deploy else GATE_L1_WEIGHT
+
+        # Train
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, scheduler, epoch, 
-            gate_l1_weight=GATE_L1_WEIGHT
+            active_model, train_loader, optimizer, scheduler, epoch, gate_l1_weight=gate_l1
         )
-        
-        # Validate
-        val_acc, val_auc, val_precision, val_recall, val_f1 = evaluate_model(model, val_loader, DEVICE)
-        test_acc, test_auc, test_precision, test_recall, test_f1 = evaluate_model(model, test_loader, DEVICE)
-        
+
+        # Evaluate
+        val_acc, val_auc, val_precision, val_recall, val_f1 = evaluate_model(active_model, val_loader, DEVICE)
+        test_acc, test_auc, test_precision, test_recall, test_f1 = evaluate_model(active_model, test_loader, DEVICE)
+
+        model_type = 'deploy' if using_deploy else 'gated'
         print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
-        print(f"  Val   - Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
-        
-        # Track overall best (for logging)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_model_state = copy.deepcopy(model.state_dict())
-            best_epoch = epoch
-            print(f"  ✓ New best validation accuracy (overall): {val_acc:.4f}")
-        
-        # CRITICAL FIX: Track best AFTER final pruning (for deployment)
-        if epoch > final_prune_epoch and val_acc > best_val_acc_after_pruning:
-            best_val_acc_after_pruning = val_acc
-            best_model_after_pruning = copy.deepcopy(model.state_dict())
-            best_epoch_after_pruning = epoch
-            print(f"  ✓ New best validation accuracy (post-pruning): {val_acc:.4f}")
-        
+        print(f"  Val   - Acc: {val_acc:.4f}, AUC: {val_auc:.4f} [{model_type}]")
+
+        # Track best deployment model
+        if using_deploy and val_acc > best_deploy_val_acc:
+            best_deploy_val_acc = val_acc
+            best_deploy_state = copy.deepcopy(deploy_model.state_dict())
+            best_deploy_epoch = epoch
+            print(f"  ✓ New best deployment val_acc: {val_acc:.4f}")
+
         all_metrics.append({
             'trial': trial_num, 'epoch': epoch, 'train_loss': train_loss, 'train_acc': train_acc,
-            'val_acc': val_acc, 'test_acc': test_acc, 'params_m': count_parameters(model), 'lr': current_lr
+            'val_acc': val_acc, 'val_auc': val_auc, 'test_acc': test_acc, 'test_auc': test_auc,
+            'params_m': count_parameters(active_model), 'lr': current_lr, 'model_type': model_type
         })
-    
-    # CRITICAL FIX: Load best model AFTER pruning (not overall best)
-    if best_model_after_pruning is not None:
-        model.load_state_dict(best_model_after_pruning)
-        print(f"\n✓ Loaded best post-pruning model from epoch {best_epoch_after_pruning} (val_acc={best_val_acc_after_pruning:.4f})")
-    else:
-        print(f"\n✓ Using final epoch model (no checkpoints after pruning)")
-    
-    # Final gate statistics
-    print("\nFinal gate statistics before deployment conversion:")
-    print_gate_statistics(model)
-    
-    # Convert to deployment model
-    deploy_model, pruning_config = convert_to_deployment_model(
-        model, num_classes, save_masks=True, save_dir=save_dir
-    )
-    
-    # Finetune deployment model
-    deploy_model = finetune_deployment_model(
-        deploy_model, train_loader, val_loader, 
-        epochs=DEPLOY_FINETUNE_EPOCHS, lr=DEPLOY_FINETUNE_LR
-    )
-    
-    # Measure energy on deployment model
-    print("\n📊 Measuring energy on deployment model...")
+
+    # Restore best deployment model
+    if deploy_model is None:
+        print("  [WARNING: No deployment conversion happened, converting now]")
+        deploy_model, pruning_config = convert_to_deployment_model(model, num_classes)
+    elif best_deploy_state is not None:
+        deploy_model.load_state_dict(best_deploy_state)
+        print(f"\n✓ Restored best deployment model from epoch {best_deploy_epoch} (val_acc={best_deploy_val_acc:.4f})")
+
+    # Measure inference energy on deployment model
+    print("\nMeasuring inference energy on deployment model...")
     deploy_tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_progressive_deploy_trial{trial_num}")
     test_acc, test_auc, test_precision, test_recall, test_f1 = evaluate_model(deploy_model, test_loader, DEVICE)
     energy_metrics = stop_energy_tracker(deploy_tracker, save_dir, f"{dataset_name}_{model_name}_progressive_deploy_trial{trial_num}")
-    
+
     # Stop training energy tracker
     training_energy = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_{model_name}_progressive_trial{trial_num}")
-    
+
     # Save
     torch.save(deploy_model.state_dict(), os.path.join(save_dir,
                f"{dataset_name}_{model_name}_progressive_deploy_trial{trial_num}_final.pth"))
     pd.DataFrame(all_metrics).to_csv(os.path.join(save_dir,
                f"{dataset_name}_{model_name}_progressive_trial{trial_num}_metrics.csv"), index=False)
-    
+
     # Get effective dimensions
     avg_heads = np.mean(pruning_config['deploy_per_layer_num_heads'])
     avg_mlp = np.mean(pruning_config['deploy_per_layer_mlp_dim'])
-    
+
     final_metrics = {
         'method': 'progressive_structured_pruning',
         'dataset': dataset_name,
         'model': model_name,
         'trial': trial_num,
         'total_epochs': FIXED_EPOCHS,
-        'best_epoch': best_epoch_after_pruning,  # Report post-pruning best
-        'best_val_acc': best_val_acc_after_pruning,
+        'best_epoch': best_deploy_epoch,
+        'best_val_acc': best_deploy_val_acc,
         'test_acc': test_acc,
         'test_auc': test_auc,
         'test_precision': test_precision,
@@ -1557,129 +1585,147 @@ def train_progressive_structured_pruning(dataset_name, model_name, train_loader,
         'deploy_avg_mlp': avg_mlp,
         'total_prune_steps': NUM_PRUNE_STEPS
     }
-    
+
     print(f"\n✓ Final Test - Acc: {test_acc:.4f}, Precision: {test_precision:.4f}")
     print(f"Deployment: {pruning_config['deploy_embed_dim']} embed, {avg_heads:.1f} avg heads, {avg_mlp:.0f} avg MLP")
-    
+
     cleanup_memory()
     return deploy_model, final_metrics
 
-# ==================== METHOD 3: ONE-SHOT PRUNING ====================
+# ==================== METHOD 3: SMALL MODEL FROM SCRATCH ====================
 
-def train_prune_then_finetune(dataset_name, model_name, train_loader, val_loader, test_loader,
-                              num_classes, save_dir, trial_num):
+def train_small_model_from_scratch(dataset_name, model_name, train_loader, val_loader, test_loader,
+                                   num_classes, save_dir, trial_num):
     """
-    METHOD 3: One-Shot Pruning then Finetune
-    Converts to deployment model after pruning
+    METHOD 3: Train Small Model From Scratch
+
+    Creates a small DeployVisionTransformer with dimensions matching the progressive
+    pruning output (40% sparsity = 60% of original dimensions), initializes from
+    ImageNet pretrained weights, and trains with baseline hyperparameters.
+
+    This provides a fair comparison to see if progressive pruning outperforms
+    simply training a smaller model from scratch.
     """
     print("\n" + "="*80)
-    print(f"METHOD 3: ONE-SHOT PRUNE-THEN-TRAIN - {dataset_name.upper()} - {model_name} - TRIAL {trial_num}")
+    print(f"METHOD 3: SMALL MODEL FROM SCRATCH - {dataset_name.upper()} - {model_name} - TRIAL {trial_num}")
     print("="*80)
-    
-    # Create model
-    model = create_gated_vit_from_timm(model_name, num_classes, pretrained=True).to(DEVICE)
-    print(f"Initial parameters: {count_parameters(model):.2f}M")
-    
-    # Setup pruners
-    pruners = []
-    for component_type in [0, 1, 2]:
-        modules = prepare_pruning_list(model, component_type)
-        if len(modules) > 0:
-            pruner = StructuredPruner(model, modules, pruning_momentum=PRUNING_MOMENTUM)
-            pruners.append(pruner)
-    
-    # Start energy tracking (includes pruning)
-    tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_prune_then_train_trial{trial_num}")
-    
-    # ONE-SHOT PRUNING
-    print("\n*** ONE-SHOT PRUNING ***")
-    collect_importance_scores(model, pruners, train_loader, max_batches=IMPORTANCE_CAL_BATCHES)
-    
-    target_sparsity = TARGET_FLOPS_REDUCTION
-    apply_pruning_per_component(model, pruners, target_sparsity=target_sparsity)
-    
-    # Debug: Print gate statistics
-    print_gate_statistics(model)
-    
-    print(f"\nNow training pruned model for {FIXED_EPOCHS} epochs...")
-    
-    # Optimizer
+
+    # Create small model with dimensions matching 40% pruned progressive model
+    model, model_config = create_small_vit_from_pretrained(
+        model_name=model_name,
+        num_classes=num_classes,
+        target_sparsity=TARGET_FLOPS_REDUCTION,  # 0.4 = 40% pruned
+        pretrained=True
+    )
+
+    print(f"\nSmall model architecture:")
+    print(f"  Embed dim: {model_config['embed_dim']}")
+    print(f"  Num heads: {model_config['num_heads']}")
+    print(f"  MLP dim: {model_config['mlp_dim']}")
+    print(f"  Parameters: {count_parameters(model):.2f}M")
+
+    # Start energy tracking
+    tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_small_model_trial{trial_num}")
+
+    # Optimizer (same as baseline)
     optimizer = optim.AdamW(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
     total_steps = FIXED_EPOCHS * len(train_loader)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=MIN_LR)
-    
+
     # Track metrics
     all_metrics = []
     best_val_acc = 0.0
     best_model_state = None
     best_epoch = 0
-    
+
+    print(f"\nTraining small model for {FIXED_EPOCHS} epochs (same as baseline)...")
+
     for epoch in range(1, FIXED_EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
-        
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, scheduler, epoch,
-            gate_l1_weight=GATE_L1_WEIGHT
-        )
+
+        # Train (no gate L1 since this is a deploy model without gates)
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        for images, labels in train_loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = nn.functional.cross_entropy(outputs, labels)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+        train_loss = running_loss / len(train_loader)
+        train_acc = correct / total
+
+        # Evaluate
         val_acc, val_auc, val_precision, val_recall, val_f1 = evaluate_model(model, val_loader, DEVICE)
         test_acc, test_auc, test_precision, test_recall, test_f1 = evaluate_model(model, test_loader, DEVICE)
-        
+
         print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
         print(f"  Val   - Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
-        
+
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_model_state = copy.deepcopy(model.state_dict())
             best_epoch = epoch
             print(f"  ✓ New best validation accuracy: {val_acc:.4f}")
-        
+
         all_metrics.append({
-            'trial': trial_num, 'epoch': epoch, 'train_loss': train_loss, 'train_acc': train_acc,
-            'val_acc': val_acc, 'test_acc': test_acc, 'params_m': count_parameters(model)
+            'trial': trial_num,
+            'epoch': epoch,
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'val_acc': val_acc,
+            'val_auc': val_auc,
+            'val_precision': val_precision,
+            'val_recall': val_recall,
+            'val_f1': val_f1,
+            'test_acc': test_acc,
+            'test_auc': test_auc,
+            'test_precision': test_precision,
+            'test_recall': test_recall,
+            'test_f1': test_f1,
+            'params_m': count_parameters(model),
+            'lr': optimizer.param_groups[0]['lr']
         })
-    
+
+    # Load best model
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print(f"\n✓ Loaded best model from epoch {best_epoch}")
-    
-    # Final gate statistics
-    print("\nFinal gate statistics before deployment conversion:")
-    print_gate_statistics(model)
-    
-    # Convert to deployment model
-    deploy_model, pruning_config = convert_to_deployment_model(
-        model, num_classes, save_masks=True, save_dir=save_dir
-    )
-    
-    # Finetune deployment model
-    deploy_model = finetune_deployment_model(
-        deploy_model, train_loader, val_loader,
-        epochs=DEPLOY_FINETUNE_EPOCHS, lr=DEPLOY_FINETUNE_LR
-    )
-    
-    # Measure energy on deployment model
-    print("\n📊 Measuring energy on deployment model...")
-    deploy_tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_prune_then_train_deploy_trial{trial_num}")
-    test_acc, test_auc, test_precision, test_recall, test_f1 = evaluate_model(deploy_model, test_loader, DEVICE)
-    energy_metrics = stop_energy_tracker(deploy_tracker, save_dir, f"{dataset_name}_{model_name}_prune_then_train_deploy_trial{trial_num}")
-    
+
+    # Measure inference energy
+    print("\nMeasuring inference energy...")
+    inference_tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_small_model_inference_trial{trial_num}")
+    test_acc, test_auc, test_precision, test_recall, test_f1 = evaluate_model(model, test_loader, DEVICE)
+    inference_energy = stop_energy_tracker(inference_tracker, save_dir, f"{dataset_name}_{model_name}_small_model_inference_trial{trial_num}")
+
     # Stop training energy tracker
-    training_energy = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_{model_name}_prune_then_train_trial{trial_num}")
-    
-    # Save
-    torch.save(deploy_model.state_dict(), os.path.join(save_dir,
-               f"{dataset_name}_{model_name}_prune_then_train_deploy_trial{trial_num}_final.pth"))
+    training_energy = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_{model_name}_small_model_trial{trial_num}")
+
+    # Save model and metrics
+    torch.save(model.state_dict(), os.path.join(save_dir,
+               f"{dataset_name}_{model_name}_small_model_trial{trial_num}_final.pth"))
     pd.DataFrame(all_metrics).to_csv(os.path.join(save_dir,
-               f"{dataset_name}_{model_name}_prune_then_train_trial{trial_num}_metrics.csv"), index=False)
-    
-    # Get effective dimensions
-    avg_heads = np.mean(pruning_config['deploy_per_layer_num_heads'])
-    avg_mlp = np.mean(pruning_config['deploy_per_layer_mlp_dim'])
-    
+               f"{dataset_name}_{model_name}_small_model_trial{trial_num}_history.csv"), index=False)
+
+    # Final metrics
     final_metrics = {
-        'method': 'prune_then_train',
+        'method': 'small_model_from_scratch',
         'dataset': dataset_name,
-        'model': model_name,
+        'model': f'{model_name}_small',
         'trial': trial_num,
         'total_epochs': FIXED_EPOCHS,
         'best_epoch': best_epoch,
@@ -1689,155 +1735,274 @@ def train_prune_then_finetune(dataset_name, model_name, train_loader, val_loader
         'test_precision': test_precision,
         'test_recall': test_recall,
         'test_f1': test_f1,
-        'params_m': count_parameters(deploy_model),
-        'model_size_mb': model_size_mb(deploy_model),
-        'flops_g': deploy_model.compute_flops() / 1e9,
+        'params_m': count_parameters(model),
+        'model_size_mb': model_size_mb(model),
+        'flops_g': model.compute_flops() / 1e9,
         'training_energy_kwh': training_energy['energy_kwh'],
-        'inference_energy_kwh': energy_metrics['energy_kwh'],
-        'deploy_embed_dim': pruning_config['deploy_embed_dim'],
-        'deploy_avg_heads': avg_heads,
-        'deploy_avg_mlp': avg_mlp
+        'inference_energy_kwh': inference_energy['energy_kwh'],
+        'embed_dim': model_config['embed_dim'],
+        'num_heads': model_config['num_heads'],
+        'mlp_dim': model_config['mlp_dim'],
+        'target_sparsity': model_config['target_sparsity']
     }
-    
-    print(f"\n✓ Final Test - Acc: {test_acc:.4f}, Precision: {test_precision:.4f}")
-    print(f"Deployment: {pruning_config['deploy_embed_dim']} embed, {avg_heads:.1f} avg heads, {avg_mlp:.0f} avg MLP")
-    
+
+    print(f"\n✓ Final Test Results:")
+    print(f"  Accuracy:  {test_acc:.4f}")
+    print(f"  AUC:       {test_auc:.4f}")
+    print(f"  Precision: {test_precision:.4f}")
+    print(f"  Recall:    {test_recall:.4f}")
+    print(f"  F1:        {test_f1:.4f}")
+    print(f"  Params:    {count_parameters(model):.2f}M")
+    print(f"  FLOPs:     {model.compute_flops() / 1e9:.2f}G")
+
     cleanup_memory()
-    return deploy_model, final_metrics
+    return model, final_metrics
 
 # ==================== PROCESS DATASET ====================
 
-def process_dataset(dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir):
-    """Process one dataset through all methods"""
+def process_dataset(dataset_name, model_name, train_loader, val_loader, test_loader, num_classes, save_dir):
+    """Process one dataset with one model through all methods"""
     print("\n" + "="*100)
-    print(f"PROCESSING DATASET: {dataset_name.upper()}")
+    print(f"PROCESSING: {dataset_name.upper()} with {model_name}")
     print("="*100)
-    
+
     all_baseline_metrics = []
     all_progressive_metrics = []
-    all_prune_then_train_metrics = []
-    
+    all_small_model_metrics = []
+
     for trial in range(1, NUM_TRIALS + 1):
         print(f"\n{'~'*100}")
         print(f"~ TRIAL {trial}/{NUM_TRIALS}")
         print(f"{'~'*100}")
-        
+
         trial_seed = SEED + trial * 100
         set_seed(trial_seed)
-        
-        # Method 2: Progressive
-        _, progressive_metrics = train_progressive_structured_pruning(
-            dataset_name, 'vit_tiny_patch16_224', train_loader, val_loader, test_loader,
-            num_classes, save_dir, trial
-        )
-        all_progressive_metrics.append(progressive_metrics)
-        
-        # Method 1: Baseline
+
+        # Method 1: Baseline (full model)
         _, baseline_metrics = train_baseline_vit(
-            dataset_name, 'vit_tiny_patch16_224', train_loader, val_loader, test_loader,
+            dataset_name, model_name, train_loader, val_loader, test_loader,
             num_classes, save_dir, trial
         )
         all_baseline_metrics.append(baseline_metrics)
-        
-        # Method 3: Prune-then-train
-        _, prune_then_train_metrics = train_prune_then_finetune(
-            dataset_name, 'vit_tiny_patch16_224', train_loader, val_loader, test_loader,
+
+        # Method 2: Progressive Pruning
+        _, progressive_metrics = train_progressive_structured_pruning(
+            dataset_name, model_name, train_loader, val_loader, test_loader,
             num_classes, save_dir, trial
         )
-        all_prune_then_train_metrics.append(prune_then_train_metrics)
-    
+        all_progressive_metrics.append(progressive_metrics)
+
+        # Method 3: Small Model From Scratch (same dimensions as pruned progressive)
+        _, small_model_metrics = train_small_model_from_scratch(
+            dataset_name, model_name, train_loader, val_loader, test_loader,
+            num_classes, save_dir, trial
+        )
+        all_small_model_metrics.append(small_model_metrics)
+
     # Save combined results
-    all_metrics_df = pd.DataFrame(all_baseline_metrics + all_progressive_metrics + all_prune_then_train_metrics)
-    all_metrics_df.to_csv(os.path.join(save_dir, f"{dataset_name}_all_trials_metrics.csv"), index=False)
-    
+    all_metrics_df = pd.DataFrame(all_baseline_metrics + all_progressive_metrics + all_small_model_metrics)
+    all_metrics_df.to_csv(os.path.join(save_dir, f"{dataset_name}_{model_name}_all_trials_metrics.csv"), index=False)
+
     # Compute summary
     baseline_df = pd.DataFrame(all_baseline_metrics)
     progressive_df = pd.DataFrame(all_progressive_metrics)
-    prune_then_train_df = pd.DataFrame(all_prune_then_train_metrics)
-    
+    small_model_df = pd.DataFrame(all_small_model_metrics)
+
     summary_rows = []
-    
-    for df, method_name in [(baseline_df, 'baseline'), 
+
+    for df, method_name in [(baseline_df, 'baseline'),
                             (progressive_df, 'progressive_structured_pruning'),
-                            (prune_then_train_df, 'prune_then_train')]:
-        summary = {'method': method_name, 'dataset': dataset_name, 'num_trials': NUM_TRIALS}
-        for col in ['test_acc', 'test_precision', 'params_m', 'flops_g', 
-                    'inference_energy_kwh', 'model_size_mb']:
+                            (small_model_df, 'small_model_from_scratch')]:
+        summary = {'method': method_name, 'dataset': dataset_name, 'model': model_name, 'num_trials': NUM_TRIALS}
+        for col in ['test_acc', 'test_auc', 'test_precision', 'test_recall', 'test_f1',
+                    'params_m', 'flops_g', 'inference_energy_kwh', 'training_energy_kwh',
+                    'model_size_mb', 'best_val_acc']:
             if col in df.columns:
                 summary[f'{col}_mean'] = df[col].mean()
                 summary[f'{col}_std'] = df[col].std()
         summary_rows.append(summary)
-    
+
     summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(os.path.join(save_dir, f"{dataset_name}_summary_statistics.csv"), index=False)
-    
+    summary_df.to_csv(os.path.join(save_dir, f"{dataset_name}_{model_name}_summary_statistics.csv"), index=False)
+
     # Print comparison
-    print("\n" + "="*140)
-    print(f"SUMMARY - {dataset_name.upper()}")
-    print("="*140)
-    print(f"{'Metric':<30} {'Baseline':<35} {'Progressive':<35} {'Prune-Then-Train':<35}")
-    print("-"*140)
-    for col in ['test_acc', 'params_m', 'flops_g', 'inference_energy_kwh', 'model_size_mb']:
+    print("\n" + "="*150)
+    print(f"SUMMARY - {dataset_name.upper()} - {model_name}")
+    print("="*150)
+    print(f"{'Metric':<25} {'Baseline (Full)':<35} {'Progressive Pruning':<35} {'Small Model (Scratch)':<35}")
+    print("-"*150)
+    for col in ['test_acc', 'test_auc', 'test_f1', 'params_m', 'flops_g', 'inference_energy_kwh', 'model_size_mb']:
         base_mean = summary_rows[0].get(f'{col}_mean', float('nan'))
         base_std = summary_rows[0].get(f'{col}_std', float('nan'))
         prog_mean = summary_rows[1].get(f'{col}_mean', float('nan'))
         prog_std = summary_rows[1].get(f'{col}_std', float('nan'))
-        ptt_mean = summary_rows[2].get(f'{col}_mean', float('nan'))
-        ptt_std = summary_rows[2].get(f'{col}_std', float('nan'))
-        
-        print(f"{col:<30} {base_mean:.4f}±{base_std:.4f}  "
-              f"{prog_mean:.4f}±{prog_std:.4f}  "
-              f"{ptt_mean:.4f}±{ptt_std:.4f}")
-    print("="*140)
+        small_mean = summary_rows[2].get(f'{col}_mean', float('nan'))
+        small_std = summary_rows[2].get(f'{col}_std', float('nan'))
+
+        print(f"{col:<25} {base_mean:.4f}±{base_std:.4f}            "
+              f"{prog_mean:.4f}±{prog_std:.4f}            "
+              f"{small_mean:.4f}±{small_std:.4f}")
+    print("="*150)
+
+    return all_baseline_metrics, all_progressive_metrics, all_small_model_metrics
 
 # ==================== MAIN ====================
 
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='ViT Structured Pruning Experiments (ViT-Tiny and ViT-Base)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Example usage:
+  python simulPruneVit.py --trials 3                    # Run 3 trials per (model, method)
+  python simulPruneVit.py --trials 5 --models tiny      # Run 5 trials, only ViT-Tiny
+  python simulPruneVit.py --trials 1 --models base      # Quick test with ViT-Base only
+  python simulPruneVit.py --datasets bloodmnist         # Run on single dataset
+
+Experiment structure (per dataset):
+  - 3 methods: baseline, progressive_pruning, small_model_from_scratch
+  - 2 models: vit_tiny_patch16_224, vit_base_patch16_224
+  - Total runs per dataset: NUM_TRIALS × 2 models × 3 methods = NUM_TRIALS × 6
+        """
+    )
+    parser.add_argument('--trials', type=int, default=NUM_TRIALS,
+                        help=f'Number of trials/replicates per (model, method) combination (default: {NUM_TRIALS})')
+    parser.add_argument('--models', type=str, nargs='+', default=['tiny', 'base'],
+                        choices=['tiny', 'base'],
+                        help='Which models to run: tiny, base, or both (default: both)')
+    parser.add_argument('--datasets', type=str, nargs='+', default=DATASETS,
+                        help=f'Datasets to process (default: {DATASETS})')
+    parser.add_argument('--save_dir', type=str, default=SAVE_DIR,
+                        help=f'Directory to save results (default: {SAVE_DIR})')
+    return parser.parse_args()
+
+
 def main():
+    global NUM_TRIALS, MODELS_TO_RUN, SAVE_DIR
+
+    args = parse_args()
+
+    # Update global config from args
+    NUM_TRIALS = args.trials
+    SAVE_DIR = args.save_dir
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+    # Map model shortcuts to full names
+    model_map = {
+        'tiny': 'vit_tiny_patch16_224',
+        'base': 'vit_base_patch16_224'
+    }
+    models_to_run = [model_map[m] for m in args.models]
+    datasets = args.datasets
+
     set_seed(SEED)
-    
+
     print("="*100)
     print("STRUCTURED VISION TRANSFORMER PRUNING WITH DEPLOYMENT CONVERSION")
     print("="*100)
-    print(f"\n⚡ Key Feature: Physical model compression with deployment conversion")
-    print(f"   - Training models use gates to identify important components")
-    print(f"   - Deployment models are PHYSICALLY SMALLER (actual speedup)")
-    print(f"   - Energy measured on deployment models (real-world applicable)")
-    print(f"\n🔧 FIXES APPLIED:")
-    print(f"   - L1 regularization on gates (weight={GATE_L1_WEIGHT})")
-    print(f"   - Per-component pruning for balanced reduction")
-    print(f"   - Aggressive sparsity schedule: {SPARSITY_SCHEDULE}")
-    print(f"   - Gate statistics monitoring")
-    print(f"\nConfiguration:")
+
+    # Calculate total runs
+    total_runs = NUM_TRIALS * len(models_to_run) * 3 * len(datasets)
+    print(f"\nExperiment Overview:")
+    print(f"  Models: {models_to_run}")
+    print(f"  Datasets: {datasets}")
+    print(f"  Methods: baseline, progressive_pruning, small_model_from_scratch")
+    print(f"  Trials per (model, method): {NUM_TRIALS}")
+    print(f"  Total runs: {NUM_TRIALS} trials x {len(models_to_run)} models x 3 methods x {len(datasets)} datasets = {total_runs}")
+
+    print(f"\nConfiguration (gentle_40pct from ViT_hyper.py):")
     print(f"  Device: {DEVICE}")
-    print(f"  Fixed Epochs: {FIXED_EPOCHS}")
-    print(f"  Pruning Schedule: {PRUNE_EPOCHS_SCHEDULE}")
-    print(f"  Target FLOPs Reduction: {TARGET_FLOPS_REDUCTION:.1%}")
-    print(f"  Deployment Finetune Epochs: {DEPLOY_FINETUNE_EPOCHS}")
-    print(f"  Number of Trials: {NUM_TRIALS}")
-    
-    datasets = ['bloodmnist', 'pathmnist', 'dermamnist']
-    
+    print(f"  Total Epochs: {FIXED_EPOCHS}")
+    print(f"  Pruning Schedule: epochs {PRUNE_EPOCHS_SCHEDULE}")
+    print(f"  Sparsity Schedule: {SPARSITY_SCHEDULE} (40% max compression)")
+    print(f"  Gate L1 Weight: {GATE_L1_WEIGHT}")
+    print(f"  LR Reduction After Prune: {LR_REDUCTION_AFTER_PRUNE}")
+
+    print(f"\nMetrics Tracked:")
+    print(f"  - Accuracy, AUC, Precision, Recall, F1")
+    print(f"  - Parameters (M), FLOPs (G), Model Size (MB)")
+    print(f"  - Training Energy (kWh), Inference Energy (kWh) [CodeCarbon]")
+
+    if not CODECARBON_AVAILABLE:
+        print(f"\n  WARNING: CodeCarbon not available - energy metrics will be NaN")
+
+    # Collect all results for final summary
+    all_results = []
+
     for dataset in datasets:
         npz_path = os.path.join(DATASET_DIR, f"{dataset}_224.npz")
-        
+
         if not os.path.exists(npz_path):
-            print(f"\n⚠️  Dataset not found: {npz_path}")
+            print(f"\nDataset not found: {npz_path}")
             continue
-        
+
         train_loader, val_loader, test_loader, num_classes, dataset_name = load_dataset(npz_path)
-        process_dataset(dataset_name, train_loader, val_loader, test_loader, num_classes, SAVE_DIR)
-    
+
+        # Run experiments for each model
+        for model_name in models_to_run:
+            print(f"\n" + "#"*100)
+            print(f"# RUNNING: {dataset_name} with {model_name}")
+            print(f"# Trials: {NUM_TRIALS}, Methods: 3 (baseline, progressive, small_model)")
+            print(f"#"*100)
+
+            baseline_metrics, progressive_metrics, small_model_metrics = process_dataset(
+                dataset_name, model_name, train_loader, val_loader, test_loader, num_classes, SAVE_DIR
+            )
+
+            all_results.extend(baseline_metrics)
+            all_results.extend(progressive_metrics)
+            all_results.extend(small_model_metrics)
+
+    # Save all results
+    if all_results:
+        all_results_df = pd.DataFrame(all_results)
+        all_results_df.to_csv(os.path.join(SAVE_DIR, "all_experiments_combined.csv"), index=False)
+
+        # Print final summary table
+        print("\n" + "="*120)
+        print("FINAL SUMMARY - ALL EXPERIMENTS")
+        print("="*120)
+
+        summary_data = []
+        for model_name in models_to_run:
+            for method in ['baseline', 'progressive_structured_pruning', 'small_model_from_scratch']:
+                model_filter = model_name if method != 'small_model_from_scratch' else f'{model_name}_small'
+                subset = all_results_df[(all_results_df['model'] == model_filter) &
+                                        (all_results_df['method'] == method)]
+                if len(subset) > 0:
+                    summary_data.append({
+                        'model': model_name.replace('_patch16_224', ''),
+                        'method': method.replace('_structured_pruning', '').replace('_from_scratch', ''),
+                        'test_acc': f"{subset['test_acc'].mean():.4f}±{subset['test_acc'].std():.4f}",
+                        'params_m': f"{subset['params_m'].mean():.2f}",
+                        'flops_g': f"{subset['flops_g'].mean():.2f}",
+                        'train_energy': f"{subset['training_energy_kwh'].mean():.6f}",
+                        'infer_energy': f"{subset['inference_energy_kwh'].mean():.6f}"
+                    })
+
+        if summary_data:
+            summary_df = pd.DataFrame(summary_data)
+            print(summary_df.to_string(index=False))
+
     print("\n" + "="*100)
-    print("✅ EXPERIMENT COMPLETED")
+    print("EXPERIMENT COMPLETED")
     print("="*100)
-    print(f"\n🎯 Key Results:")
-    print(f"   - All methods create deployment models")
-    print(f"   - Baseline: Full-size deployment model")
-    print(f"   - Progressive/One-shot: Physically smaller deployment models")
-    print(f"   - Energy measured on actual deployment models")
-    print(f"   - Gate regularization ensures actual pruning occurs")
-    print(f"   - Results saved to: {SAVE_DIR}")
+    print(f"\nMethods Compared:")
+    print(f"   1. Baseline: Full model ({FIXED_EPOCHS} epochs)")
+    print(f"   2. Progressive Pruning: Prune during training -> convert to deploy -> continue training")
+    print(f"   3. Small Model: Same size as pruned, trained from scratch")
+    print(f"\nModels Tested:")
+    for model_name in models_to_run:
+        cfg = MODEL_CONFIGS.get(model_name, {})
+        print(f"   - {model_name}: embed_dim={cfg.get('embed_dim')}, heads={cfg.get('num_heads')}")
+    print(f"\nMetrics Tracked:")
+    print(f"   - Accuracy, AUC, Precision, Recall, F1")
+    print(f"   - Parameters (M), FLOPs (G), Model Size (MB)")
+    print(f"   - Training & Inference Energy (kWh) via CodeCarbon")
+    print(f"\nResults saved to: {SAVE_DIR}")
     print("="*100)
+
 
 if __name__ == "__main__":
     main()
