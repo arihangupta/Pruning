@@ -101,9 +101,9 @@ def rename_files(save_dir, dataset_name, dry_run=False):
     return renamed
 
 
-def process_dataset(dataset_name, dry_run=False):
+def process_dataset(dataset_name, base_dir, dry_run=False):
     """Process a single dataset directory."""
-    save_dir = os.path.join(SAVE_DIR_BASE, dataset_name)
+    save_dir = os.path.join(base_dir, dataset_name)
 
     if not os.path.exists(save_dir):
         print(f"Directory not found: {save_dir}")
@@ -126,9 +126,9 @@ def process_dataset(dataset_name, dry_run=False):
     rename_files(save_dir, dataset_name, dry_run)
 
 
-def update_combined_summary(dry_run=False):
+def update_combined_summary(base_dir, dry_run=False):
     """Update the combined summary CSV if it exists."""
-    combined_path = os.path.join(SAVE_DIR_BASE, "all_datasets_summary.csv")
+    combined_path = os.path.join(base_dir, "all_datasets_summary.csv")
 
     if os.path.exists(combined_path):
         print(f"\nProcessing combined summary...")
@@ -142,17 +142,16 @@ def main():
     parser.add_argument("--base-dir", type=str, default=SAVE_DIR_BASE, help="Base directory for experiment results")
     args = parser.parse_args()
 
-    global SAVE_DIR_BASE
-    SAVE_DIR_BASE = args.base_dir
+    base_dir = args.base_dir
 
-    print(f"Aligning names in: {SAVE_DIR_BASE}")
+    print(f"Aligning names in: {base_dir}")
     if args.dry_run:
         print("(DRY RUN - no changes will be made)")
 
     for dataset_name in DATASETS:
-        process_dataset(dataset_name, dry_run=args.dry_run)
+        process_dataset(dataset_name, base_dir, dry_run=args.dry_run)
 
-    update_combined_summary(dry_run=args.dry_run)
+    update_combined_summary(base_dir, dry_run=args.dry_run)
 
     print("\nDone!")
 
