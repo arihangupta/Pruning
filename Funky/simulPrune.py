@@ -548,9 +548,9 @@ def stop_energy_tracker(tracker, save_dir, project_name):
         return {"energy_kwh": float("nan"), "emissions_kg": float("nan"), "duration_s": float("nan")}
 
 def get_final_model_path(save_dir, dataset_name, method_key, trial_num):
-    """Get the path to the final model file for a given method and trial."""
+    """Get the path to the final model file for a given method and trial (new naming)."""
     paths = {
-        'baseline_l1': f"{dataset_name}_baseline_trial{trial_num}_final.pth",
+        'baseline_l1': f"{dataset_name}_baseline_l1_trial{trial_num}_final.pth",
         'baseline_no_reg': f"{dataset_name}_baseline_no_reg_trial{trial_num}_final.pth",
         'prune_then_train': f"{dataset_name}_prune_then_train_trial{trial_num}_final.pth",
         'progressive_with_reg': f"{dataset_name}_progressive_with_reg_trial{trial_num}_final.pth",
@@ -558,10 +558,26 @@ def get_final_model_path(save_dir, dataset_name, method_key, trial_num):
     }
     return os.path.join(save_dir, paths[method_key])
 
+def get_legacy_model_path(save_dir, dataset_name, method_key, trial_num):
+    """Get legacy file path (before naming alignment)."""
+    legacy_paths = {
+        'baseline_l1': f"{dataset_name}_baseline_trial{trial_num}_final.pth",
+    }
+    if method_key in legacy_paths:
+        return os.path.join(save_dir, legacy_paths[method_key])
+    return None
+
 def check_experiment_exists(save_dir, dataset_name, method_key, trial_num):
-    """Check if a final model file already exists for this experiment."""
+    """Check if a final model file already exists (checks both new and legacy names)."""
+    # Check new naming first
     path = get_final_model_path(save_dir, dataset_name, method_key, trial_num)
-    return os.path.exists(path)
+    if os.path.exists(path):
+        return True, path
+    # Check legacy naming
+    legacy_path = get_legacy_model_path(save_dir, dataset_name, method_key, trial_num)
+    if legacy_path and os.path.exists(legacy_path):
+        return True, legacy_path
+    return False, None
 
 def load_and_compute_metrics(model_path, model, test_loader, method_name, trial_num,
                              stage_planes=None, use_reg=True):
@@ -597,21 +613,21 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
     model = build_baseline_resnet(num_classes)
     optimizer = optim.Adam(model.parameters(), lr=INITIAL_LR, weight_decay=0.0)
     history = []
-    tracker = start_energy_tracker(save_dir, f"{dataset_name}_baseline_training_trial{trial_num}")
-    
+    tracker = start_energy_tracker(save_dir, f"{dataset_name}_baseline_l1_training_trial{trial_num}")
+
     for epoch in range(1, FIXED_EPOCHS + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, epoch, True, L1_LAMBDA)
         val_loss, val_acc, val_auc = evaluate(model, val_loader)
-        
+
         print(f"  Epoch {epoch}: val_acc={val_acc:.4f} val_auc={val_auc:.4f}")
-        
+
         history.append({'trial': trial_num, 'epoch': epoch, 'train_loss': train_loss, 'train_acc': train_acc,
                        'val_loss': val_loss, 'val_acc': val_acc, 'val_auc': val_auc})
-        
+
         # Save incrementally for live monitoring
-        pd.DataFrame(history).to_csv(os.path.join(save_dir, f"{dataset_name}_baseline_trial{trial_num}_training_history.csv"), index=False)
-    
-    energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_baseline_training_trial{trial_num}")
+        pd.DataFrame(history).to_csv(os.path.join(save_dir, f"{dataset_name}_baseline_l1_trial{trial_num}_training_history.csv"), index=False)
+
+    energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_baseline_l1_training_trial{trial_num}")
     
     # ONLY evaluate test set after all training is complete
     test_loss, test_acc, test_auc = evaluate(model, test_loader)
@@ -622,10 +638,10 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
     
     print(f"  Final: acc={test_acc:.4f} auc={test_auc:.4f} params={params_m:.2f}M size={size_mb:.2f}MB")
     
-    torch.save(model.state_dict(), os.path.join(save_dir, f"{dataset_name}_baseline_trial{trial_num}_final.pth"))
+    torch.save(model.state_dict(), os.path.join(save_dir, f"{dataset_name}_baseline_l1_trial{trial_num}_final.pth"))
 
     return model, {
-        'method': 'baseline_l1_regularized', 'trial': trial_num, 'total_epochs': FIXED_EPOCHS,
+        'method': 'baseline_l1', 'trial': trial_num, 'total_epochs': FIXED_EPOCHS,
         'test_loss': test_loss, 'test_acc': test_acc, 'test_auc': test_auc,
         'params_m': params_m, 'model_size_mb': size_mb, 'flops': flops, 'flops_m': flops/1e6,
         'inference_time_ms': inf_time*1000, 'peak_ram_mb': peak_ram,
@@ -667,7 +683,7 @@ def train_baseline_no_regularization(dataset_name, train_loader, val_loader, tes
     torch.save(model.state_dict(), os.path.join(save_dir, f"{dataset_name}_baseline_no_reg_trial{trial_num}_final.pth"))
 
     return model, {
-        'method': 'baseline_no_regularization', 'trial': trial_num, 'total_epochs': FIXED_EPOCHS,
+        'method': 'baseline_no_reg', 'trial': trial_num, 'total_epochs': FIXED_EPOCHS,
         'test_loss': test_loss, 'test_acc': test_acc, 'test_auc': test_auc,
         'params_m': params_m, 'model_size_mb': size_mb, 'flops': flops, 'flops_m': flops/1e6,
         'inference_time_ms': inf_time*1000, 'peak_ram_mb': peak_ram,
@@ -786,7 +802,7 @@ def train_progressive(dataset_name, train_loader, val_loader, test_loader, num_c
         print(f"  Epoch {epoch}: val_acc={val_acc:.4f} val_auc={val_auc:.4f}")
         
         all_metrics.append({
-            'method': f'progressive_pruning_{"with_reg" if use_l1 else "no_reg"}',
+            'method': f'progressive_{"with_reg" if use_l1 else "no_reg"}',
             'trial': trial_num, 'epoch': epoch,
             'train_loss': train_loss, 'train_acc': train_acc,
             'val_loss': val_loss, 'val_acc': val_acc, 'val_auc': val_auc,
@@ -812,7 +828,7 @@ def train_progressive(dataset_name, train_loader, val_loader, test_loader, num_c
     torch.save(model.state_dict(), os.path.join(save_dir, f"{dataset_name}_progressive_{suffix}_trial{trial_num}_final.pth"))
     
     return model, {
-        'method': f'progressive_pruning_{"with_reg" if use_l1 else "no_reg"}',
+        'method': f'progressive_{"with_reg" if use_l1 else "no_reg"}',
         'trial': trial_num, 'total_epochs': FIXED_EPOCHS,
         'test_loss': test_loss, 'test_acc': test_acc, 'test_auc': test_auc,
         'params_m': params_m, 'model_size_mb': size_mb, 'flops': flops, 'flops_m': flops/1e6,
@@ -854,11 +870,11 @@ def process_dataset(dataset_name, cfg):
 
     # Method configurations: (key, method_name, train_func, extra_args, use_reg, stage_planes)
     method_configs = [
-        ('baseline_l1', 'baseline_l1_regularized', train_baseline_with_regularization, {}, True, [64, 128, 256, 512]),
-        ('baseline_no_reg', 'baseline_no_regularization', train_baseline_no_regularization, {}, False, [64, 128, 256, 512]),
+        ('baseline_l1', 'baseline_l1', train_baseline_with_regularization, {}, True, [64, 128, 256, 512]),
+        ('baseline_no_reg', 'baseline_no_reg', train_baseline_no_regularization, {}, False, [64, 128, 256, 512]),
         ('prune_then_train', 'prune_then_train', train_prune_then_train, {}, True, PRUNE_THEN_TRAIN_TARGETS),
-        ('progressive_with_reg', 'progressive_pruning_with_reg', lambda *args: train_progressive(*args, use_l1=True), {}, True, None),
-        ('progressive_no_reg', 'progressive_pruning_no_reg', lambda *args: train_progressive(*args, use_l1=False), {}, False, None),
+        ('progressive_with_reg', 'progressive_with_reg', lambda *args: train_progressive(*args, use_l1=True), {}, True, None),
+        ('progressive_no_reg', 'progressive_no_reg', lambda *args: train_progressive(*args, use_l1=False), {}, False, None),
     ]
 
     method_results = {
@@ -875,12 +891,13 @@ def process_dataset(dataset_name, cfg):
         set_seed(trial_seed, deterministic=True)
 
         for method_key, method_name, train_func, extra_args, use_reg, default_planes in method_configs:
-            if check_experiment_exists(save_dir, dataset_name, method_key, trial):
+            exists, existing_path = check_experiment_exists(save_dir, dataset_name, method_key, trial)
+            if exists:
                 print(f"  Skipping {method_key} trial {trial} (already exists)")
 
                 # If no existing summary, we need to recompute metrics from saved model
                 if existing_summary is None:
-                    model_path = get_final_model_path(save_dir, dataset_name, method_key, trial)
+                    model_path = existing_path  # Use the path that was found (could be legacy or new)
                     print(f"    Recomputing metrics from {os.path.basename(model_path)}")
 
                     # Determine stage planes for this method
