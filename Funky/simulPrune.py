@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-Four-method pruning comparison with minimal output
+Five-method pruning comparison with minimal output.
+
+Methods:
+1. baseline_l1 - Baseline ResNet50 with L1 regularization
+2. baseline_no_reg - Baseline ResNet50 without regularization
+3. prune_then_train - Prune first, then train with L1 regularization
+4. progressive_with_reg - Progressive pruning with L1 regularization
+5. progressive_no_reg - Progressive pruning without regularization
+
+Supports resuming: skips experiments if final .pth files already exist.
 """
 
 import os, time, math, random, tempfile, copy
@@ -538,10 +547,53 @@ def stop_energy_tracker(tracker, save_dir, project_name):
     except:
         return {"energy_kwh": float("nan"), "emissions_kg": float("nan"), "duration_s": float("nan")}
 
-def train_baseline_with_regularization(dataset_name, train_loader, val_loader, test_loader, 
+def get_final_model_path(save_dir, dataset_name, method_key, trial_num):
+    """Get the path to the final model file for a given method and trial."""
+    paths = {
+        'baseline_l1': f"{dataset_name}_baseline_trial{trial_num}_final.pth",
+        'baseline_no_reg': f"{dataset_name}_baseline_no_reg_trial{trial_num}_final.pth",
+        'prune_then_train': f"{dataset_name}_prune_then_train_trial{trial_num}_final.pth",
+        'progressive_with_reg': f"{dataset_name}_progressive_with_reg_trial{trial_num}_final.pth",
+        'progressive_no_reg': f"{dataset_name}_progressive_no_reg_trial{trial_num}_final.pth",
+    }
+    return os.path.join(save_dir, paths[method_key])
+
+def check_experiment_exists(save_dir, dataset_name, method_key, trial_num):
+    """Check if a final model file already exists for this experiment."""
+    path = get_final_model_path(save_dir, dataset_name, method_key, trial_num)
+    return os.path.exists(path)
+
+def load_and_compute_metrics(model_path, model, test_loader, method_name, trial_num,
+                             stage_planes=None, use_reg=True):
+    """Load a saved model and compute its metrics."""
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.to(DEVICE)
+
+    test_loss, test_acc, test_auc = evaluate(model, test_loader)
+    params_m = count_parameters(model)
+    size_mb = model_size_mb(model)
+    flops = compute_flops(model)
+    inf_time, peak_ram = inference_time_per_batch(model, test_loader)
+
+    if stage_planes is None:
+        stage_planes = [64, 128, 256, 512]
+
+    return {
+        'method': method_name, 'trial': trial_num, 'total_epochs': FIXED_EPOCHS,
+        'test_loss': test_loss, 'test_acc': test_acc, 'test_auc': test_auc,
+        'params_m': params_m, 'model_size_mb': size_mb, 'flops': flops, 'flops_m': flops/1e6,
+        'inference_time_ms': inf_time*1000, 'peak_ram_mb': peak_ram,
+        'training_energy_kwh': float('nan'), 'training_emissions_kg': float('nan'),
+        'training_duration_s': float('nan'),
+        'channels_layer1': stage_planes[0], 'channels_layer2': stage_planes[1],
+        'channels_layer3': stage_planes[2], 'channels_layer4': stage_planes[3],
+        'l1_lambda': L1_LAMBDA if use_reg else 0.0, 'use_regularization': use_reg
+    }
+
+def train_baseline_with_regularization(dataset_name, train_loader, val_loader, test_loader,
                                       num_classes, save_dir, trial_num):
     print(f"\nMethod 1: Baseline+L1 | {dataset_name} trial {trial_num}")
-    
+
     model = build_baseline_resnet(num_classes)
     optimizer = optim.Adam(model.parameters(), lr=INITIAL_LR, weight_decay=0.0)
     history = []
@@ -571,7 +623,7 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
     print(f"  Final: acc={test_acc:.4f} auc={test_auc:.4f} params={params_m:.2f}M size={size_mb:.2f}MB")
     
     torch.save(model.state_dict(), os.path.join(save_dir, f"{dataset_name}_baseline_trial{trial_num}_final.pth"))
-    
+
     return model, {
         'method': 'baseline_l1_regularized', 'trial': trial_num, 'total_epochs': FIXED_EPOCHS,
         'test_loss': test_loss, 'test_acc': test_acc, 'test_auc': test_auc,
@@ -582,8 +634,50 @@ def train_baseline_with_regularization(dataset_name, train_loader, val_loader, t
         'channels_layer1': 64, 'channels_layer2': 128, 'channels_layer3': 256, 'channels_layer4': 512
     }
 
+def train_baseline_no_regularization(dataset_name, train_loader, val_loader, test_loader,
+                                     num_classes, save_dir, trial_num):
+    print(f"\nMethod 2: Baseline (No Reg) | {dataset_name} trial {trial_num}")
+
+    model = build_baseline_resnet(num_classes)
+    optimizer = optim.Adam(model.parameters(), lr=INITIAL_LR, weight_decay=0.0)
+    history = []
+    tracker = start_energy_tracker(save_dir, f"{dataset_name}_baseline_no_reg_training_trial{trial_num}")
+
+    for epoch in range(1, FIXED_EPOCHS + 1):
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, epoch, False, 0.0)
+        val_loss, val_acc, val_auc = evaluate(model, val_loader)
+
+        print(f"  Epoch {epoch}: val_acc={val_acc:.4f} val_auc={val_auc:.4f}")
+
+        history.append({'trial': trial_num, 'epoch': epoch, 'train_loss': train_loss, 'train_acc': train_acc,
+                       'val_loss': val_loss, 'val_acc': val_acc, 'val_auc': val_auc})
+
+        pd.DataFrame(history).to_csv(os.path.join(save_dir, f"{dataset_name}_baseline_no_reg_trial{trial_num}_training_history.csv"), index=False)
+
+    energy_metrics = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_baseline_no_reg_training_trial{trial_num}")
+
+    test_loss, test_acc, test_auc = evaluate(model, test_loader)
+    params_m = count_parameters(model)
+    size_mb = model_size_mb(model)
+    flops = compute_flops(model)
+    inf_time, peak_ram = inference_time_per_batch(model, test_loader)
+
+    print(f"  Final: acc={test_acc:.4f} auc={test_auc:.4f} params={params_m:.2f}M size={size_mb:.2f}MB")
+
+    torch.save(model.state_dict(), os.path.join(save_dir, f"{dataset_name}_baseline_no_reg_trial{trial_num}_final.pth"))
+
+    return model, {
+        'method': 'baseline_no_regularization', 'trial': trial_num, 'total_epochs': FIXED_EPOCHS,
+        'test_loss': test_loss, 'test_acc': test_acc, 'test_auc': test_auc,
+        'params_m': params_m, 'model_size_mb': size_mb, 'flops': flops, 'flops_m': flops/1e6,
+        'inference_time_ms': inf_time*1000, 'peak_ram_mb': peak_ram,
+        'training_energy_kwh': energy_metrics['energy_kwh'], 'training_emissions_kg': energy_metrics['emissions_kg'],
+        'training_duration_s': energy_metrics['duration_s'], 'l1_lambda': 0.0, 'use_regularization': False,
+        'channels_layer1': 64, 'channels_layer2': 128, 'channels_layer3': 256, 'channels_layer4': 512
+    }
+
 def train_prune_then_train(dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial_num):
-    print(f"\nMethod 2: Prune-Then-Train+L1 | {dataset_name} trial {trial_num}")
+    print(f"\nMethod 3: Prune-Then-Train+L1 | {dataset_name} trial {trial_num}")
     
     initial_model = build_baseline_resnet(num_classes)
     keep_indices = {}
@@ -644,7 +738,7 @@ def train_prune_then_train(dataset_name, train_loader, val_loader, test_loader, 
 
 def train_progressive(dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial_num, use_l1):
     method_str = "Progressive+L1" if use_l1 else "Progressive NoReg"
-    print(f"\nMethod {'3' if use_l1 else '4'}: {method_str} | {dataset_name} trial {trial_num}")
+    print(f"\nMethod {'4' if use_l1 else '5'}: {method_str} | {dataset_name} trial {trial_num}")
     
     prune_epochs = [WARMUP_EPOCHS + i * EPOCHS_BETWEEN_PRUNES for i in range(1, NUM_PRUNE_STEPS + 1)]
     prune_epochs = [e for e in prune_epochs if e <= FIXED_EPOCHS]
@@ -732,77 +826,188 @@ def train_progressive(dataset_name, train_loader, val_loader, test_loader, num_c
 
 def process_dataset(dataset_name, cfg):
     print(f"\n{'='*60}\nDataset: {dataset_name}\n{'='*60}")
-    
+
     save_dir = os.path.join(SAVE_DIR_BASE, dataset_name)
     os.makedirs(save_dir, exist_ok=True)
-    
+
     train_loader, val_loader, test_loader, num_classes = make_loaders(cfg['path'], cfg['batch_size'])
-    
-    all_baseline = []
+
+    # Check for existing summary file
+    summary_path = os.path.join(save_dir, f"{dataset_name}_summary_statistics.csv")
+    all_trials_path = os.path.join(save_dir, f"{dataset_name}_all_trials_metrics.csv")
+
+    existing_summary = None
+    existing_trials = None
+    if os.path.exists(summary_path):
+        existing_summary = pd.read_csv(summary_path)
+        print(f"Found existing summary with {len(existing_summary)} methods")
+    if os.path.exists(all_trials_path):
+        existing_trials = pd.read_csv(all_trials_path)
+        print(f"Found existing trials data with {len(existing_trials)} rows")
+
+    # Collect metrics for each method
+    all_baseline_l1 = []
+    all_baseline_no_reg = []
     all_ptt = []
     all_prog_reg = []
     all_prog_noreg = []
-    
+
+    # Method configurations: (key, method_name, train_func, extra_args, use_reg, stage_planes)
+    method_configs = [
+        ('baseline_l1', 'baseline_l1_regularized', train_baseline_with_regularization, {}, True, [64, 128, 256, 512]),
+        ('baseline_no_reg', 'baseline_no_regularization', train_baseline_no_regularization, {}, False, [64, 128, 256, 512]),
+        ('prune_then_train', 'prune_then_train', train_prune_then_train, {}, True, PRUNE_THEN_TRAIN_TARGETS),
+        ('progressive_with_reg', 'progressive_pruning_with_reg', lambda *args: train_progressive(*args, use_l1=True), {}, True, None),
+        ('progressive_no_reg', 'progressive_pruning_no_reg', lambda *args: train_progressive(*args, use_l1=False), {}, False, None),
+    ]
+
+    method_results = {
+        'baseline_l1': all_baseline_l1,
+        'baseline_no_reg': all_baseline_no_reg,
+        'prune_then_train': all_ptt,
+        'progressive_with_reg': all_prog_reg,
+        'progressive_no_reg': all_prog_noreg,
+    }
+
     for trial in range(1, NUM_TRIALS + 1):
         print(f"\n--- Trial {trial}/{NUM_TRIALS} ---")
         trial_seed = SEED + trial * 100
         set_seed(trial_seed, deterministic=True)
-        
-        m, metrics = train_baseline_with_regularization(dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial)
-        all_baseline.append(metrics)
-        del m
-        cleanup_memory()
-        
-        m, metrics = train_prune_then_train(dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial)
-        all_ptt.append(metrics)
-        del m
-        cleanup_memory()
-        
-        m, metrics = train_progressive(dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial, use_l1=True)
-        all_prog_reg.append(metrics)
-        del m
-        cleanup_memory()
-        
-        m, metrics = train_progressive(dataset_name, train_loader, val_loader, test_loader, num_classes, save_dir, trial, use_l1=False)
-        all_prog_noreg.append(metrics)
-        del m
-        cleanup_memory()
-    
-    all_metrics = pd.DataFrame(all_baseline + all_ptt + all_prog_reg + all_prog_noreg)
-    all_metrics.to_csv(os.path.join(save_dir, f"{dataset_name}_all_trials_metrics.csv"), index=False)
-    
+
+        for method_key, method_name, train_func, extra_args, use_reg, default_planes in method_configs:
+            if check_experiment_exists(save_dir, dataset_name, method_key, trial):
+                print(f"  Skipping {method_key} trial {trial} (already exists)")
+
+                # If no existing summary, we need to recompute metrics from saved model
+                if existing_summary is None:
+                    model_path = get_final_model_path(save_dir, dataset_name, method_key, trial)
+                    print(f"    Recomputing metrics from {os.path.basename(model_path)}")
+
+                    # Determine stage planes for this method
+                    if method_key == 'prune_then_train':
+                        stage_planes = [PRUNE_THEN_TRAIN_TARGETS[s] for s in STAGES]
+                    elif method_key in ['progressive_with_reg', 'progressive_no_reg']:
+                        # For progressive, we need to infer from model or use final values
+                        # Load the model to get actual channel counts
+                        stage_planes = None  # Will be inferred
+                    else:
+                        stage_planes = [64, 128, 256, 512]
+
+                    # Build appropriate model architecture
+                    if method_key == 'prune_then_train':
+                        model = build_pruned_resnet(stage_planes, num_classes)
+                    elif method_key in ['progressive_with_reg', 'progressive_no_reg']:
+                        # Try to load and infer architecture from state dict
+                        state_dict = torch.load(model_path, map_location=DEVICE)
+                        # Infer planes from conv1 weights in each layer
+                        inferred_planes = []
+                        for stage in STAGES:
+                            key = f"{stage}.0.conv1.weight"
+                            if key in state_dict:
+                                inferred_planes.append(state_dict[key].shape[0])
+                            else:
+                                inferred_planes.append(64)  # fallback
+                        stage_planes = inferred_planes
+                        model = build_pruned_resnet(stage_planes, num_classes)
+                    else:
+                        model = build_baseline_resnet(num_classes)
+                        stage_planes = [64, 128, 256, 512]
+
+                    metrics = load_and_compute_metrics(model_path, model, test_loader,
+                                                       method_name, trial, stage_planes, use_reg)
+                    method_results[method_key].append(metrics)
+                    del model
+                    cleanup_memory()
+            else:
+                # Run the training
+                m, metrics = train_func(dataset_name, train_loader, val_loader, test_loader,
+                                       num_classes, save_dir, trial)
+                method_results[method_key].append(metrics)
+                del m
+                cleanup_memory()
+
+    # Combine all new metrics
+    new_metrics_list = []
+    for key in ['baseline_l1', 'baseline_no_reg', 'prune_then_train', 'progressive_with_reg', 'progressive_no_reg']:
+        new_metrics_list.extend(method_results[key])
+
+    if new_metrics_list:
+        new_metrics_df = pd.DataFrame(new_metrics_list)
+
+        # Handle all_trials file
+        if existing_trials is not None:
+            # Append only truly new entries (avoid duplicates by method+trial)
+            existing_keys = set(zip(existing_trials['method'], existing_trials['trial']))
+            new_rows = [m for m in new_metrics_list
+                       if (m['method'], m['trial']) not in existing_keys]
+            if new_rows:
+                combined_trials = pd.concat([existing_trials, pd.DataFrame(new_rows)], ignore_index=True)
+            else:
+                combined_trials = existing_trials
+        else:
+            combined_trials = new_metrics_df
+
+        combined_trials.to_csv(all_trials_path, index=False)
+
+    # Generate summary
     def summarize(df, method_name):
-        summary = {'method': method_name, 'dataset': dataset_name, 'num_trials': NUM_TRIALS, 'fixed_epochs': FIXED_EPOCHS}
-        for col in ['test_acc', 'test_auc', 'params_m', 'model_size_mb', 'flops_m', 'inference_time_ms', 
+        if df.empty:
+            return None
+        summary = {'method': method_name, 'dataset': dataset_name, 'num_trials': len(df), 'fixed_epochs': FIXED_EPOCHS}
+        for col in ['test_acc', 'test_auc', 'params_m', 'model_size_mb', 'flops_m', 'inference_time_ms',
                     'training_energy_kwh', 'channels_layer1', 'channels_layer2', 'channels_layer3', 'channels_layer4']:
             if col in df.columns:
                 summary[f'{col}_mean'] = df[col].mean()
                 summary[f'{col}_std'] = df[col].std()
         return summary
-    
-    summary_rows = [
-        summarize(pd.DataFrame(all_baseline), 'baseline_l1'),
-        summarize(pd.DataFrame(all_ptt), 'prune_then_train'),
-        summarize(pd.DataFrame(all_prog_reg), 'progressive_with_reg'),
-        summarize(pd.DataFrame(all_prog_noreg), 'progressive_no_reg')
+
+    summary_rows = []
+    method_summary_names = [
+        ('baseline_l1', 'baseline_l1'),
+        ('baseline_no_reg', 'baseline_no_reg'),
+        ('prune_then_train', 'prune_then_train'),
+        ('progressive_with_reg', 'progressive_with_reg'),
+        ('progressive_no_reg', 'progressive_no_reg'),
     ]
-    
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(os.path.join(save_dir, f"{dataset_name}_summary_statistics.csv"), index=False)
-    
-    print(f"\n{dataset_name.upper()} SUMMARY:")
-    print(f"{'Method':<25} {'Test Acc':<20} {'Params (M)':<15} {'Size (MB)':<15}")
-    for row in summary_rows:
-        acc_str = f"{row['test_acc_mean']:.4f}±{row['test_acc_std']:.4f}"
-        params_str = f"{row['params_m_mean']:.2f}±{row['params_m_std']:.2f}"
-        size_str = f"{row['model_size_mb_mean']:.2f}±{row['model_size_mb_std']:.2f}"
-        print(f"{row['method']:<25} {acc_str:<20} {params_str:<15} {size_str:<15}")
-    
-    return summary_df
+
+    for method_key, summary_name in method_summary_names:
+        if method_results[method_key]:
+            s = summarize(pd.DataFrame(method_results[method_key]), summary_name)
+            if s:
+                summary_rows.append(s)
+
+    if summary_rows:
+        new_summary_df = pd.DataFrame(summary_rows)
+
+        # If existing summary, merge/update
+        if existing_summary is not None:
+            existing_methods = set(existing_summary['method'])
+            new_methods = set(new_summary_df['method'])
+
+            # Update existing methods with new data, add new methods
+            rows_to_keep = existing_summary[~existing_summary['method'].isin(new_methods)]
+            final_summary = pd.concat([rows_to_keep, new_summary_df], ignore_index=True)
+        else:
+            final_summary = new_summary_df
+
+        final_summary.to_csv(summary_path, index=False)
+
+        print(f"\n{dataset_name.upper()} SUMMARY:")
+        print(f"{'Method':<25} {'Test Acc':<20} {'Params (M)':<15} {'Size (MB)':<15}")
+        for _, row in final_summary.iterrows():
+            acc_str = f"{row['test_acc_mean']:.4f}±{row['test_acc_std']:.4f}"
+            params_str = f"{row['params_m_mean']:.2f}±{row['params_m_std']:.2f}"
+            size_str = f"{row['model_size_mb_mean']:.2f}±{row['model_size_mb_std']:.2f}"
+            print(f"{row['method']:<25} {acc_str:<20} {params_str:<15} {size_str:<15}")
+
+        return final_summary
+
+    return existing_summary
 
 def main():
-    print("Four-Method Pruning Comparison")
+    print("Five-Method Pruning Comparison")
     print(f"Device: {DEVICE} | Trials: {NUM_TRIALS} | Epochs: {FIXED_EPOCHS} | L1: {L1_LAMBDA}")
+    print("Methods: baseline_l1, baseline_no_reg, prune_then_train, progressive_with_reg, progressive_no_reg")
     
     os.makedirs(SAVE_DIR_BASE, exist_ok=True)
     all_summaries = []
