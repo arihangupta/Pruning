@@ -31,7 +31,6 @@ import logging
 from sklearn.metrics import roc_auc_score, accuracy_score
 import timm
 from tqdm import tqdm
-from functools import partial
 
 # Configure debug logging to file only
 logging.basicConfig(
@@ -65,176 +64,6 @@ BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/new_baseline"
 PRUNED_MODELS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/pruned_models"
 DATASETS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 OUTPUT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/benchmarking_results"
-
-
-# -------------------------
-# Deployment ViT Components for One-Shot Pruned Models
-# -------------------------
-class DeployMlp(nn.Module):
-    """MLP without gates - physically smaller"""
-    def __init__(self, in_features, hidden_features, out_features=None,
-                 act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
-
-class DeployAttention(nn.Module):
-    """Multi-head attention without gates - physically smaller"""
-    def __init__(self, dim, num_heads, head_dim, qkv_bias=False, qk_scale=None,
-                 attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.scale = qk_scale or head_dim ** -0.5
-
-        self.inner_dim = head_dim * num_heads
-
-        self.qkv = nn.Linear(dim, self.inner_dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(self.inner_dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, self.inner_dim)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class DeployBlock(nn.Module):
-    """Transformer block without gates - physically smaller"""
-    def __init__(self, dim, num_heads, head_dim, mlp_hidden_dim, qkv_bias=False,
-                 qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = DeployAttention(
-            dim, num_heads=num_heads, head_dim=head_dim, qkv_bias=qkv_bias,
-            qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop
-        )
-
-        from timm.models.layers import DropPath
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-
-        self.mlp = DeployMlp(
-            in_features=dim, hidden_features=mlp_hidden_dim,
-            act_layer=act_layer, drop=drop
-        )
-
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
-
-
-class DeployVisionTransformer(nn.Module):
-    """Deployment ViT - physically smaller model without gates"""
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000,
-                 embed_dim=192, depth=12, head_dim=64,
-                 per_layer_num_heads=None, per_layer_mlp_dim=None,
-                 qkv_bias=True, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.):
-        super().__init__()
-
-        self.num_classes = num_classes
-        self.num_features = self.embed_dim = embed_dim
-        self.patch_size = patch_size
-        self.img_size = img_size
-        self.depth = depth
-        self.head_dim = head_dim
-
-        from timm.models.layers import PatchEmbed
-        self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size,
-            in_chans=in_chans, embed_dim=embed_dim
-        )
-        num_patches = self.patch_embed.num_patches
-
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-        self.pos_drop = nn.Dropout(p=drop_rate)
-
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-
-        if per_layer_num_heads is None:
-            per_layer_num_heads = [embed_dim // head_dim] * depth
-        if per_layer_mlp_dim is None:
-            per_layer_mlp_dim = [embed_dim * 4] * depth
-
-        self.blocks = nn.ModuleList([
-            DeployBlock(
-                dim=embed_dim,
-                num_heads=per_layer_num_heads[i],
-                head_dim=head_dim,
-                mlp_hidden_dim=per_layer_mlp_dim[i],
-                qkv_bias=qkv_bias, qk_scale=None,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i],
-                norm_layer=partial(nn.LayerNorm, eps=1e-6)
-            )
-            for i in range(depth)
-        ])
-
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-
-        self.per_layer_num_heads = per_layer_num_heads
-        self.per_layer_mlp_dim = per_layer_mlp_dim
-
-        from timm.models.layers import trunc_normal_
-        trunc_normal_(self.pos_embed, std=.02)
-        trunc_normal_(self.cls_token, std=.02)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            from timm.models.layers import trunc_normal_
-            trunc_normal_(m.weight, std=.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def forward_features(self, x):
-        B = x.shape[0]
-        x = self.patch_embed(x)
-
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
-
-        for blk in self.blocks:
-            x = blk(x)
-
-        x = self.norm(x)
-        return x[:, 0]
-
-    def forward(self, x):
-        x = self.forward_features(x)
-        x = self.head(x)
-        return x
 
 DATASETS = {
     "bloodmnist": f"{DATASETS_DIR}/bloodmnist_224.npz",
@@ -337,13 +166,12 @@ def parse_model_name(model_path, dataset):
     Handles patterns from pruned_models directory:
     - quantization_vit_{size}_patch16_224_{dataset}_final.pth
     - kd_vit_{teacher_size}_patch16_224_to_vit_{student_size}_patch16_224_{dataset}_final.pth
-    - oneshot_vit_{size}_patch16_224_{dataset}_final.pth
     And baseline models:
     - vit_{size}_patch16_224_{dataset}_pretrained.pth
     """
     basename = os.path.basename(model_path)
     logger.debug(f"Parsing model file: {basename} for dataset: {dataset}")
-
+    
     # Handle baseline models from baseline directory
     if "_pretrained.pth" in basename:
         model_name = basename.replace(f"_{dataset}_pretrained.pth", "")
@@ -356,25 +184,7 @@ def parse_model_name(model_path, dataset):
             "teacher_model": None,
             "student_model": None
         }
-
-    # Handle one-shot pruned models from pruned_models directory
-    # Pattern: oneshot_vit_{size}_patch16_224_{dataset}_final.pth
-    if basename.startswith("oneshot_") and "_final.pth" in basename:
-        # Extract the model architecture name
-        # oneshot_vit_tiny_patch16_224_bloodmnist_final.pth -> vit_tiny_patch16_224
-        parts = basename.replace("oneshot_", "").replace(f"_{dataset}_final.pth", "")
-        model_name = parts  # e.g., vit_tiny_patch16_224
-
-        return {
-            "model_name": model_name,
-            "full_name": f"oneshot_{model_name}",
-            "pruning_method": "oneshot",
-            "sparsity": "50%",  # One-shot pruning targets 40% sparsity
-            "stored_precision": "fp32",
-            "teacher_model": model_name,
-            "student_model": f"{model_name}_pruned"
-        }
-
+    
     # Handle quantized models from pruned_models directory
     # Pattern: quantization_vit_{size}_patch16_224_{dataset}_final.pth
     if basename.startswith("quantization_") and "_final.pth" in basename:
@@ -382,7 +192,7 @@ def parse_model_name(model_path, dataset):
         # quantization_vit_tiny_patch16_224_bloodmnist_final.pth -> vit_tiny_patch16_224
         parts = basename.replace("quantization_", "").replace(f"_{dataset}_final.pth", "")
         model_name = parts  # e.g., vit_tiny_patch16_224
-
+        
         return {
             "model_name": model_name,
             "full_name": f"quantization_{model_name}",
@@ -392,30 +202,30 @@ def parse_model_name(model_path, dataset):
             "teacher_model": None,
             "student_model": None
         }
-
+    
     # Handle knowledge distillation models from pruned_models directory
     # Pattern: kd_vit_{teacher_size}_patch16_224_to_vit_{student_size}_patch16_224_{dataset}_final.pth
     if basename.startswith("kd_") and "_final.pth" in basename:
         # Remove kd_ prefix and _final.pth suffix
         middle = basename.replace("kd_", "").replace(f"_{dataset}_final.pth", "")
-
+        
         # Split on "_to_" to get teacher and student
         if "_to_" in middle:
             parts = middle.split("_to_")
             teacher_name = parts[0]  # e.g., vit_base_patch16_224
             student_name = parts[1]  # e.g., vit_small_patch16_224
-
+            
             # Estimate sparsity based on student/teacher size
             sparsity_map = {
                 ("base", "small"): "33%",
                 ("base", "tiny"): "67%",
                 ("small", "tiny"): "50%"
             }
-
+            
             teacher_size = "tiny" if "tiny" in teacher_name else ("small" if "small" in teacher_name else "base")
             student_size = "tiny" if "tiny" in student_name else ("small" if "small" in student_name else "base")
             sparsity = sparsity_map.get((teacher_size, student_size), "unknown")
-
+            
             return {
                 "model_name": student_name,
                 "full_name": f"kd_{teacher_name}_to_{student_name}",
@@ -425,7 +235,7 @@ def parse_model_name(model_path, dataset):
                 "teacher_model": teacher_name,
                 "student_model": student_name
             }
-
+    
     logger.debug(f"Skipping {basename}: unrecognized format")
     return None
 
@@ -489,92 +299,31 @@ def load_model(config, num_classes):
     model_path = config.experiment['model_path']
     model_name = config.experiment['model_name']
     precision = config.experiment['precision']
-    pruning_method = config.experiment.get('pruning_method', 'baseline')
-
+    
     if not os.path.exists(model_path):
         raise ValueError(f"Model path does not exist: {model_path}")
-
+    
+    # Create model
+    model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+    
     # Load checkpoint
     checkpoint = torch.load(model_path, map_location='cpu')
-
+    
     # Handle different checkpoint formats
     if 'model' in checkpoint:
         state_dict = checkpoint['model']
     else:
         state_dict = checkpoint
-
-    # Handle one-shot pruned models (use DeployVisionTransformer)
-    if pruning_method == 'oneshot':
-        # Extract pruning config from checkpoint
-        pruning_config = checkpoint.get('pruning_config', {})
-
-        if pruning_config:
-            # Create DeployVisionTransformer with the exact pruned dimensions
-            model = DeployVisionTransformer(
-                img_size=IMG_SIZE,
-                patch_size=16,
-                in_chans=3,
-                num_classes=num_classes,
-                embed_dim=pruning_config['deploy_embed_dim'],
-                depth=12,  # Fixed for ViT models
-                head_dim=pruning_config['head_dim'],
-                per_layer_num_heads=pruning_config['deploy_per_layer_num_heads'],
-                per_layer_mlp_dim=pruning_config['deploy_per_layer_mlp_dim'],
-                qkv_bias=True,
-                drop_rate=0.0,
-                attn_drop_rate=0.0,
-                drop_path_rate=0.1
-            )
-        else:
-            # Fallback: infer dimensions from state dict
-            embed_dim = state_dict['cls_token'].shape[-1]
-            depth = sum(1 for k in state_dict.keys() if 'blocks.' in k and '.norm1.weight' in k)
-
-            # Infer per-layer dimensions
-            per_layer_num_heads = []
-            per_layer_mlp_dim = []
-            for i in range(depth):
-                qkv_weight = state_dict.get(f'blocks.{i}.attn.qkv.weight')
-                if qkv_weight is not None:
-                    # QKV weight shape: [3 * num_heads * head_dim, embed_dim]
-                    inner_dim = qkv_weight.shape[0] // 3
-                    # Assume head_dim = 64 for ViT
-                    head_dim = 64
-                    num_heads = inner_dim // head_dim
-                    per_layer_num_heads.append(num_heads)
-
-                mlp_fc1_weight = state_dict.get(f'blocks.{i}.mlp.fc1.weight')
-                if mlp_fc1_weight is not None:
-                    per_layer_mlp_dim.append(mlp_fc1_weight.shape[0])
-
-            model = DeployVisionTransformer(
-                img_size=IMG_SIZE,
-                patch_size=16,
-                in_chans=3,
-                num_classes=num_classes,
-                embed_dim=embed_dim,
-                depth=depth,
-                head_dim=64,  # Standard head dim for ViT
-                per_layer_num_heads=per_layer_num_heads,
-                per_layer_mlp_dim=per_layer_mlp_dim,
-                qkv_bias=True,
-                drop_rate=0.0,
-                attn_drop_rate=0.0,
-                drop_path_rate=0.1
-            )
-
-        model.load_state_dict(state_dict)
-    else:
-        # Standard timm model for baseline, quantization, and KD
-        model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
-        model.load_state_dict(state_dict)
-
+    
+    # Load state dict
+    model.load_state_dict(state_dict)
+    
     # Handle precision
     if precision == 'amp' or config.experiment.get('stored_precision') == 'amp':
         model = model.half()
     else:
         model = model.float()
-
+    
     return model
 
 
@@ -905,12 +654,11 @@ def run_matrix(matrix_config):
     """
     Run full factorial experiment across all configurations.
     Main execution function matching ResNet script structure.
-    Skips model+batch_size+precision combinations that already have data.
     """
     datasets = matrix_config['datasets']
     log_base = Path(matrix_config['log_dir'])
     log_base.mkdir(parents=True, exist_ok=True)
-
+    
     batch_sizes = matrix_config['batch_sizes']
     precisions = matrix_config['precisions']
     repeats = matrix_config['repeats']
@@ -919,31 +667,17 @@ def run_matrix(matrix_config):
     seed = matrix_config['seed']
     num_workers = matrix_config['num_workers']
     pin_memory = matrix_config['pin_memory']
-
+    
     for dataset_model in matrix_config['models']:
         dataset = dataset_model['dataset']
         dataset_models = dataset_model['models']
         print(f"\nStarting dataset: {dataset}")
         print(f"Found {len(dataset_models)} models: {[m['full_name'] for m in dataset_models]}")
-
-        # Load existing results to check what has already been benchmarked
-        results_csv = log_base / f"{dataset}_results.csv"
-        existing_runs = set()
-        if os.path.exists(results_csv):
-            try:
-                existing_df = pd.read_csv(results_csv)
-                # Create set of (model_name, batch_size, precision, rep) tuples
-                for _, row in existing_df.iterrows():
-                    key = (row['model_name'], row['batch_size'], row['runtime_precision'], row['rep'])
-                    existing_runs.add(key)
-                print(f"✓ Loaded {len(existing_runs)} existing benchmark results from {results_csv}")
-            except Exception as e:
-                print(f"⚠ Could not load existing results: {e}")
-
+        
         for rep in range(repeats):
             print(f"\nStarting repeat {rep+1}/{repeats} for {dataset}")
             random.seed(seed + rep)
-
+            
             # Create conditions list
             conditions = []
             for midx, model_cfg in enumerate(dataset_models):
@@ -952,23 +686,16 @@ def run_matrix(matrix_config):
                     model_precisions = ['amp']
                 else:
                     model_precisions = precisions
-
+                
                 for bs, prec in product(batch_sizes, model_precisions):
                     conditions.append((midx, bs, prec))
-
+            
             # Shuffle conditions to avoid systematic biases
             random.shuffle(conditions)
-
+            
             # Run each condition
             for midx, bs, prec in conditions:
                 model_cfg = dataset_models[midx]
-
-                # Check if this combination already has results
-                run_key = (model_cfg['full_name'], bs, prec, rep)
-                if run_key in existing_runs:
-                    print(f"\n⊗ Skipping {model_cfg['full_name']}, bs={bs}, prec={prec}, rep={rep} (already exists)")
-                    continue
-
                 exp_cfg = {
                     'model_name': model_cfg['model_name'],
                     'full_name': model_cfg['full_name'],
@@ -989,15 +716,15 @@ def run_matrix(matrix_config):
                     'teacher_model': model_cfg.get('teacher_model'),
                     'student_model': model_cfg.get('student_model')
                 }
-
+                
                 config = Config(
                     experiment=exp_cfg,
                     log_dir=str(log_base / f"{dataset}_rep{rep}")
                 )
-
+                
                 print(f"\nRunning: {exp_cfg['full_name']}, bs={bs}, prec={prec}, "
                       f"stored_as={exp_cfg['stored_precision']}, rep={rep}")
-
+                
                 try:
                     result = bench_fixed_passes(config)
                     if result is None:
@@ -1006,7 +733,7 @@ def run_matrix(matrix_config):
                     print(f"  Error: {e}")
                     import traceback
                     traceback.print_exc()
-
+                
                 # Cool down between runs
                 time.sleep(30)
 
