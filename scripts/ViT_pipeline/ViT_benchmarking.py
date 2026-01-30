@@ -454,7 +454,7 @@ def discover_models():
                 if parsed:
                     parsed["model_path"] = baseline_path
                     dataset_models.append(parsed)
-                    print(f"✓ Found baseline: {model_name} for {dataset}")
+                    print(f"Found baseline: {model_name} for {dataset}")
             else:
                 logger.debug(f"Baseline not found: {baseline_path}")
         
@@ -469,7 +469,7 @@ def discover_models():
                 if parsed:
                     parsed["model_path"] = model_path
                     dataset_models.append(parsed)
-                    print(f"✓ Found {parsed['pruning_method']}: {parsed['full_name']} for {dataset}")
+                    print(f"Found {parsed['pruning_method']}: {parsed['full_name']} for {dataset}")
                 else:
                     logger.debug(f"Skipping unrecognized file: {os.path.basename(model_path)}")
         else:
@@ -936,9 +936,9 @@ def run_matrix(matrix_config):
                 for _, row in existing_df.iterrows():
                     key = (row['model_name'], row['batch_size'], row['runtime_precision'], row['rep'])
                     existing_runs.add(key)
-                print(f"✓ Loaded {len(existing_runs)} existing benchmark results from {results_csv}")
-            except Exception as e:
-                print(f"⚠ Could not load existing results: {e}")
+                pass
+            except Exception:
+                pass
 
         for rep in range(repeats):
             print(f"\nStarting repeat {rep+1}/{repeats} for {dataset}")
@@ -966,7 +966,6 @@ def run_matrix(matrix_config):
                 # Check if this combination already has results
                 run_key = (model_cfg['full_name'], bs, prec, rep)
                 if run_key in existing_runs:
-                    print(f"\n⊗ Skipping {model_cfg['full_name']}, bs={bs}, prec={prec}, rep={rep} (already exists)")
                     continue
 
                 exp_cfg = {
@@ -1244,75 +1243,35 @@ def run_full_analysis(log_base):
 
 def main():
     """Main execution function."""
-    print(f"\n{'='*80}")
-    print("VISION TRANSFORMER MODEL BENCHMARKING")
-    print(f"{'='*80}\n")
+    print("ViT Benchmarking")
     
-    print("Configuration:")
-    print(f"  Datasets: {MATRIX_CONFIG['datasets']}")
-    print(f"  Batch sizes: {MATRIX_CONFIG['batch_sizes']}")
-    print(f"  Precisions: {MATRIX_CONFIG['precisions']}")
-    print(f"  Passes per test: {MATRIX_CONFIG['num_passes']}")
-    print(f"  Warmup batches: {MATRIX_CONFIG['warmup_batches']}")
-    print(f"  Repeats: {MATRIX_CONFIG['repeats']}")
-    print(f"  Output directory: {OUTPUT_DIR}")
-    print(f"  CodeCarbon available: {CODECARBON_AVAILABLE}")
-    
-    # Verify paths exist
     if not os.path.exists(BASELINE_DIR):
-        print(f"\n✗ Error: Baseline directory not found: {BASELINE_DIR}")
+        print(f"Error: Baseline directory not found: {BASELINE_DIR}")
         return
-    
+
     if not os.path.exists(PRUNED_MODELS_DIR):
-        print(f"\n✗ Error: Pruned models directory not found: {PRUNED_MODELS_DIR}")
+        print(f"Error: Pruned models directory not found: {PRUNED_MODELS_DIR}")
         return
-    
+
     if not os.path.exists(DATASETS_DIR):
-        print(f"\n✗ Error: Datasets directory not found: {DATASETS_DIR}")
+        print(f"Error: Datasets directory not found: {DATASETS_DIR}")
         return
-    
-    # Check CUDA availability
+
     if not torch.cuda.is_available():
-        print("\n✗ Warning: CUDA not available. Benchmarks may be slower and less accurate.")
+        print("Warning: CUDA not available.")
         response = input("Continue anyway? (y/n): ")
         if response.lower() != 'y':
             return
-    else:
-        print(f"\n✓ CUDA available: {torch.cuda.get_device_name(0)}")
-        print(f"  CUDA version: {torch.version.cuda}")
-        print(f"  PyTorch version: {torch.__version__}")
     
-    # Discover models
-    print("\nDiscovering models...")
     MATRIX_CONFIG["models"] = discover_models()
-    
+
     if not MATRIX_CONFIG["models"]:
-        print("\n✗ No models found. Check your model directories.")
+        print("No models found. Check your model directories.")
         return
     
-    print(f"\nModel discovery results:")
-    for dataset_info in MATRIX_CONFIG["models"]:
-        print(f"  {dataset_info['dataset']}: {len(dataset_info['models'])} models found")
-        for model in dataset_info['models']:
-            print(f"    - {model['pruning_method']} ({model['sparsity']}, "
-                  f"stored as {model['stored_precision']})")
-    
-    # Run benchmarks
-    print("\nStarting full experiment...")
     run_matrix(MATRIX_CONFIG)
-    
-    # Run analysis
-    print("\n\nAll runs complete. Running analysis...")
     run_full_analysis(Path(MATRIX_CONFIG['log_dir']))
-    
-    print(f"\n{'='*80}")
-    print("BENCHMARKING COMPLETE!")
-    print(f"{'='*80}")
-    print(f"\nCheck the {OUTPUT_DIR} directory for outputs:")
-    print("  - {dataset}_results.csv (raw results for each dataset)")
-    print("  - analysis/{dataset}/summary.csv (statistical summaries)")
-    print("  - analysis/global_summary.csv (overall summary)")
-    print("  - analysis/{dataset}/*.png (visualization plots)")
+    print("Benchmarking complete.")
 
 
 if __name__ == "__main__":

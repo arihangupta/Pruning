@@ -818,12 +818,9 @@ def main():
         print("No data loaded! Check the merged directory path.")
         return
     
-    # Verify we have the true baseline
     baseline_check = df[df['Variant'] == 'baseline_vit_base_patch16_224']
     if baseline_check.empty:
         print("WARNING: No baseline_vit_base_patch16_224 found!")
-    else:
-        print(f"✓ Found {len(baseline_check)} baseline_vit_base_patch16_224 records\n")
     
     datasets = df['dataset'].unique()
     print(f"Datasets found: {datasets}\n")

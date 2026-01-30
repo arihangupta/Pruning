@@ -342,7 +342,7 @@ def discover_models():
                 if parsed:
                     parsed["model_path"] = baseline_path
                     dataset_models.append(parsed)
-                    logger.info(f"✓ Found baseline: {model_name} for {dataset}")
+                    logger.info(f"Found baseline: {model_name} for {dataset}")
             else:
                 logger.debug(f"Baseline not found: {baseline_path}")
         
@@ -356,7 +356,7 @@ def discover_models():
                 if parsed:
                     parsed["model_path"] = model_path
                     dataset_models.append(parsed)
-                    logger.info(f"✓ Found {parsed['pruning_method']}: {parsed['full_name']} for {dataset}")
+                    logger.info(f"Found {parsed['pruning_method']}: {parsed['full_name']} for {dataset}")
                 else:
                     logger.debug(f"Skipping unrecognized file: {os.path.basename(model_path)}")
         else:

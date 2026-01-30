@@ -394,7 +394,6 @@ def train(dataset_name, model_name, train_loader, val_loader, test_loader, num_c
         print(f"Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}, F1: {metrics['f1']:.4f}")
         
         if metrics['acc'] > best_acc:
-            print(f"\n✓ New best accuracy: {metrics['acc']:.4f} (previous: {best_acc:.4f})")
             best_acc, best_auc = metrics['acc'], metrics['auc']
             state = {
                 'model': net.state_dict(),
@@ -446,7 +445,7 @@ def train(dataset_name, model_name, train_loader, val_loader, test_loader, num_c
             writer.writeheader()
         writer.writerow(results)
     
-    print(f"✓ Test results saved to {csv_path}")
+    print(f"Test results saved to {csv_path}")
 
 
 
@@ -497,41 +496,26 @@ def main():
         npz_path = os.path.join(DATASET_DIR, f"{dataset}_224.npz")
         
         if not os.path.exists(npz_path):
-            print(f"\n✗ Error: Dataset file not found: {npz_path}")
-            print("Skipping this dataset...")
+            print(f"Dataset not found: {npz_path}")
             continue
-        
+
         try:
             train_loader, val_loader, test_loader, num_classes, dataset_name = load_dataset(npz_path, use_strong_aug=use_strong_aug)
-            print(f"Loaded {dataset_name}: {num_classes} classes")
         except Exception as e:
-            print(f"\n✗ Error loading dataset {dataset}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            print("Skipping this dataset...")
+            print(f"Error loading dataset {dataset}: {str(e)}")
             continue
         
         for model_name in models:
             current_model += 1
-            
-            print("\n" + "=" * 100)
-            print(f"TRAINING MODEL {current_model}/{total_models}")
-            print(f"Dataset: {dataset_name} | Model: {model_name}")
-            print("=" * 100)
-            
+            print(f"Training {model_name} on {dataset_name} ({current_model}/{total_models})")
+
             try:
                 train(dataset_name, model_name, train_loader, val_loader, test_loader, num_classes, strategy=TRAINING_STRATEGY)
-                print(f"\n✓ Successfully completed training for {model_name} on {dataset_name}")
             except Exception as e:
-                print(f"\n✗ Error training {model_name} on {dataset_name}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                print("Continuing to next model...")
+                print(f"Error training {model_name} on {dataset_name}: {str(e)}")
                 continue
-    
-    print("\n" + "=" * 100)
-    print("ALL TRAINING COMPLETED!")
-    print("=" * 100)
+
+    print("Training complete.")
 
 
 if __name__ == '__main__':

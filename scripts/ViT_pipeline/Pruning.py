@@ -32,7 +32,7 @@ try:
 except Exception:
     EmissionsTracker = None
     CODECARBON_AVAILABLE = False
-    print("⚠️  WARNING: codecarbon not available. Energy/emissions will be NaN.")
+    print("WARNING: codecarbon not available. Energy/emissions will be NaN.")
 
 # -------------------------
 # Config
@@ -395,7 +395,7 @@ def start_tracker(save_dir: str, project_name: str, measure_power_secs: int=10):
         tracker.start()
         return tracker
     except Exception as e:
-        print(f"⚠️  Error starting tracker: {e}")
+        print(f"Error starting tracker: {e}")
         return None
 
 
@@ -587,28 +587,16 @@ def measure_baseline_energy_averaged(baseline, test_loader, save_dir, model_name
 
 
 # -------------------------
-# TEST CODECARBON BEFORE MAIN EXECUTION
-# -------------------------
 def test_codecarbon():
-    """
-    MANDATORY: Test CodeCarbon functionality before running main experiments.
-    Returns True if working, False otherwise.
-    """
-    print("\n" + "="*80)
-    print("🧪 TESTING CODECARBON FUNCTIONALITY")
-    print("="*80)
-    
+    """Test CodeCarbon functionality. Returns True if working, False otherwise."""
     if not CODECARBON_AVAILABLE:
-        print("❌ FAILED: CodeCarbon is not installed!")
-        print("   Install with: pip install codecarbon --break-system-packages")
-        print("="*80 + "\n")
+        print("CodeCarbon not installed")
         return False
-    
+
     test_dir = "/tmp/codecarbon_test"
     os.makedirs(test_dir, exist_ok=True)
-    
+
     try:
-        print("📊 Starting test tracker...")
         tracker = EmissionsTracker(
             project_name="test_run",
             output_dir=test_dir,
@@ -618,90 +606,37 @@ def test_codecarbon():
             log_level='error'
         )
         tracker.start()
-        
-        # Run actual compute workload
-        print("⚙️  Running test workload (5 seconds)...")
-        start_time = time.time()
-        
+
         if torch.cuda.is_available():
-            # GPU workload
             x = torch.randn(2000, 2000).cuda()
-            for i in range(200):
+            for _ in range(200):
                 y = torch.matmul(x, x)
-                if i % 50 == 0:
-                    print(f"   Progress: {i}/200 iterations")
             torch.cuda.synchronize()
         else:
-            # CPU workload
             x = torch.randn(1000, 1000)
-            for i in range(50):
+            for _ in range(50):
                 y = torch.matmul(x, x)
-                if i % 10 == 0:
-                    print(f"   Progress: {i}/50 iterations")
-        
-        elapsed = time.time() - start_time
-        print(f"✅ Workload completed in {elapsed:.2f}s")
-        
-        # Stop tracker
-        print("🛑 Stopping tracker...")
-        emissions = tracker.stop()
-        print(f"   Returned emissions value: {emissions}")
-        
-        # Wait for file write
+
+        tracker.stop()
         time.sleep(3)
-        
-        # Verify CSV was created
+
         csv_path = os.path.join(test_dir, "test_emissions.csv")
-        print(f"📄 Checking for CSV file: {csv_path}")
-        
         if not os.path.exists(csv_path):
-            print("❌ FAILED: CSV file was not created!")
-            print("="*80 + "\n")
             return False
-        
-        print(f"✅ CSV file exists!")
-        
-        # Read and validate data
+
         df = pd.read_csv(csv_path)
-        print(f"📊 CSV has {len(df)} rows")
-        
         if df.empty:
-            print("❌ FAILED: CSV file is empty!")
-            print("="*80 + "\n")
             return False
-        
-        # Extract metrics
-        last_row = df.iloc[-1]
-        energy_kwh = last_row.get('energy_consumed', float('nan'))
-        emissions_kg = last_row.get('emissions', float('nan'))
-        duration_s = last_row.get('duration', float('nan'))
-        
-        print(f"\n📈 TEST RESULTS:")
-        print(f"   Energy consumed: {energy_kwh:.9f} kWh")
-        print(f"   CO2 emissions: {emissions_kg:.9f} kg")
-        print(f"   Duration: {duration_s:.2f} seconds")
-        print(f"   CPU Power: {last_row.get('cpu_power', 'N/A')} W")
-        print(f"   GPU Power: {last_row.get('gpu_power', 'N/A')} W")
-        print(f"   RAM Power: {last_row.get('ram_power', 'N/A')} W")
-        
-        # Validate that we got real numbers
+
+        energy_kwh = df.iloc[-1].get('energy_consumed', float('nan'))
         if math.isnan(energy_kwh) or energy_kwh == 0:
-            print("\n⚠️  WARNING: Energy value is 0 or NaN!")
-            print("   CodeCarbon may not be measuring correctly.")
-            print("   Results may be inaccurate, but continuing anyway...")
-            print("="*80 + "\n")
-            return True  # Continue but with warning
-        
-        print("\n✅ SUCCESS: CodeCarbon is working correctly!")
-        print("="*80 + "\n")
+            print("Warning: Energy measurement may be inaccurate")
+
+        print("CodeCarbon test passed")
         return True
-        
+
     except Exception as e:
-        print(f"\n❌ FAILED: Exception occurred during test")
-        print(f"   Error: {e}")
-        import traceback
-        traceback.print_exc()
-        print("="*80 + "\n")
+        print(f"CodeCarbon test failed: {e}")
         return False
 
 

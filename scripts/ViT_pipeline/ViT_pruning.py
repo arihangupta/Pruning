@@ -34,7 +34,7 @@ try:
 except Exception:
     EmissionsTracker = None
     CODECARBON_AVAILABLE = False
-    print("⚠️  WARNING: codecarbon not available. Energy/emissions will be NaN.")
+    print("WARNING: codecarbon not available. Energy/emissions will be NaN.")
 
 # -------------------------
 # Config
@@ -571,7 +571,6 @@ class StructuredPruner:
 # -------------------------
 def create_gated_vit_from_timm(model_name, num_classes, pretrained=True):
     """Create gated ViT and load pretrained weights from TIMM"""
-    print(f"Creating gated {model_name} (pretrained={pretrained})...")
 
     configs = {
         'vit_tiny_patch16_224': {'embed_dim': 192, 'depth': 12, 'num_heads': 3},
@@ -600,7 +599,6 @@ def create_gated_vit_from_timm(model_name, num_classes, pretrained=True):
     )
 
     if pretrained:
-        print("  Loading pretrained weights from TIMM...")
         timm_model = timm.create_model(model_name, pretrained=True, num_classes=num_classes)
 
         model_dict = model.state_dict()
@@ -743,25 +741,22 @@ def convert_to_deployment_model(gated_model, num_classes, save_masks=False, save
 # -------------------------
 class EarlyStopping:
     """Early stops training if validation accuracy doesn't improve after patience epochs."""
-    def __init__(self, patience=10, verbose=True, delta=0):
+    def __init__(self, patience=10, verbose=False, delta=0):
         self.patience = patience
-        self.verbose = verbose
         self.delta = delta
         self.counter = 0
         self.best_score = None
         self.early_stop = False
         self.best_acc = 0
-        
+
     def __call__(self, val_acc):
         score = val_acc
-        
+
         if self.best_score is None:
             self.best_score = score
             self.best_acc = val_acc
         elif score < self.best_score + self.delta:
             self.counter += 1
-            if self.verbose:
-                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
@@ -844,7 +839,6 @@ class NumpyMemmapDataset(Dataset):
 
 def load_dataset(npz_path: str):
     """Load dataset from NPZ file."""
-    print(f"Loading {npz_path} ...")
     data = np.load(npz_path, mmap_mode="r")
 
     X_train = data["train_images"]
@@ -855,7 +849,6 @@ def load_dataset(npz_path: str):
     y_test = data["test_labels"].flatten()
 
     n_train, n_val, n_test = len(y_train), len(y_val), len(y_test)
-    print(f"Dataset sizes: train={n_train}, val={n_val}, test={n_test}")
 
     train_ds = NumpyMemmapDataset(X_train, y_train, img_size=IMG_SIZE, is_train=True)
     val_ds = NumpyMemmapDataset(X_val, y_val, img_size=IMG_SIZE, is_train=False)
@@ -1070,7 +1063,7 @@ def start_tracker(save_dir: str, project_name: str, measure_power_secs: int=10):
         tracker.start()
         return tracker
     except Exception as e:
-        print(f"⚠️  Error starting tracker: {e}")
+        print(f"Error starting tracker: {e}")
         return None
 
 
@@ -1262,28 +1255,16 @@ def measure_baseline_energy_averaged(baseline, test_loader, save_dir, model_name
 
 
 # -------------------------
-# TEST CODECARBON BEFORE MAIN EXECUTION
-# -------------------------
 def test_codecarbon():
-    """
-    MANDATORY: Test CodeCarbon functionality before running main experiments.
-    Returns True if working, False otherwise.
-    """
-    print("\n" + "="*80)
-    print("🧪 TESTING CODECARBON FUNCTIONALITY")
-    print("="*80)
-    
+    """Test CodeCarbon functionality. Returns True if working, False otherwise."""
     if not CODECARBON_AVAILABLE:
-        print("❌ FAILED: CodeCarbon is not installed!")
-        print("   Install with: pip install codecarbon --break-system-packages")
-        print("="*80 + "\n")
+        print("CodeCarbon not installed")
         return False
-    
+
     test_dir = "/tmp/codecarbon_test"
     os.makedirs(test_dir, exist_ok=True)
-    
+
     try:
-        print("📊 Starting test tracker...")
         tracker = EmissionsTracker(
             project_name="test_run",
             output_dir=test_dir,
@@ -1293,90 +1274,37 @@ def test_codecarbon():
             log_level='error'
         )
         tracker.start()
-        
-        # Run actual compute workload
-        print("⚙️  Running test workload (5 seconds)...")
-        start_time = time.time()
-        
+
         if torch.cuda.is_available():
-            # GPU workload
             x = torch.randn(2000, 2000).cuda()
-            for i in range(200):
+            for _ in range(200):
                 y = torch.matmul(x, x)
-                if i % 50 == 0:
-                    print(f"   Progress: {i}/200 iterations")
             torch.cuda.synchronize()
         else:
-            # CPU workload
             x = torch.randn(1000, 1000)
-            for i in range(50):
+            for _ in range(50):
                 y = torch.matmul(x, x)
-                if i % 10 == 0:
-                    print(f"   Progress: {i}/50 iterations")
-        
-        elapsed = time.time() - start_time
-        print(f"✅ Workload completed in {elapsed:.2f}s")
-        
-        # Stop tracker
-        print("🛑 Stopping tracker...")
-        emissions = tracker.stop()
-        print(f"   Returned emissions value: {emissions}")
-        
-        # Wait for file write
+
+        tracker.stop()
         time.sleep(3)
-        
-        # Verify CSV was created
+
         csv_path = os.path.join(test_dir, "test_emissions.csv")
-        print(f"📄 Checking for CSV file: {csv_path}")
-        
         if not os.path.exists(csv_path):
-            print("❌ FAILED: CSV file was not created!")
-            print("="*80 + "\n")
             return False
-        
-        print(f"✅ CSV file exists!")
-        
-        # Read and validate data
+
         df = pd.read_csv(csv_path)
-        print(f"📊 CSV has {len(df)} rows")
-        
         if df.empty:
-            print("❌ FAILED: CSV file is empty!")
-            print("="*80 + "\n")
             return False
-        
-        # Extract metrics
-        last_row = df.iloc[-1]
-        energy_kwh = last_row.get('energy_consumed', float('nan'))
-        emissions_kg = last_row.get('emissions', float('nan'))
-        duration_s = last_row.get('duration', float('nan'))
-        
-        print(f"\n📈 TEST RESULTS:")
-        print(f"   Energy consumed: {energy_kwh:.9f} kWh")
-        print(f"   CO2 emissions: {emissions_kg:.9f} kg")
-        print(f"   Duration: {duration_s:.2f} seconds")
-        print(f"   CPU Power: {last_row.get('cpu_power', 'N/A')} W")
-        print(f"   GPU Power: {last_row.get('gpu_power', 'N/A')} W")
-        print(f"   RAM Power: {last_row.get('ram_power', 'N/A')} W")
-        
-        # Validate that we got real numbers
+
+        energy_kwh = df.iloc[-1].get('energy_consumed', float('nan'))
         if math.isnan(energy_kwh) or energy_kwh == 0:
-            print("\n⚠️  WARNING: Energy value is 0 or NaN!")
-            print("   CodeCarbon may not be measuring correctly.")
-            print("   Results may be inaccurate, but continuing anyway...")
-            print("="*80 + "\n")
-            return True  # Continue but with warning
-        
-        print("\n✅ SUCCESS: CodeCarbon is working correctly!")
-        print("="*80 + "\n")
+            print("Warning: Energy measurement may be inaccurate")
+
+        print("CodeCarbon test passed")
         return True
-        
+
     except Exception as e:
-        print(f"\n❌ FAILED: Exception occurred during test")
-        print(f"   Error: {e}")
-        import traceback
-        traceback.print_exc()
-        print("="*80 + "\n")
+        print(f"CodeCarbon test failed: {e}")
         return False
 
 
@@ -1385,13 +1313,11 @@ def test_codecarbon():
 # -------------------------
 def quantize_model_amp(dataset_name, model_name, baseline_path, baseline_model, test_loader, num_classes, save_dir):
     """Apply AMP quantization."""
-    print(f"\n{'='*100}")
-    print(f"Quantizing {model_name} on {dataset_name} using AMP")
-    print(f"{'='*100}")
-    
+    print(f"Quantizing {model_name} on {dataset_name}")
+
     save_path = os.path.join(save_dir, f'quantization_{model_name}_{dataset_name}_final.pth')
     if os.path.exists(save_path):
-        print(f"⊗ Quantized model already exists, skipping")
+        print(f"Quantized model already exists, skipping")
         return None
     
     # Start conversion energy tracking
@@ -1409,15 +1335,8 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, baseline_model, 
     conversion_metrics = stop_tracker_and_get_metrics(conversion_tracker, save_dir, conversion_proj)
     conversion_energy_kwh = conversion_metrics["energy_kwh"]
     conversion_emissions_kg = conversion_metrics["emissions_kg"]
-    
-    print(f"⚡ Conversion: {conversion_energy_kwh:.6f} kWh, {conversion_emissions_kg:.6f} kg CO2")
-    
-    # Evaluate quantized model
-    print("Evaluating quantized model...")
+
     quantized_metrics = evaluate_model(quantized_model, test_loader, DEVICE, use_amp=True)
-    
-    # Get baseline metrics
-    print("Measuring baseline metrics...")
     baseline_metrics = evaluate_model(baseline_model, test_loader, DEVICE, use_amp=False)
     
     # Measure baseline energy
@@ -1433,8 +1352,6 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, baseline_model, 
     quantized_energy_kwh = quantized_inf_metrics["energy_kwh"]
     quantized_emissions_kg = quantized_inf_metrics["emissions_kg"]
     quantized_energy_per_pred_kwh = quantized_energy_kwh / quantized_images if quantized_images > 0 and not math.isnan(quantized_energy_kwh) else float("nan")
-    
-    print(f"⚡ Quantized inference: {quantized_images} images, {quantized_energy_kwh:.6f} kWh")
     
     # Measure prediction energy
     pred_energy_proj = f"{dataset_name}_quantization_{model_name}_pred_50images_{int(time.time())}"
@@ -1457,7 +1374,6 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, baseline_model, 
         'pruning_method': 'quantization'
     }
     torch.save(state, save_path)
-    print(f"✓ Saved to {save_path}")
     
     quantized_size = os.path.getsize(save_path) / (1024 * 1024)
     compression_ratio = baseline_size / quantized_size if quantized_size > 0 else 1.0
@@ -1469,11 +1385,8 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, baseline_model, 
     
     acc_drop = (baseline_metrics['acc'] - quantized_metrics['acc']) * 100
     auc_drop = (baseline_metrics['auc'] - quantized_metrics['auc']) * 100
-    
-    print(f"\n{'='*60}")
-    print(f"RESULTS: Acc Drop: {acc_drop:.2f}%, Compression: {compression_ratio:.2f}x")
-    print(f"Break-even: {break_even:.0f} predictions" if not math.isinf(break_even) else "Never")
-    print(f"{'='*60}")
+
+    print(f"Quantization complete: Acc={quantized_metrics['acc']:.4f}, Drop={acc_drop:.2f}%")
     
     results = {
         'Dataset': dataset_name,
@@ -1571,45 +1484,36 @@ def train_epoch_kd(student, teacher, train_loader, optimizer, scheduler, criteri
     return avg_loss
 
 
-def knowledge_distillation(dataset_name, teacher_model_name, student_model_name, 
+def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
                           teacher_path, teacher_model, train_loader, val_loader, test_loader, num_classes, save_dir):
     """Perform knowledge distillation."""
-    print(f"\n{'='*100}")
-    print(f"Knowledge Distillation: {teacher_model_name} → {student_model_name} on {dataset_name}")
-    print(f"{'='*100}")
-    
+    print(f"KD: {teacher_model_name} -> {student_model_name} on {dataset_name}")
+
     save_path = os.path.join(save_dir, f'kd_{teacher_model_name}_to_{student_model_name}_{dataset_name}_final.pth')
     if os.path.exists(save_path):
-        print(f"⊗ KD model already exists, skipping")
+        print(f"KD model already exists, skipping")
         return None
     
     # Start training energy tracking
     training_proj = f"{dataset_name}_kd_{teacher_model_name}_to_{student_model_name}_training_{int(time.time())}"
     training_tracker = start_tracker(save_dir, training_proj, measure_power_secs=10)
     
-    # Load teacher
-    print(f"Loading teacher: {teacher_model_name}")
     teacher = timm.create_model(teacher_model_name, pretrained=False, num_classes=num_classes).to(DEVICE)
     checkpoint = torch.load(teacher_path, map_location=DEVICE, weights_only=False)
     teacher.load_state_dict(checkpoint['model'])
     teacher.eval()
-    
-    # Evaluate teacher
+
     teacher_metrics = evaluate_model(teacher, test_loader, DEVICE)
-    print(f"Teacher: Acc={teacher_metrics['acc']:.4f}, AUC={teacher_metrics['auc']:.4f}")
     
     # Measure teacher energy
     teacher_energy_kwh, teacher_emissions_kg, teacher_energy_per_pred_kwh, teacher_images, teacher_pred_energy_per_image_kwh = measure_baseline_energy_averaged(
         teacher, test_loader, save_dir, teacher_model_name, dataset_name
     )
     
-    # Create student
-    print(f"Creating student: {student_model_name}")
     student = timm.create_model(student_model_name, pretrained=False, num_classes=num_classes).to(DEVICE)
-    
+
     teacher_params = params_count(teacher)
     student_params = params_count(student)
-    print(f"Parameter reduction: {(1 - student_params/teacher_params)*100:.2f}%")
     
     # Setup training
     criterion = DistillationLoss(temperature=TEMPERATURE, alpha=ALPHA)
@@ -1626,20 +1530,16 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
             return 0.5 * (1 + np.cos(np.pi * progress))
     
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    early_stopping = EarlyStopping(patience=EARLY_STOP_PATIENCE, verbose=True)
+    early_stopping = EarlyStopping(patience=EARLY_STOP_PATIENCE, verbose=False)
     best_acc, best_auc = 0.0, 0.0
-    
-    # Training loop
-    print(f"\nTraining for {EPOCHS_KD} epochs...")
+
     for epoch in range(EPOCHS_KD):
-        print(f"\nEpoch [{epoch + 1}/{EPOCHS_KD}]")
         train_loss = train_epoch_kd(student, teacher, train_loader, optimizer, scheduler, criterion, DEVICE)
         metrics = evaluate_model(student, val_loader, DEVICE)
-        
-        print(f"Loss: {train_loss:.4f}, Val Acc: {metrics['acc']:.4f}, AUC: {metrics['auc']:.4f}")
-        
+
+        print(f"Epoch {epoch+1}/{EPOCHS_KD}: Loss={train_loss:.4f}, Val Acc={metrics['acc']:.4f}")
+
         if metrics['acc'] > best_acc:
-            print(f"✓ New best: {metrics['acc']:.4f}")
             best_acc, best_auc = metrics['acc'], metrics['auc']
             state = {
                 'model': student.state_dict(),
@@ -1657,7 +1557,6 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
         
         early_stopping(metrics['acc'])
         if early_stopping.early_stop:
-            print(f"Early stopping at epoch {epoch + 1}")
             break
     
     time.sleep(3)
@@ -1666,9 +1565,7 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
     training_metrics = stop_tracker_and_get_metrics(training_tracker, save_dir, training_proj)
     training_energy_kwh = training_metrics["energy_kwh"]
     training_emissions_kg = training_metrics["emissions_kg"]
-    
-    print(f"\n⚡ Training: {training_energy_kwh:.6f} kWh, {training_emissions_kg:.6f} kg CO2")
-    
+
     # Test evaluation
     checkpoint = torch.load(save_path, map_location=DEVICE, weights_only=False)
     student.load_state_dict(checkpoint['model'])
@@ -1701,9 +1598,8 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
     
     acc_drop = (teacher_metrics['acc'] - test_metrics['acc']) * 100
     auc_drop = (teacher_metrics['auc'] - test_metrics['auc']) * 100
-    
-    print(f"\nFinal: Student Acc={test_metrics['acc']:.4f}, Drop={acc_drop:.2f}%")
-    print(f"Break-even: {break_even:.0f} predictions" if not math.isinf(break_even) else "Never")
+
+    print(f"KD complete: Acc={test_metrics['acc']:.4f}, Drop={acc_drop:.2f}%")
     
     results = {
         'Dataset': dataset_name,
@@ -1757,33 +1653,57 @@ def collect_importance_scores(model, pruners, train_loader, max_batches=IMPORTAN
     """
     Collect importance scores for one-shot pruning.
     Model in eval mode, gradients collected but no weight updates.
+    Uses memory-efficient processing with smaller effective batch sizes.
     """
     model.eval()
     criterion = nn.CrossEntropyLoss()
 
-    print(f"Collecting importance scores over {max_batches} batches...")
 
+    # Clear memory before starting
+    cleanup_memory()
+
+    batch_count = 0
     for batch_idx, (images, labels) in enumerate(train_loader):
-        if batch_idx >= max_batches:
+        if batch_count >= max_batches:
             break
 
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
+        # Process in smaller chunks if batch is large to save memory
+        chunk_size = min(8, images.size(0))  # Process max 8 images at a time
+        num_chunks = (images.size(0) + chunk_size - 1) // chunk_size
 
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.zero_()
+        for chunk_idx in range(num_chunks):
+            if batch_count >= max_batches:
+                break
 
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
+            start_idx = chunk_idx * chunk_size
+            end_idx = min((chunk_idx + 1) * chunk_size, images.size(0))
 
-        for pruner in pruners:
-            pruner.do_step(loss.item())
+            chunk_images = images[start_idx:end_idx].to(DEVICE)
+            chunk_labels = labels[start_idx:end_idx].to(DEVICE)
 
-        if (batch_idx + 1) % 10 == 0:
-            print(f"  Batch {batch_idx + 1}/{max_batches}")
+            # Zero gradients
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.zero_()
 
-    print("✓ Importance collection complete")
+            # Forward + backward
+            outputs = model(chunk_images)
+            loss = criterion(outputs, chunk_labels)
+            loss.backward()
+
+            # Collect scores
+            for pruner in pruners:
+                pruner.do_step(loss.item())
+
+            # Free memory immediately
+            del outputs, loss, chunk_images, chunk_labels
+
+            batch_count += 1
+
+            if batch_count % 10 == 0:
+                cleanup_memory()
+
+    cleanup_memory()
 
 
 def apply_pruning_per_component(model, pruners, target_sparsity=ONESHOT_TARGET_SPARSITY):
@@ -1791,11 +1711,7 @@ def apply_pruning_per_component(model, pruners, target_sparsity=ONESHOT_TARGET_S
     Prune each component type independently for balanced pruning.
     This ensures attention, MLP, and residual are all pruned equally.
     """
-    print(f"\nApplying per-component pruning (target: {target_sparsity:.1%})...")
-
-    component_names = ['Attention Heads', 'MLP Hidden', 'Residual Dims']
-
-    for i, pruner in enumerate(pruners):
+    for pruner in pruners:
         criteria = pruner.finalize_scores()
 
         all_scores = []
@@ -1810,16 +1726,7 @@ def apply_pruning_per_component(model, pruners, target_sparsity=ONESHOT_TARGET_S
         else:
             threshold = -np.inf
 
-        print(f"  {component_names[i]}:")
-        print(f"    Total units: {len(all_scores_array)}")
-        print(f"    Threshold: {threshold:.6f}")
-        print(f"    Pruning: {num_to_prune} units ({target_sparsity*100:.1f}%)")
-
         pruner.prune(criteria, threshold)
-
-        active = pruner.get_num_active()
-        total = pruner.all_neuron_units
-        print(f"    Result: {active}/{total} active ({active/total*100:.1f}%)")
 
 
 def train_epoch_oneshot(model, train_loader, optimizer, scheduler, epoch):
@@ -1860,50 +1767,37 @@ def oneshot_pruning(dataset_name, model_name, baseline_path, baseline_model,
                     train_loader, val_loader, test_loader, num_classes, save_dir):
     """
     ONE-SHOT PRUNING: Prune model based on importance scores, then recover with training.
-
-    Steps:
-    1. Create gated ViT and load baseline weights
-    2. Compute importance scores using Taylor2 scorer
-    3. Prune to target sparsity (one-shot)
-    4. Convert to physically smaller deployment model
-    5. Train deployment model for recovery (2 epochs)
-    6. Return final pruned model with metrics
     """
-    print(f"\n{'='*100}")
-    print(f"One-Shot Pruning: {model_name} on {dataset_name}")
-    print(f"Target Sparsity: {ONESHOT_TARGET_SPARSITY:.0%}, Recovery Epochs: {ONESHOT_RECOVERY_EPOCHS}")
-    print(f"{'='*100}")
+    print(f"One-shot pruning: {model_name} on {dataset_name}")
 
     save_path = os.path.join(save_dir, f'oneshot_{model_name}_{dataset_name}_final.pth')
     if os.path.exists(save_path):
-        print(f"⊗ One-shot pruned model already exists, skipping")
+        print(f"One-shot model already exists, skipping")
         return None
 
     # Start pruning energy tracking
     pruning_proj = f"{dataset_name}_oneshot_{model_name}_pruning_{int(time.time())}"
     pruning_tracker = start_tracker(save_dir, pruning_proj, measure_power_secs=10)
 
-    # Step 1: Create gated ViT with pretrained weights
-    print(f"\nStep 1: Creating gated model from {model_name}...")
-    gated_model = create_gated_vit_from_timm(model_name, num_classes, pretrained=True).to(DEVICE)
+    baseline_dict = {k: v.cpu().clone() for k, v in baseline_model.state_dict().items()}
+    baseline_params = params_count(baseline_model)
 
-    # Load baseline weights into gated model if available
-    print("Loading baseline weights into gated model...")
-    baseline_dict = baseline_model.state_dict()
+    baseline_model.cpu()
+    cleanup_memory()
+
+    gated_model = create_gated_vit_from_timm(model_name, num_classes, pretrained=True).to(DEVICE)
     gated_dict = gated_model.state_dict()
 
     # Transfer matching weights from baseline
     for key in baseline_dict.keys():
         if key in gated_dict and gated_dict[key].shape == baseline_dict[key].shape:
-            gated_dict[key].copy_(baseline_dict[key])
+            gated_dict[key].copy_(baseline_dict[key].to(DEVICE))
 
     gated_model.load_state_dict(gated_dict)
 
-    baseline_params = params_count(gated_model)
-    print(f"Initial parameters: {baseline_params:,}")
+    del baseline_dict
+    cleanup_memory()
 
-    # Step 2: Setup pruners and collect importance scores
-    print(f"\nStep 2: Collecting importance scores...")
     pruners = []
     for component_type in [0, 1, 2]:  # attn, mlp, residual
         modules = prepare_pruning_list(gated_model, component_type)
@@ -1911,25 +1805,15 @@ def oneshot_pruning(dataset_name, model_name, baseline_path, baseline_model,
             pruner = StructuredPruner(gated_model, modules, pruning_momentum=0.9)
             pruners.append(pruner)
 
-    # Collect importance scores
     collect_importance_scores(gated_model, pruners, train_loader, max_batches=IMPORTANCE_CAL_BATCHES)
-
-    # Step 3: Apply one-shot pruning
-    print(f"\nStep 3: Applying one-shot pruning (target sparsity: {ONESHOT_TARGET_SPARSITY:.0%})...")
     apply_pruning_per_component(gated_model, pruners, target_sparsity=ONESHOT_TARGET_SPARSITY)
 
-    # Step 4: Convert to deployment model
-    print(f"\nStep 4: Converting to deployment model...")
     deploy_model, pruning_config = convert_to_deployment_model(gated_model, num_classes)
 
-    deploy_params = params_count(deploy_model)
-    print(f"Deployment parameters: {deploy_params:,} ({deploy_params/baseline_params*100:.1f}% of original)")
-    print(f"Embed dim: {pruning_config['deploy_embed_dim']}")
-    print(f"Avg heads: {np.mean(pruning_config['deploy_per_layer_num_heads']):.1f}")
-    print(f"Avg MLP dim: {np.mean(pruning_config['deploy_per_layer_mlp_dim']):.0f}")
+    del gated_model, pruners
+    cleanup_memory()
 
-    # Step 5: Recovery training
-    print(f"\nStep 5: Recovery training for {ONESHOT_RECOVERY_EPOCHS} epochs...")
+    deploy_params = params_count(deploy_model)
     optimizer = optim.AdamW(deploy_model.parameters(), lr=ONESHOT_RECOVERY_LR, weight_decay=WEIGHT_DECAY)
     total_steps = ONESHOT_RECOVERY_EPOCHS * len(train_loader)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=MIN_LR)
@@ -1941,16 +1825,14 @@ def oneshot_pruning(dataset_name, model_name, baseline_path, baseline_model,
         train_loss, train_acc = train_epoch_oneshot(deploy_model, train_loader, optimizer, scheduler, epoch)
         val_metrics = evaluate_model(deploy_model, val_loader, DEVICE)
 
-        print(f"  Epoch {epoch}/{ONESHOT_RECOVERY_EPOCHS} - Train Acc: {train_acc:.4f}, Val Acc: {val_metrics['acc']:.4f}")
+        print(f"Recovery {epoch}/{ONESHOT_RECOVERY_EPOCHS}: Val Acc={val_metrics['acc']:.4f}")
 
         if val_metrics['acc'] > best_val_acc:
             best_val_acc = val_metrics['acc']
             best_state = copy.deepcopy(deploy_model.state_dict())
-            print(f"    ✓ New best val acc: {val_metrics['acc']:.4f}")
 
     if best_state is not None:
         deploy_model.load_state_dict(best_state)
-        print(f"✓ Restored best model with val acc: {best_val_acc:.4f}")
 
     time.sleep(2)
 
@@ -1959,11 +1841,9 @@ def oneshot_pruning(dataset_name, model_name, baseline_path, baseline_model,
     pruning_energy_kwh = pruning_metrics["energy_kwh"]
     pruning_emissions_kg = pruning_metrics["emissions_kg"]
 
-    print(f"\n⚡ Pruning + Recovery: {pruning_energy_kwh:.6f} kWh, {pruning_emissions_kg:.6f} kg CO2")
-
-    # Step 6: Final evaluation
-    print(f"\nStep 6: Final evaluation...")
     test_metrics = evaluate_model(deploy_model, test_loader, DEVICE)
+
+    baseline_model.to(DEVICE)
 
     # Get baseline metrics for comparison
     baseline_metrics = evaluate_model(baseline_model, test_loader, DEVICE)
@@ -1972,6 +1852,10 @@ def oneshot_pruning(dataset_name, model_name, baseline_path, baseline_model,
     baseline_energy_kwh, baseline_emissions_kg, baseline_energy_per_pred_kwh, baseline_images, baseline_pred_energy_per_image_kwh = measure_baseline_energy_averaged(
         baseline_model, test_loader, save_dir, model_name, dataset_name
     )
+
+    # Move baseline back to CPU to free GPU memory for remaining operations
+    baseline_model.cpu()
+    cleanup_memory()
 
     # Measure pruned model inference energy
     pruned_inf_proj = f"{dataset_name}_oneshot_{model_name}_inference_{int(time.time())}"
@@ -2004,7 +1888,6 @@ def oneshot_pruning(dataset_name, model_name, baseline_path, baseline_model,
         'recovery_epochs': ONESHOT_RECOVERY_EPOCHS
     }
     torch.save(state, save_path)
-    print(f"✓ Saved to {save_path}")
 
     pruned_size = os.path.getsize(save_path) / (1024 * 1024)
     compression_ratio = baseline_size / pruned_size if pruned_size > 0 else 1.0
@@ -2017,11 +1900,7 @@ def oneshot_pruning(dataset_name, model_name, baseline_path, baseline_model,
     acc_drop = (baseline_metrics['acc'] - test_metrics['acc']) * 100
     auc_drop = (baseline_metrics['auc'] - test_metrics['auc']) * 100
 
-    print(f"\n{'='*60}")
-    print(f"RESULTS: Acc Drop: {acc_drop:.2f}%, Compression: {compression_ratio:.2f}x")
-    print(f"Parameters: {deploy_params:,} ({deploy_params/baseline_params*100:.1f}% of original)")
-    print(f"Break-even: {break_even:.0f} predictions" if not math.isinf(break_even) else "Break-even: Never")
-    print(f"{'='*60}")
+    print(f"One-shot complete: Acc={test_metrics['acc']:.4f}, Drop={acc_drop:.2f}%")
 
     results = {
         'Dataset': dataset_name,
@@ -2070,7 +1949,6 @@ def oneshot_pruning(dataset_name, model_name, baseline_path, baseline_model,
         'ModelPath': save_path
     }
 
-    del gated_model
     cleanup_memory()
 
     return results
@@ -2078,11 +1956,8 @@ def oneshot_pruning(dataset_name, model_name, baseline_path, baseline_model,
 
 def evaluate_baseline_model(model_name, baseline_path, test_loader, num_classes, dataset_name, save_dir):
     """Evaluate a baseline model with full benchmarking."""
-    print(f"\n{'='*100}")
-    print(f"Evaluating Baseline: {model_name} on {dataset_name}")
-    print(f"{'='*100}")
-    
-    # Load baseline model
+    print(f"Evaluating baseline: {model_name} on {dataset_name}")
+
     net = timm.create_model(model_name, pretrained=False, num_classes=num_classes).to(DEVICE)
     checkpoint = torch.load(baseline_path, map_location=DEVICE, weights_only=False)
     net.load_state_dict(checkpoint['model'])
@@ -2102,11 +1977,9 @@ def evaluate_baseline_model(model_name, baseline_path, test_loader, num_classes,
     flops = compute_flops(net)
     flops_m = flops / 1e6 if not math.isnan(flops) else float("nan")
     
-    # Timing
     inf_time, peak_ram, images = inference_time_per_batch(net, test_loader, timed=TIMING_BATCHES)
-    
-    print(f"\nBaseline: Acc={metrics['acc']:.4f}, AUC={metrics['auc']:.4f}")
-    print(f"Params: {params:,}, Size: {model_size:.2f} MB")
+
+    print(f"Baseline complete: Acc={metrics['acc']:.4f}")
     
     results = {
         'Dataset': dataset_name,
@@ -2163,44 +2036,29 @@ def save_results_to_csv(results_list, dataset_name, save_dir):
     
     df = pd.DataFrame(results_list)
     df.to_csv(csv_path, index=False)
-    print(f"✓ Results saved to {csv_path}")
+    print(f"Results saved to {csv_path}")
 
 
 def main():
     set_seed(SEED)
-    print(f"Using {DEVICE} device.")
-    
-    # ========================================
-    # MANDATORY: TEST CODECARBON FIRST
-    # ========================================
+    print(f"Using {DEVICE}")
+
     codecarbon_ok = test_codecarbon()
-    
+
     if not codecarbon_ok:
-        print("\n" + "!"*80)
-        print("WARNING: CodeCarbon test failed!")
-        print("Energy measurements may not work correctly.")
-        print("Do you want to continue anyway? (y/n)")
-        print("!"*80)
-        
+        print("WARNING: CodeCarbon test failed. Energy measurements may be inaccurate.")
         response = input("Continue? (y/n): ").strip().lower()
         if response != 'y':
-            print("Exiting...")
             sys.exit(1)
-        print("\nContinuing with potentially inaccurate energy measurements...\n")
-    else:
-        print("✅ CodeCarbon test passed! Proceeding with main experiments...\n")
-        time.sleep(2)
     
-    # Validate directories
     if not os.path.exists(DATASET_DIR):
-        print(f"Error: Dataset directory '{DATASET_DIR}' not found!")
+        print(f"Error: Dataset directory not found: {DATASET_DIR}")
         sys.exit(1)
-    
+
     if not os.path.exists(BASELINE_DIR):
-        print(f"Error: Baseline directory '{BASELINE_DIR}' not found!")
+        print(f"Error: Baseline directory not found: {BASELINE_DIR}")
         sys.exit(1)
-    
-    # Define datasets and models
+
     datasets = ['bloodmnist', 'pathmnist', 'dermamnist']
     baseline_models = ['vit_tiny_patch16_224', 'vit_small_patch16_224', 'vit_base_patch16_224']
     kd_pairs = [
@@ -2210,27 +2068,9 @@ def main():
     ]
     models_for_quantization = ['vit_tiny_patch16_224', 'vit_small_patch16_224', 'vit_base_patch16_224']
     models_for_oneshot = ['vit_tiny_patch16_224', 'vit_small_patch16_224', 'vit_base_patch16_224']
-
-    print("=" * 100)
-    print("MODEL PRUNING: QUANTIZATION, KNOWLEDGE DISTILLATION & ONE-SHOT PRUNING")
-    print("=" * 100)
-    print(f"\nDatasets: {datasets}")
-    print(f"Baseline models: {baseline_models}")
-    print(f"KD pairs: {kd_pairs}")
-    print(f"Models for one-shot pruning: {models_for_oneshot}")
-    print(f"\nParameters:")
-    print(f"  - Batch size: {BATCH_SIZE}")
-    print(f"  - KD epochs: {EPOCHS_KD}")
-    print(f"  - One-shot target sparsity: {ONESHOT_TARGET_SPARSITY:.0%}")
-    print(f"  - One-shot recovery epochs: {ONESHOT_RECOVERY_EPOCHS}")
-    print(f"  - Timing batches: {TIMING_BATCHES}")
-    print("\n" + "=" * 100)
     
-    # Process each dataset
     for dataset in datasets:
-        print(f"\n{'#'*100}")
-        print(f"# PROCESSING DATASET: {dataset.upper()}")
-        print(f"{'#'*100}")
+        print(f"\nProcessing dataset: {dataset}")
 
         save_dir = os.path.join(SAVE_DIR_BASE, dataset)
         os.makedirs(save_dir, exist_ok=True)
@@ -2244,45 +2084,33 @@ def main():
                 existing_df = pd.read_csv(csv_path)
                 existing_results = existing_df.to_dict('records')
                 existing_variants = set(existing_df['Variant'].tolist())
-                print(f"✓ Loaded {len(existing_results)} existing results from {csv_path}")
-                print(f"  Existing variants: {existing_variants}")
-            except Exception as e:
-                print(f"⚠ Could not load existing results: {e}")
+            except Exception:
+                pass
 
         # Load dataset
         npz_path = os.path.join(DATASET_DIR, f"{dataset}_224.npz")
         if not os.path.exists(npz_path):
-            print(f"✗ Dataset file not found: {npz_path}")
+            print(f"Dataset not found: {npz_path}")
             continue
 
         try:
             train_loader, val_loader, test_loader, num_classes, dataset_name = load_dataset(npz_path)
-            print(f"Loaded {dataset_name}: {num_classes} classes")
-            log_memory_usage(f"After loading {dataset_name}: ")
         except Exception as e:
-            print(f"✗ Error loading dataset: {e}")
+            print(f"Error loading dataset: {e}")
             continue
 
-        all_results = list(existing_results)  # Start with existing results
+        all_results = list(existing_results)
         baseline_cache = {}
-
-        # 1. EVALUATE BASELINES
-        print(f"\n{'='*100}")
-        print(f"STEP 1: EVALUATE BASELINE MODELS")
-        print(f"{'='*100}")
 
         for model_name in baseline_models:
             variant_name = f'baseline_{model_name}'
             baseline_path = os.path.join(BASELINE_DIR, f'{model_name}_{dataset_name}_pretrained.pth')
 
             if not os.path.exists(baseline_path):
-                print(f"✗ Baseline not found: {baseline_path}")
+                print(f"Baseline not found: {baseline_path}")
                 continue
 
-            # Check if this variant already exists
             if variant_name in existing_variants:
-                print(f"⊗ {variant_name} already exists, loading baseline model only...")
-                # Still need to load the model for other methods
                 try:
                     net = timm.create_model(model_name, pretrained=False, num_classes=num_classes).to(DEVICE)
                     checkpoint = torch.load(baseline_path, map_location=DEVICE, weights_only=False)
@@ -2290,7 +2118,7 @@ def main():
                     net.eval()
                     baseline_cache[model_name] = (net, baseline_path)
                 except Exception as e:
-                    print(f"✗ Error loading baseline model: {e}")
+                    print(f"Error loading baseline: {e}")
                 continue
 
             try:
@@ -2299,25 +2127,17 @@ def main():
                 )
                 all_results.append(results)
                 baseline_cache[model_name] = (baseline_model, baseline_path)
-                print(f"✓ Completed baseline: {model_name}")
                 cleanup_memory()
             except Exception as e:
-                print(f"✗ Error evaluating baseline: {e}")
-
-        # 2. QUANTIZATION
-        print(f"\n{'='*100}")
-        print(f"STEP 2: QUANTIZATION WITH AMP")
-        print(f"{'='*100}")
+                print(f"Error evaluating baseline: {e}")
 
         for model_name in models_for_quantization:
             variant_name = f'quantization_{model_name}'
 
             if variant_name in existing_variants:
-                print(f"⊗ {variant_name} already exists, skipping")
                 continue
 
             if model_name not in baseline_cache:
-                print(f"✗ Baseline {model_name} not in cache, skipping")
                 continue
 
             baseline_model, baseline_path = baseline_cache[model_name]
@@ -2329,25 +2149,17 @@ def main():
                 )
                 if results is not None:
                     all_results.append(results)
-                    print(f"✓ Completed quantization: {model_name}")
                 cleanup_memory()
             except Exception as e:
-                print(f"✗ Error quantizing: {e}")
-
-        # 3. KNOWLEDGE DISTILLATION
-        print(f"\n{'='*100}")
-        print(f"STEP 3: KNOWLEDGE DISTILLATION")
-        print(f"{'='*100}")
+                print(f"Error quantizing: {e}")
 
         for teacher_model, student_model in kd_pairs:
             variant_name = f'kd_{teacher_model}_to_{student_model}'
 
             if variant_name in existing_variants:
-                print(f"⊗ {variant_name} already exists, skipping")
                 continue
 
             if teacher_model not in baseline_cache:
-                print(f"✗ Teacher {teacher_model} not in cache, skipping")
                 continue
 
             teacher_baseline, teacher_path = baseline_cache[teacher_model]
@@ -2359,25 +2171,17 @@ def main():
                 )
                 if results is not None:
                     all_results.append(results)
-                    print(f"✓ Completed KD: {teacher_model} → {student_model}")
                 cleanup_memory()
             except Exception as e:
-                print(f"✗ Error in KD: {e}")
-
-        # 4. ONE-SHOT PRUNING
-        print(f"\n{'='*100}")
-        print(f"STEP 4: ONE-SHOT PRUNING")
-        print(f"{'='*100}")
+                print(f"Error in KD: {e}")
 
         for model_name in models_for_oneshot:
             variant_name = f'oneshot_{model_name}'
 
             if variant_name in existing_variants:
-                print(f"⊗ {variant_name} already exists, skipping")
                 continue
 
             if model_name not in baseline_cache:
-                print(f"✗ Baseline {model_name} not in cache, skipping")
                 continue
 
             baseline_model, baseline_path = baseline_cache[model_name]
@@ -2389,24 +2193,17 @@ def main():
                 )
                 if results is not None:
                     all_results.append(results)
-                    print(f"✓ Completed one-shot pruning: {model_name}")
                 cleanup_memory()
             except Exception as e:
-                print(f"✗ Error in one-shot pruning: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"Error in one-shot pruning: {e}")
 
         # Save results (overwrite with all results including new ones)
         save_results_to_csv(all_results, dataset_name, save_dir)
 
-        # Cleanup
         del train_loader, val_loader, test_loader, baseline_cache
         cleanup_memory()
-        print(f"\nFinished: {dataset.upper()}\n")
 
-    print("\n" + "="*100)
-    print("ALL DATASETS PROCESSED!")
-    print("="*100)
+    print("All datasets processed.")
 
 
 if __name__ == "__main__":
