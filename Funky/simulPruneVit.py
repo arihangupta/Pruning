@@ -7,8 +7,8 @@ This implementation follows the Hikvision paper methodology with complete deploy
 3. Measure energy on deployment models (real speedup)
 
 Three methods compared:
-- Baseline: Full ViT-Tiny trained for 20 epochs
-- Progressive Pruning: Gradual pruning during training → physically smaller model
+- Baseline: Full ViT trained for 20 epochs
+- Progressive Pruning: Gradual pruning during training -> physically smaller model
 - Small Model From Scratch: Same dimensions as pruned model, initialized from pretrained,
   trained with baseline hyperparameters (fair comparison to see if pruning helps)
 
@@ -22,6 +22,11 @@ Metrics tracked:
 - Accuracy, AUC, Precision, Recall, F1
 - Parameters, FLOPs, Model Size
 - Training & Inference Energy (CodeCarbon)
+
+Features:
+- Supports resuming: skips experiments if final .pth files already exist
+- Generates summary statistics (mean/std) across trials
+- Use organize_vit_outputs.py to sort results into dataset folders
 
 Date: 2026
 """
@@ -134,6 +139,20 @@ def cleanup_memory():
     """Clean up GPU memory"""
     gc.collect()
     torch.cuda.empty_cache()
+
+def get_final_model_path(save_dir, dataset_name, model_name, method_key, trial_num):
+    """Get the path to the final model file for a given method and trial."""
+    paths = {
+        'baseline': f"{dataset_name}_{model_name}_baseline_deploy_trial{trial_num}_final.pth",
+        'progressive': f"{dataset_name}_{model_name}_progressive_deploy_trial{trial_num}_final.pth",
+        'small_model': f"{dataset_name}_{model_name}_small_model_trial{trial_num}_final.pth",
+    }
+    return os.path.join(save_dir, paths[method_key])
+
+def check_experiment_exists(save_dir, dataset_name, model_name, method_key, trial_num):
+    """Check if a final model file already exists for this experiment."""
+    path = get_final_model_path(save_dir, dataset_name, model_name, method_key, trial_num)
+    return os.path.exists(path), path
 
 def count_parameters(model):
     """Count trainable parameters in millions"""
@@ -1801,14 +1820,34 @@ def train_small_model_from_scratch(dataset_name, model_name, train_loader, val_l
 # ==================== PROCESS DATASET ====================
 
 def process_dataset(dataset_name, model_name, train_loader, val_loader, test_loader, num_classes, save_dir):
-    """Process one dataset with one model through all methods"""
+    """Process one dataset with one model through all methods, skipping existing experiments"""
     print("\n" + "="*100)
     print(f"PROCESSING: {dataset_name.upper()} with {model_name}")
     print("="*100)
 
+    # Check for existing files
+    all_trials_path = os.path.join(save_dir, f"{dataset_name}_{model_name}_all_trials_metrics.csv")
+    summary_path = os.path.join(save_dir, f"{dataset_name}_{model_name}_summary_statistics.csv")
+
+    existing_trials = None
+    existing_summary = None
+    if os.path.exists(all_trials_path):
+        existing_trials = pd.read_csv(all_trials_path)
+        print(f"Found existing trials data with {len(existing_trials)} rows")
+    if os.path.exists(summary_path):
+        existing_summary = pd.read_csv(summary_path)
+        print(f"Found existing summary with {len(existing_summary)} methods")
+
     all_baseline_metrics = []
     all_progressive_metrics = []
     all_small_model_metrics = []
+
+    # Method configurations: (key, method_name, train_func, results_list)
+    method_configs = [
+        ('baseline', 'baseline', train_baseline_vit, all_baseline_metrics),
+        ('progressive', 'progressive_structured_pruning', train_progressive_structured_pruning, all_progressive_metrics),
+        ('small_model', 'small_model_from_scratch', train_small_model_from_scratch, all_small_model_metrics),
+    ]
 
     for trial in range(1, NUM_TRIALS + 1):
         print(f"\n{'~'*100}")
@@ -1818,71 +1857,108 @@ def process_dataset(dataset_name, model_name, train_loader, val_loader, test_loa
         trial_seed = SEED + trial * 100
         set_seed(trial_seed)
 
-        # Method 1: Baseline (full model)
-        _, baseline_metrics = train_baseline_vit(
-            dataset_name, model_name, train_loader, val_loader, test_loader,
-            num_classes, save_dir, trial
-        )
-        all_baseline_metrics.append(baseline_metrics)
+        for method_key, method_name, train_func, results_list in method_configs:
+            exists, existing_path = check_experiment_exists(save_dir, dataset_name, model_name, method_key, trial)
 
-        # Method 2: Progressive Pruning
-        _, progressive_metrics = train_progressive_structured_pruning(
-            dataset_name, model_name, train_loader, val_loader, test_loader,
-            num_classes, save_dir, trial
-        )
-        all_progressive_metrics.append(progressive_metrics)
+            if exists:
+                print(f"\n  Skipping {method_key} trial {trial} (already exists)")
 
-        # Method 3: Small Model From Scratch (same dimensions as pruned progressive)
-        _, small_model_metrics = train_small_model_from_scratch(
-            dataset_name, model_name, train_loader, val_loader, test_loader,
-            num_classes, save_dir, trial
-        )
-        all_small_model_metrics.append(small_model_metrics)
+                # Load metrics from existing trials CSV if available
+                if existing_trials is not None:
+                    trial_data = existing_trials[
+                        (existing_trials['method'] == method_name) &
+                        (existing_trials['trial'] == trial)
+                    ]
+                    if len(trial_data) > 0:
+                        results_list.append(trial_data.iloc[0].to_dict())
+                        print(f"    Loaded metrics from existing CSV")
+                    else:
+                        print(f"    Warning: No matching metrics found in CSV for {method_key} trial {trial}")
+            else:
+                # Run the training
+                _, metrics = train_func(
+                    dataset_name, model_name, train_loader, val_loader, test_loader,
+                    num_classes, save_dir, trial
+                )
+                results_list.append(metrics)
 
-    # Save combined results
-    all_metrics_df = pd.DataFrame(all_baseline_metrics + all_progressive_metrics + all_small_model_metrics)
-    all_metrics_df.to_csv(os.path.join(save_dir, f"{dataset_name}_{model_name}_all_trials_metrics.csv"), index=False)
+    # Combine all metrics
+    all_new_metrics = all_baseline_metrics + all_progressive_metrics + all_small_model_metrics
 
-    # Compute summary
-    baseline_df = pd.DataFrame(all_baseline_metrics)
-    progressive_df = pd.DataFrame(all_progressive_metrics)
-    small_model_df = pd.DataFrame(all_small_model_metrics)
+    if all_new_metrics:
+        new_metrics_df = pd.DataFrame(all_new_metrics)
 
-    summary_rows = []
+        # Handle all_trials file - append new entries
+        if existing_trials is not None:
+            existing_keys = set(zip(existing_trials['method'], existing_trials['trial']))
+            new_rows = [m for m in all_new_metrics if (m['method'], m['trial']) not in existing_keys]
+            if new_rows:
+                combined_trials = pd.concat([existing_trials, pd.DataFrame(new_rows)], ignore_index=True)
+            else:
+                combined_trials = existing_trials
+        else:
+            combined_trials = new_metrics_df
 
-    for df, method_name in [(baseline_df, 'baseline'),
-                            (progressive_df, 'progressive_structured_pruning'),
-                            (small_model_df, 'small_model_from_scratch')]:
-        summary = {'method': method_name, 'dataset': dataset_name, 'model': model_name, 'num_trials': NUM_TRIALS}
+        combined_trials.to_csv(all_trials_path, index=False)
+
+    # Compute summary from collected metrics
+    def compute_summary(metrics_list, method_name):
+        if not metrics_list:
+            return None
+        df = pd.DataFrame(metrics_list)
+        summary = {'method': method_name, 'dataset': dataset_name, 'model': model_name, 'num_trials': len(df)}
         for col in ['test_acc', 'test_auc', 'test_precision', 'test_recall', 'test_f1',
                     'params_m', 'flops_g', 'inference_energy_kwh', 'training_energy_kwh',
                     'model_size_mb', 'best_val_acc']:
             if col in df.columns:
                 summary[f'{col}_mean'] = df[col].mean()
                 summary[f'{col}_std'] = df[col].std()
-        summary_rows.append(summary)
+        return summary
 
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(os.path.join(save_dir, f"{dataset_name}_{model_name}_summary_statistics.csv"), index=False)
+    summary_rows = []
+    for method_key, method_name, _, results_list in method_configs:
+        s = compute_summary(results_list, method_name)
+        if s:
+            summary_rows.append(s)
 
-    # Print comparison
-    print("\n" + "="*150)
-    print(f"SUMMARY - {dataset_name.upper()} - {model_name}")
-    print("="*150)
-    print(f"{'Metric':<25} {'Baseline (Full)':<35} {'Progressive Pruning':<35} {'Small Model (Scratch)':<35}")
-    print("-"*150)
-    for col in ['test_acc', 'test_auc', 'test_f1', 'params_m', 'flops_g', 'inference_energy_kwh', 'model_size_mb']:
-        base_mean = summary_rows[0].get(f'{col}_mean', float('nan'))
-        base_std = summary_rows[0].get(f'{col}_std', float('nan'))
-        prog_mean = summary_rows[1].get(f'{col}_mean', float('nan'))
-        prog_std = summary_rows[1].get(f'{col}_std', float('nan'))
-        small_mean = summary_rows[2].get(f'{col}_mean', float('nan'))
-        small_std = summary_rows[2].get(f'{col}_std', float('nan'))
+    if summary_rows:
+        new_summary_df = pd.DataFrame(summary_rows)
 
-        print(f"{col:<25} {base_mean:.4f}±{base_std:.4f}            "
-              f"{prog_mean:.4f}±{prog_std:.4f}            "
-              f"{small_mean:.4f}±{small_std:.4f}")
-    print("="*150)
+        # Merge with existing summary if present
+        if existing_summary is not None:
+            existing_methods = set(existing_summary['method'])
+            new_methods = set(new_summary_df['method'])
+            rows_to_keep = existing_summary[~existing_summary['method'].isin(new_methods)]
+            final_summary = pd.concat([rows_to_keep, new_summary_df], ignore_index=True)
+        else:
+            final_summary = new_summary_df
+
+        final_summary.to_csv(summary_path, index=False)
+
+        # Print comparison
+        print("\n" + "="*150)
+        print(f"SUMMARY - {dataset_name.upper()} - {model_name}")
+        print("="*150)
+        print(f"{'Metric':<25} {'Baseline (Full)':<35} {'Progressive Pruning':<35} {'Small Model (Scratch)':<35}")
+        print("-"*150)
+
+        # Get summary rows in order
+        base_row = next((r for r in summary_rows if r['method'] == 'baseline'), {})
+        prog_row = next((r for r in summary_rows if r['method'] == 'progressive_structured_pruning'), {})
+        small_row = next((r for r in summary_rows if r['method'] == 'small_model_from_scratch'), {})
+
+        for col in ['test_acc', 'test_auc', 'test_f1', 'params_m', 'flops_g', 'inference_energy_kwh', 'model_size_mb']:
+            base_mean = base_row.get(f'{col}_mean', float('nan'))
+            base_std = base_row.get(f'{col}_std', float('nan'))
+            prog_mean = prog_row.get(f'{col}_mean', float('nan'))
+            prog_std = prog_row.get(f'{col}_std', float('nan'))
+            small_mean = small_row.get(f'{col}_mean', float('nan'))
+            small_std = small_row.get(f'{col}_std', float('nan'))
+
+            print(f"{col:<25} {base_mean:.4f}±{base_std:.4f}            "
+                  f"{prog_mean:.4f}±{prog_std:.4f}            "
+                  f"{small_mean:.4f}±{small_std:.4f}")
+        print("="*150)
 
     return all_baseline_metrics, all_progressive_metrics, all_small_model_metrics
 
