@@ -41,7 +41,7 @@ except Exception:
 # -------------------------
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/new_baseline"
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/pruned_models"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/rerun/pruned_models"
 EPOCHS_KD = 50  # Epochs for knowledge distillation
 BATCH_SIZE = 64
 LR_KD = 0.0005  # Learning rate for student
@@ -64,7 +64,7 @@ PREDICTION_IMAGES = 50
 
 # One-Shot Pruning Parameters
 ONESHOT_TARGET_SPARSITY = 0.5  # 40% sparsity (keep 60% of dimensions)
-ONESHOT_RECOVERY_EPOCHS = 2   # Epochs for recovery training after pruning
+ONESHOT_RECOVERY_EPOCHS = 10   # Epochs for recovery training after pruning
 ONESHOT_RECOVERY_LR = 1e-4    # Learning rate for recovery training
 IMPORTANCE_CAL_BATCHES = 50   # Number of batches to compute importance scores
 GATE_THRESHOLD = 0.01         # Threshold for considering a gate as pruned
