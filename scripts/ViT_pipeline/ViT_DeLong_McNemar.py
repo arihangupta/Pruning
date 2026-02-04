@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import warnings
 import timm
+from functools import partial
 
 warnings.filterwarnings('ignore')
 
@@ -53,6 +54,176 @@ DATASET_NUM_CLASSES = {
 }
 
 TARGET_DATASETS = ["bloodmnist", "dermamnist", "pathmnist"]
+
+# ============================================================================
+# Deployment ViT Components (for One-Shot Pruned Models)
+# ============================================================================
+
+class DeployMlp(nn.Module):
+    """MLP without gates - physically smaller"""
+    def __init__(self, in_features, hidden_features, out_features=None,
+                 act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class DeployAttention(nn.Module):
+    """Multi-head attention without gates - physically smaller"""
+    def __init__(self, dim, num_heads, head_dim, qkv_bias=False, qk_scale=None,
+                 attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.inner_dim = head_dim * num_heads
+
+        self.qkv = nn.Linear(dim, self.inner_dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(self.inner_dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, self.inner_dim)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class DeployBlock(nn.Module):
+    """Transformer block without gates - physically smaller"""
+    def __init__(self, dim, num_heads, head_dim, mlp_hidden_dim, qkv_bias=False,
+                 qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = DeployAttention(
+            dim, num_heads=num_heads, head_dim=head_dim, qkv_bias=qkv_bias,
+            qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop
+        )
+
+        from timm.models.layers import DropPath
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+
+        self.mlp = DeployMlp(
+            in_features=dim, hidden_features=mlp_hidden_dim,
+            act_layer=act_layer, drop=drop
+        )
+
+    def forward(self, x):
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class DeployVisionTransformer(nn.Module):
+    """Deployment ViT - physically smaller model without gates"""
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000,
+                 embed_dim=192, depth=12, head_dim=64,
+                 per_layer_num_heads=None, per_layer_mlp_dim=None,
+                 qkv_bias=True, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.):
+        super().__init__()
+
+        self.num_classes = num_classes
+        self.num_features = self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.img_size = img_size
+        self.depth = depth
+        self.head_dim = head_dim
+
+        from timm.models.layers import PatchEmbed
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size,
+            in_chans=in_chans, embed_dim=embed_dim
+        )
+        num_patches = self.patch_embed.num_patches
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+
+        if per_layer_num_heads is None:
+            per_layer_num_heads = [embed_dim // head_dim] * depth
+        if per_layer_mlp_dim is None:
+            per_layer_mlp_dim = [embed_dim * 4] * depth
+
+        self.blocks = nn.ModuleList([
+            DeployBlock(
+                dim=embed_dim,
+                num_heads=per_layer_num_heads[i],
+                head_dim=head_dim,
+                mlp_hidden_dim=per_layer_mlp_dim[i],
+                qkv_bias=qkv_bias, qk_scale=None,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i],
+                norm_layer=partial(nn.LayerNorm, eps=1e-6)
+            )
+            for i in range(depth)
+        ])
+
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+        self.per_layer_num_heads = per_layer_num_heads
+        self.per_layer_mlp_dim = per_layer_mlp_dim
+
+        from timm.models.layers import trunc_normal_
+        trunc_normal_(self.pos_embed, std=.02)
+        trunc_normal_(self.cls_token, std=.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            from timm.models.layers import trunc_normal_
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_features(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = self.norm(x)
+        return x[:, 0]
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head(x)
+        return x
 
 # ============================================================================
 # DeLong's Test Implementation
@@ -290,23 +461,23 @@ def parse_model_name(model_path, dataset):
     # Pattern: kd_vit_{teacher_size}_patch16_224_to_vit_{student_size}_patch16_224_{dataset}_final.pth
     if basename.startswith("kd_") and "_final.pth" in basename:
         middle = basename.replace("kd_", "").replace(f"_{dataset}_final.pth", "")
-        
+
         if "_to_" in middle:
             parts = middle.split("_to_")
             teacher_name = parts[0]  # e.g., vit_base_patch16_224
             student_name = parts[1]  # e.g., vit_small_patch16_224
-            
+
             # Estimate sparsity based on student/teacher size
             sparsity_map = {
                 ("base", "small"): "33%",
                 ("base", "tiny"): "67%",
                 ("small", "tiny"): "50%"
             }
-            
+
             teacher_size = "tiny" if "tiny" in teacher_name else ("small" if "small" in teacher_name else "base")
             student_size = "tiny" if "tiny" in student_name else ("small" if "small" in student_name else "base")
             sparsity = sparsity_map.get((teacher_size, student_size), "unknown")
-            
+
             return {
                 "model_name": student_name,
                 "full_name": f"kd_{teacher_name}_to_{student_name}",
@@ -316,7 +487,23 @@ def parse_model_name(model_path, dataset):
                 "teacher_model": teacher_name,
                 "student_model": student_name
             }
-    
+
+    # Handle one-shot pruning models from pruned_models directory
+    # Pattern: oneshot_vit_{size}_patch16_224_{dataset}_final.pth
+    if basename.startswith("oneshot_") and "_final.pth" in basename:
+        model_name = basename.replace("oneshot_", "").replace(f"_{dataset}_final.pth", "")
+        # e.g., vit_tiny_patch16_224, vit_small_patch16_224, vit_base_patch16_224
+
+        return {
+            "model_name": model_name,
+            "full_name": f"oneshot_{model_name}",
+            "pruning_method": "oneshot",
+            "sparsity": "50%",  # Default target sparsity from ViT_pruning.py
+            "stored_precision": "fp32",
+            "teacher_model": model_name,
+            "student_model": f"{model_name}_pruned"
+        }
+
     logger.debug(f"Skipping {basename}: unrecognized format")
     return None
 
@@ -370,26 +557,58 @@ def discover_models():
     
     return models
 
-def load_model(model_path, model_name, num_classes, stored_precision='fp32', device='cuda:0'):
+def load_model(model_path, model_name, num_classes, stored_precision='fp32', device='cuda:0', pruning_method='baseline'):
     """Load a Vision Transformer model from checkpoint."""
     if not os.path.exists(model_path):
         raise ValueError(f"Model path does not exist: {model_path}")
-    
-    # Create model using timm
-    model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
-    
+
     # Load checkpoint
     checkpoint = torch.load(model_path, map_location='cpu')
-    
-    # Handle different checkpoint formats
-    if 'model' in checkpoint:
-        state_dict = checkpoint['model']
+
+    # Handle one-shot pruned models with DeployVisionTransformer architecture
+    if pruning_method == 'oneshot':
+        if 'pruning_config' not in checkpoint:
+            raise ValueError(f"One-shot model missing pruning_config: {model_path}")
+
+        pruning_config = checkpoint['pruning_config']
+
+        # Create DeployVisionTransformer with pruned architecture
+        model = DeployVisionTransformer(
+            img_size=IMG_SIZE,
+            patch_size=16,
+            in_chans=3,
+            num_classes=num_classes,
+            embed_dim=pruning_config['deploy_embed_dim'],
+            depth=12,  # Standard ViT depth
+            head_dim=pruning_config['head_dim'],
+            per_layer_num_heads=pruning_config['deploy_per_layer_num_heads'],
+            per_layer_mlp_dim=pruning_config['deploy_per_layer_mlp_dim'],
+            qkv_bias=True,
+            drop_rate=0.0,
+            attn_drop_rate=0.0,
+            drop_path_rate=0.1
+        )
+
+        # Load state dict
+        if 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+
+        model.load_state_dict(state_dict)
     else:
-        state_dict = checkpoint
-    
-    # Load state dict
-    model.load_state_dict(state_dict)
-    
+        # Create model using timm for baseline, quantized, and KD models
+        model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+
+        # Handle different checkpoint formats
+        if 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+
+        # Load state dict
+        model.load_state_dict(state_dict)
+
     # Handle precision
     is_fp16 = False
     if stored_precision == 'amp':
@@ -397,10 +616,10 @@ def load_model(model_path, model_name, num_classes, stored_precision='fp32', dev
         is_fp16 = True
     else:
         model = model.float()
-    
+
     model = model.to(device)
     model.eval()
-    
+
     return model, is_fp16
 
 def get_predictions(model, dataloader, num_classes, device='cuda:0', is_fp16=False):
@@ -446,7 +665,7 @@ def get_predictions(model, dataloader, num_classes, device='cuda:0', is_fp16=Fal
 def compare_models(dataset_name, baseline_info, pruned_info, dataloader, num_classes, device='cuda:0'):
     """Compare a pruned/compressed model to baseline using DeLong and McNemar tests."""
     logger.info(f"\nComparing {pruned_info['full_name']} to {baseline_info['full_name']} for {dataset_name}")
-    
+
     # Load baseline model
     logger.info("Loading baseline model...")
     baseline_model, baseline_fp16 = load_model(
@@ -454,7 +673,8 @@ def compare_models(dataset_name, baseline_info, pruned_info, dataloader, num_cla
         baseline_info['model_name'],
         num_classes,
         baseline_info['stored_precision'],
-        device=device
+        device=device,
+        pruning_method=baseline_info['pruning_method']
     )
     
     # Get baseline predictions
@@ -493,7 +713,8 @@ def compare_models(dataset_name, baseline_info, pruned_info, dataloader, num_cla
         pruned_info['model_name'],
         num_classes,
         pruned_info['stored_precision'],
-        device=device
+        device=device,
+        pruning_method=pruned_info['pruning_method']
     )
     
     # Get pruned predictions
@@ -677,11 +898,11 @@ def main():
         logger.info(f"Found {len(baseline_models)} baseline models and {len(compressed_models)} compressed models")
         
         # For each compressed model, find the matching baseline
-        # For quantization: compare to baseline of same size
+        # For quantization/oneshot: compare to baseline of same size
         # For KD: compare student to TEACHER (e.g., distilled small to baseline base)
         for compressed_model in compressed_models:
             baseline_model = None
-            
+
             if compressed_model['pruning_method'] == 'kd':
                 # For KD models, compare student to teacher
                 # Extract teacher size from teacher_model name
@@ -694,7 +915,7 @@ def main():
                         teacher_size = 'small'
                     elif 'base' in teacher_name:
                         teacher_size = 'base'
-                    
+
                     # Find baseline matching teacher size
                     for bl_model in baseline_models:
                         if teacher_size and teacher_size in bl_model['model_name']:
@@ -702,7 +923,7 @@ def main():
                             logger.info(f"KD comparison: {compressed_model['full_name']} vs teacher baseline {bl_model['model_name']}")
                             break
             else:
-                # For quantization, compare to baseline of same size
+                # For quantization and oneshot, compare to baseline of same size
                 compressed_size = None
                 if 'tiny' in compressed_model['model_name']:
                     compressed_size = 'tiny'
@@ -710,12 +931,13 @@ def main():
                     compressed_size = 'small'
                 elif 'base' in compressed_model['model_name']:
                     compressed_size = 'base'
-                
+
                 # Find matching baseline
                 for bl_model in baseline_models:
                     if compressed_size and compressed_size in bl_model['model_name']:
                         baseline_model = bl_model
-                        logger.info(f"Quantization comparison: {compressed_model['full_name']} vs baseline {bl_model['model_name']}")
+                        method_name = compressed_model['pruning_method'].capitalize()
+                        logger.info(f"{method_name} comparison: {compressed_model['full_name']} vs baseline {bl_model['model_name']}")
                         break
             
             if baseline_model is None:
