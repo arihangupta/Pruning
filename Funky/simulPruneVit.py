@@ -6,11 +6,12 @@ This implementation follows the Hikvision paper methodology with complete deploy
 2. Convert to physically smaller models (actual compression)
 3. Measure energy on deployment models (real speedup)
 
-Three methods compared:
+Four methods compared:
 - Baseline: Full ViT trained for 20 epochs
 - Progressive Pruning: Gradual pruning during training -> physically smaller model
 - Small Model From Scratch: Same dimensions as pruned model, initialized from pretrained,
   trained with baseline hyperparameters (fair comparison to see if pruning helps)
+- Enhanced Progressive Pruning: Progressive pruning + LR warmup/rewarm + RandAugment + Mixup
 
 Configuration: gentle_40pct (best performing from hyperparameter tuning)
 - 40% target sparsity (keep 60% of dimensions)
@@ -146,6 +147,7 @@ def get_final_model_path(save_dir, dataset_name, model_name, method_key, trial_n
         'baseline': f"{dataset_name}_{model_name}_baseline_deploy_trial{trial_num}_final.pth",
         'progressive': f"{dataset_name}_{model_name}_progressive_deploy_trial{trial_num}_final.pth",
         'small_model': f"{dataset_name}_{model_name}_small_model_trial{trial_num}_final.pth",
+        'enhanced': f"{dataset_name}_{model_name}_enhanced_deploy_trial{trial_num}_final.pth",
     }
     return os.path.join(save_dir, paths[method_key])
 
@@ -248,13 +250,21 @@ def stop_energy_tracker(tracker, save_dir, project_name):
 
 class NumpyMemmapDataset(Dataset):
     """Dataset wrapper for NPZ files"""
-    def __init__(self, imgs_np, labels_np, img_size=224, is_train=False):
+    def __init__(self, imgs_np, labels_np, img_size=224, is_train=False, use_randaugment=False):
         self.imgs = imgs_np
         self.labels = labels_np
         self.img_size = img_size
         self.is_train = is_train
-        
-        if is_train:
+
+        if is_train and use_randaugment:
+            self.base_tfms = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize((img_size, img_size)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandAugment(num_ops=2, magnitude=9),
+                transforms.ToTensor(),
+            ])
+        elif is_train:
             self.base_tfms = transforms.Compose([
                 transforms.ToPILImage(),
                 transforms.Resize((img_size, img_size)),
@@ -315,6 +325,55 @@ def load_dataset(npz_path, batch_size=64):
     dataset_name = os.path.splitext(os.path.basename(npz_path))[0].replace('_224', '')
 
     return train_loader, val_loader, test_loader, num_classes, dataset_name
+
+def load_dataset_enhanced(npz_path, batch_size=64):
+    """Load dataset with stronger augmentation (RandAugment) for enhanced pruning method"""
+    print(f"Loading {npz_path} with enhanced augmentation (batch_size={batch_size})...")
+    data = np.load(npz_path, mmap_mode="r")
+
+    X_train, y_train = data["train_images"], data["train_labels"].flatten()
+    X_val, y_val = data["val_images"], data["val_labels"].flatten()
+    X_test, y_test = data["test_images"], data["test_labels"].flatten()
+
+    print(f"Dataset sizes: train={len(y_train)}, val={len(y_val)}, test={len(y_test)}")
+
+    train_ds = NumpyMemmapDataset(X_train, y_train, img_size=IMG_SIZE, is_train=True,
+                                   use_randaugment=True)
+    val_ds = NumpyMemmapDataset(X_val, y_val, img_size=IMG_SIZE, is_train=False)
+    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, is_train=False)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size * 2, shuffle=False,
+                            num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size * 2, shuffle=False,
+                             num_workers=4, pin_memory=True)
+
+    num_classes = int(len(np.unique(np.concatenate([y_train, y_val, y_test]))))
+    dataset_name = os.path.splitext(os.path.basename(npz_path))[0].replace('_224', '')
+
+    return train_loader, val_loader, test_loader, num_classes, dataset_name
+
+def mixup_data(x, y, alpha=0.2):
+    """Apply mixup to a batch of data.
+
+    Returns mixed inputs, pairs of targets, and the lambda value.
+    """
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Compute mixup loss as weighted combination of losses for both targets."""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 # ==================== METRICS ====================
 
@@ -1299,6 +1358,75 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, epoch, gate_l1_we
 
     return avg_loss, acc
 
+def train_one_epoch_enhanced(model, train_loader, optimizer, scheduler, epoch,
+                              gate_l1_weight=0.0, scaler=None, mixup_alpha=0.2):
+    """
+    Training epoch with mixup augmentation and L1 regularization on gates.
+    Mixup blends pairs of samples and uses a weighted loss on both targets.
+    """
+    model.train()
+    running_loss = 0.0
+    running_gate_loss = 0.0
+    correct = 0
+    total = 0
+
+    use_amp = scaler is not None
+    criterion = nn.CrossEntropyLoss()
+
+    for images, labels in train_loader:
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
+
+        # Apply mixup
+        if mixup_alpha > 0:
+            images, targets_a, targets_b, lam = mixup_data(images, labels, alpha=mixup_alpha)
+        else:
+            targets_a, targets_b, lam = labels, labels, 1.0
+
+        optimizer.zero_grad()
+
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            outputs = model(images)
+            task_loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+
+            # L1 regularization on gates
+            gate_l1_loss = 0.0
+            if gate_l1_weight > 0:
+                for name, param in model.named_parameters():
+                    if 'gate' in name and 'weight' in name:
+                        gate_l1_loss += torch.abs(param).sum()
+
+            total_loss = task_loss + gate_l1_weight * gate_l1_loss
+
+        if use_amp:
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        scheduler.step()
+
+        running_loss += task_loss.item()
+        running_gate_loss += gate_l1_loss.item() if isinstance(gate_l1_loss, torch.Tensor) else 0.0
+        # For accuracy tracking with mixup, count based on the dominant target
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += (lam * predicted.eq(targets_a).sum().item()
+                     + (1 - lam) * predicted.eq(targets_b).sum().item())
+
+    avg_loss = running_loss / len(train_loader)
+    avg_gate_loss = running_gate_loss / len(train_loader)
+    acc = correct / total
+
+    if gate_l1_weight > 0:
+        print(f"    Task Loss: {avg_loss:.4f}, Gate L1: {avg_gate_loss:.4f}")
+
+    return avg_loss, acc
+
 def finetune_deployment_model(deploy_model, train_loader, val_loader, epochs=5, lr=5e-5):
     """
     Finetune deployment model after conversion
@@ -1817,6 +1945,234 @@ def train_small_model_from_scratch(dataset_name, model_name, train_loader, val_l
     cleanup_memory()
     return model, final_metrics
 
+# ==================== METHOD 4: ENHANCED PROGRESSIVE PRUNING ====================
+
+def train_enhanced_progressive_pruning(dataset_name, model_name, train_loader, val_loader, test_loader,
+                                        num_classes, save_dir, trial_num):
+    """
+    METHOD 4: Enhanced Progressive Structured Pruning
+
+    Same pruning schedule and epoch budget as Method 2, with three enhancements:
+    1. LR warmup: Linear warmup for the first epoch before cosine decay
+    2. LR rewarm: After deployment conversion, reset LR to INITIAL_LR with warmup + cosine
+    3. Stronger augmentation: RandAugment + Mixup (alpha=0.2) during training
+
+    The train_loader passed in uses standard augmentation (for importance collection).
+    We reload an enhanced train_loader internally for training steps.
+    """
+    print("\n" + "="*80)
+    print(f"METHOD 4: ENHANCED PROGRESSIVE PRUNING - {dataset_name.upper()} - {model_name} - TRIAL {trial_num}")
+    print("="*80)
+
+    # Load enhanced training data (RandAugment)
+    model_batch_size = MODEL_CONFIGS.get(model_name, {}).get('batch_size', 64)
+    npz_path = os.path.join(DATASET_DIR, f"{dataset_name}_224.npz")
+    enhanced_train_loader, _, _, _, _ = load_dataset_enhanced(npz_path, batch_size=model_batch_size)
+
+    prune_epochs = PRUNE_EPOCHS_SCHEDULE.copy()
+    final_prune_epoch = max(prune_epochs)
+    convert_to_deploy_epoch = final_prune_epoch + 1
+
+    print(f"Pruning schedule: {prune_epochs}")
+    print(f"Sparsity schedule: {SPARSITY_SCHEDULE}")
+    print(f"Convert to deployment after epoch: {final_prune_epoch}")
+    print(f"Enhancements: LR warmup, LR rewarm after conversion, RandAugment, Mixup(alpha=0.2)")
+
+    # Create gated model
+    model = create_gated_vit_from_timm(model_name, num_classes, pretrained=True).to(DEVICE)
+    print(f"Initial parameters: {count_parameters(model):.2f}M")
+
+    # Setup pruners
+    pruners = []
+    for component_type in [0, 1, 2]:
+        modules = prepare_pruning_list(model, component_type)
+        if len(modules) > 0:
+            pruner = StructuredPruner(model, modules, pruning_momentum=PRUNING_MOMENTUM)
+            pruners.append(pruner)
+
+    print(f"Created {len(pruners)} pruning engines")
+
+    # Optimizer with LR warmup + cosine schedule
+    optimizer = optim.AdamW(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
+    current_lr = INITIAL_LR
+    total_steps = FIXED_EPOCHS * len(enhanced_train_loader)
+    warmup_steps = len(enhanced_train_loader)  # 1 epoch of warmup
+
+    warmup_scheduler = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
+    )
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps - warmup_steps, eta_min=MIN_LR
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps]
+    )
+    print(f"LR schedule: linear warmup ({warmup_steps} steps) -> cosine decay")
+
+    # AMP scaler
+    scaler = torch.cuda.amp.GradScaler() if USE_AMP and DEVICE.type == 'cuda' else None
+
+    # Track metrics
+    all_metrics = []
+    deploy_model = None
+    using_deploy = False
+    best_deploy_val_acc = 0.0
+    best_deploy_state = None
+    best_deploy_epoch = 0
+    pruning_config = None
+
+    # Start energy tracking
+    tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_enhanced_trial{trial_num}")
+
+    print(f"Training with AMP={scaler is not None}")
+
+    for epoch in range(1, FIXED_EPOCHS + 1):
+        print(f"\n--- Epoch {epoch}/{FIXED_EPOCHS} ---")
+
+        # Pruning steps (only during gated phase)
+        # Use standard train_loader for importance collection (no mixup/randaug)
+        if not using_deploy and epoch in prune_epochs:
+            prune_step = prune_epochs.index(epoch) + 1
+            target_sparsity = SPARSITY_SCHEDULE[prune_step - 1]
+            print(f"  [Pruning step {prune_step}/{NUM_PRUNE_STEPS} -> {target_sparsity*100:.0f}% sparsity]")
+
+            # Reset pruners
+            for pruner in pruners:
+                pruner.iterations_done = 0
+                pruner.pruning_scores['score'] = [list() for _ in range(len(pruner.pruning_parameters))]
+
+            # Collect importance using standard loader (clean data)
+            collect_importance_scores(model, pruners, train_loader, max_batches=IMPORTANCE_CAL_BATCHES)
+            apply_pruning_per_component(model, pruners, target_sparsity=target_sparsity)
+
+            gate_stats = get_gate_sparsity(model)
+            print(f"  Gate sparsity: Attn={gate_stats['attn']:.1f}%, MLP={gate_stats['mlp']:.1f}%, Res={gate_stats['res']:.1f}%")
+
+            # Reduce LR after pruning
+            current_lr *= LR_REDUCTION_AFTER_PRUNE
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+            print(f"  LR reduced to {current_lr:.6f}")
+
+        # Convert to deployment model after final pruning
+        if epoch == convert_to_deploy_epoch and not using_deploy:
+            print(f"  [All pruning complete - converting to deployment model]")
+
+            gate_stats = get_gate_sparsity(model)
+            print(f"  Final gate sparsity: Attn={gate_stats['attn']:.1f}%, MLP={gate_stats['mlp']:.1f}%, Res={gate_stats['res']:.1f}%")
+
+            deploy_model, pruning_config = convert_to_deployment_model(model, num_classes)
+            using_deploy = True
+
+            # LR REWARM: Reset optimizer with warmup + cosine for remaining epochs
+            remaining_epochs = FIXED_EPOCHS - epoch + 1
+            remaining_steps = remaining_epochs * len(enhanced_train_loader)
+            rewarm_steps = len(enhanced_train_loader)  # 1 epoch of warmup
+
+            optimizer = optim.AdamW(deploy_model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
+
+            rewarm_warmup = optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.01, end_factor=1.0, total_iters=rewarm_steps
+            )
+            rewarm_cosine = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=remaining_steps - rewarm_steps, eta_min=MIN_LR
+            )
+            scheduler = optim.lr_scheduler.SequentialLR(
+                optimizer, schedulers=[rewarm_warmup, rewarm_cosine], milestones=[rewarm_steps]
+            )
+
+            print(f"  LR rewarmed to {INITIAL_LR} with warmup ({rewarm_steps} steps) -> cosine")
+            print(f"  [Deployment: {count_parameters(deploy_model):.2f}M params (was {count_parameters(model):.2f}M)]")
+
+        # Select active model
+        active_model = deploy_model if using_deploy else model
+        gate_l1 = 0.0 if using_deploy else GATE_L1_WEIGHT
+
+        # Train with enhanced loop (mixup + RandAugment via enhanced_train_loader)
+        train_loss, train_acc = train_one_epoch_enhanced(
+            active_model, enhanced_train_loader, optimizer, scheduler, epoch,
+            gate_l1_weight=gate_l1, scaler=scaler, mixup_alpha=0.2
+        )
+
+        # Evaluate (no mixup during eval)
+        val_acc, val_auc, val_precision, val_recall, val_f1 = evaluate_model(active_model, val_loader, DEVICE)
+        test_acc, test_auc, test_precision, test_recall, test_f1 = evaluate_model(active_model, test_loader, DEVICE)
+
+        model_type = 'deploy' if using_deploy else 'gated'
+        print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
+        print(f"  Val   - Acc: {val_acc:.4f}, AUC: {val_auc:.4f} [{model_type}]")
+
+        # Track best deployment model
+        if using_deploy and val_acc > best_deploy_val_acc:
+            best_deploy_val_acc = val_acc
+            best_deploy_state = copy.deepcopy(deploy_model.state_dict())
+            best_deploy_epoch = epoch
+            print(f"  ✓ New best deployment val_acc: {val_acc:.4f}")
+
+        all_metrics.append({
+            'trial': trial_num, 'epoch': epoch, 'train_loss': train_loss, 'train_acc': train_acc,
+            'val_acc': val_acc, 'val_auc': val_auc, 'test_acc': test_acc, 'test_auc': test_auc,
+            'params_m': count_parameters(active_model), 'lr': optimizer.param_groups[0]['lr'],
+            'model_type': model_type
+        })
+
+    # Restore best deployment model
+    if deploy_model is None:
+        print("  [WARNING: No deployment conversion happened, converting now]")
+        deploy_model, pruning_config = convert_to_deployment_model(model, num_classes)
+    elif best_deploy_state is not None:
+        deploy_model.load_state_dict(best_deploy_state)
+        print(f"\n✓ Restored best deployment model from epoch {best_deploy_epoch} (val_acc={best_deploy_val_acc:.4f})")
+
+    # Measure inference energy on deployment model
+    print("\nMeasuring inference energy on deployment model...")
+    deploy_tracker = start_energy_tracker(save_dir, f"{dataset_name}_{model_name}_enhanced_deploy_trial{trial_num}")
+    test_acc, test_auc, test_precision, test_recall, test_f1 = evaluate_model(deploy_model, test_loader, DEVICE)
+    energy_metrics = stop_energy_tracker(deploy_tracker, save_dir, f"{dataset_name}_{model_name}_enhanced_deploy_trial{trial_num}")
+
+    # Stop training energy tracker
+    training_energy = stop_energy_tracker(tracker, save_dir, f"{dataset_name}_{model_name}_enhanced_trial{trial_num}")
+
+    # Save
+    torch.save(deploy_model.state_dict(), os.path.join(save_dir,
+               f"{dataset_name}_{model_name}_enhanced_deploy_trial{trial_num}_final.pth"))
+    pd.DataFrame(all_metrics).to_csv(os.path.join(save_dir,
+               f"{dataset_name}_{model_name}_enhanced_trial{trial_num}_metrics.csv"), index=False)
+
+    # Get effective dimensions
+    avg_heads = np.mean(pruning_config['deploy_per_layer_num_heads'])
+    avg_mlp = np.mean(pruning_config['deploy_per_layer_mlp_dim'])
+
+    final_metrics = {
+        'method': 'enhanced_progressive_pruning',
+        'dataset': dataset_name,
+        'model': model_name,
+        'trial': trial_num,
+        'total_epochs': FIXED_EPOCHS,
+        'best_epoch': best_deploy_epoch,
+        'best_val_acc': best_deploy_val_acc,
+        'test_acc': test_acc,
+        'test_auc': test_auc,
+        'test_precision': test_precision,
+        'test_recall': test_recall,
+        'test_f1': test_f1,
+        'params_m': count_parameters(deploy_model),
+        'model_size_mb': model_size_mb(deploy_model),
+        'flops_g': deploy_model.compute_flops() / 1e9,
+        'training_energy_kwh': training_energy['energy_kwh'],
+        'inference_energy_kwh': energy_metrics['energy_kwh'],
+        'deploy_embed_dim': pruning_config['deploy_embed_dim'],
+        'deploy_avg_heads': avg_heads,
+        'deploy_avg_mlp': avg_mlp,
+        'total_prune_steps': NUM_PRUNE_STEPS
+    }
+
+    print(f"\n✓ Final Test - Acc: {test_acc:.4f}, AUC: {test_auc:.4f}")
+    print(f"Deployment: {pruning_config['deploy_embed_dim']} embed, {avg_heads:.1f} avg heads, {avg_mlp:.0f} avg MLP")
+
+    cleanup_memory()
+    return deploy_model, final_metrics
+
 # ==================== PROCESS DATASET ====================
 
 def process_dataset(dataset_name, model_name, train_loader, val_loader, test_loader, num_classes, save_dir):
@@ -1841,12 +2197,14 @@ def process_dataset(dataset_name, model_name, train_loader, val_loader, test_loa
     all_baseline_metrics = []
     all_progressive_metrics = []
     all_small_model_metrics = []
+    all_enhanced_metrics = []
 
     # Method configurations: (key, method_name, train_func, results_list)
     method_configs = [
         ('baseline', 'baseline', train_baseline_vit, all_baseline_metrics),
         ('progressive', 'progressive_structured_pruning', train_progressive_structured_pruning, all_progressive_metrics),
         ('small_model', 'small_model_from_scratch', train_small_model_from_scratch, all_small_model_metrics),
+        ('enhanced', 'enhanced_progressive_pruning', train_enhanced_progressive_pruning, all_enhanced_metrics),
     ]
 
     for trial in range(1, NUM_TRIALS + 1):
@@ -1883,7 +2241,7 @@ def process_dataset(dataset_name, model_name, train_loader, val_loader, test_loa
                 results_list.append(metrics)
 
     # Combine all metrics
-    all_new_metrics = all_baseline_metrics + all_progressive_metrics + all_small_model_metrics
+    all_new_metrics = all_baseline_metrics + all_progressive_metrics + all_small_model_metrics + all_enhanced_metrics
 
     if all_new_metrics:
         new_metrics_df = pd.DataFrame(all_new_metrics)
@@ -1939,28 +2297,26 @@ def process_dataset(dataset_name, model_name, train_loader, val_loader, test_loa
         print("\n" + "="*150)
         print(f"SUMMARY - {dataset_name.upper()} - {model_name}")
         print("="*150)
-        print(f"{'Metric':<25} {'Baseline (Full)':<35} {'Progressive Pruning':<35} {'Small Model (Scratch)':<35}")
-        print("-"*150)
+        print(f"{'Metric':<25} {'Baseline (Full)':<30} {'Progressive':<30} {'Small Model':<30} {'Enhanced Prog.':<30}")
+        print("-"*165)
 
         # Get summary rows in order
         base_row = next((r for r in summary_rows if r['method'] == 'baseline'), {})
         prog_row = next((r for r in summary_rows if r['method'] == 'progressive_structured_pruning'), {})
         small_row = next((r for r in summary_rows if r['method'] == 'small_model_from_scratch'), {})
+        enhanced_row = next((r for r in summary_rows if r['method'] == 'enhanced_progressive_pruning'), {})
 
         for col in ['test_acc', 'test_auc', 'test_f1', 'params_m', 'flops_g', 'inference_energy_kwh', 'model_size_mb']:
-            base_mean = base_row.get(f'{col}_mean', float('nan'))
-            base_std = base_row.get(f'{col}_std', float('nan'))
-            prog_mean = prog_row.get(f'{col}_mean', float('nan'))
-            prog_std = prog_row.get(f'{col}_std', float('nan'))
-            small_mean = small_row.get(f'{col}_mean', float('nan'))
-            small_std = small_row.get(f'{col}_std', float('nan'))
+            vals = []
+            for row in [base_row, prog_row, small_row, enhanced_row]:
+                mean = row.get(f'{col}_mean', float('nan'))
+                std = row.get(f'{col}_std', float('nan'))
+                vals.append(f"{mean:.4f}±{std:.4f}")
 
-            print(f"{col:<25} {base_mean:.4f}±{base_std:.4f}            "
-                  f"{prog_mean:.4f}±{prog_std:.4f}            "
-                  f"{small_mean:.4f}±{small_std:.4f}")
-        print("="*150)
+            print(f"{col:<25} {vals[0]:<30} {vals[1]:<30} {vals[2]:<30} {vals[3]:<30}")
+        print("="*165)
 
-    return all_baseline_metrics, all_progressive_metrics, all_small_model_metrics
+    return all_baseline_metrics, all_progressive_metrics, all_small_model_metrics, all_enhanced_metrics
 
 # ==================== MAIN ====================
 
@@ -1977,9 +2333,9 @@ Example usage:
   python simulPruneVit.py --datasets bloodmnist         # Run on single dataset
 
 Experiment structure (per dataset):
-  - 3 methods: baseline, progressive_pruning, small_model_from_scratch
+  - 4 methods: baseline, progressive_pruning, small_model_from_scratch, enhanced_progressive
   - 2 models: vit_tiny_patch16_224, vit_base_patch16_224
-  - Total runs per dataset: NUM_TRIALS × 2 models × 3 methods = NUM_TRIALS × 6
+  - Total runs per dataset: NUM_TRIALS × 2 models × 4 methods = NUM_TRIALS × 8
         """
     )
     parser.add_argument('--trials', type=int, default=NUM_TRIALS,
@@ -2019,13 +2375,13 @@ def main():
     print("="*100)
 
     # Calculate total runs
-    total_runs = NUM_TRIALS * len(models_to_run) * 3 * len(datasets)
+    total_runs = NUM_TRIALS * len(models_to_run) * 4 * len(datasets)
     print(f"\nExperiment Overview:")
     print(f"  Models: {models_to_run}")
     print(f"  Datasets: {datasets}")
-    print(f"  Methods: baseline, progressive_pruning, small_model_from_scratch")
+    print(f"  Methods: baseline, progressive_pruning, small_model_from_scratch, enhanced_progressive_pruning")
     print(f"  Trials per (model, method): {NUM_TRIALS}")
-    print(f"  Total runs: {NUM_TRIALS} trials x {len(models_to_run)} models x 3 methods x {len(datasets)} datasets = {total_runs}")
+    print(f"  Total runs: {NUM_TRIALS} trials x {len(models_to_run)} models x 4 methods x {len(datasets)} datasets = {total_runs}")
 
     print(f"\nConfiguration (gentle_40pct from ViT_hyper.py):")
     print(f"  Device: {DEVICE}")
@@ -2065,10 +2421,10 @@ def main():
 
             print(f"\n" + "#"*100)
             print(f"# RUNNING: {dataset_name} with {model_name} (batch_size={model_batch_size})")
-            print(f"# Trials: {NUM_TRIALS}, Methods: 3 (baseline, progressive, small_model)")
+            print(f"# Trials: {NUM_TRIALS}, Methods: 4 (baseline, progressive, small_model, enhanced)")
             print(f"#"*100)
 
-            baseline_metrics, progressive_metrics, small_model_metrics = process_dataset(
+            baseline_metrics, progressive_metrics, small_model_metrics, enhanced_metrics = process_dataset(
                 dataset_name, model_name, train_loader, val_loader, test_loader, num_classes, SAVE_DIR
             )
 
@@ -2078,6 +2434,7 @@ def main():
             all_results.extend(baseline_metrics)
             all_results.extend(progressive_metrics)
             all_results.extend(small_model_metrics)
+            all_results.extend(enhanced_metrics)
 
     # Save all results
     if all_results:
@@ -2091,7 +2448,7 @@ def main():
 
         summary_data = []
         for model_name in models_to_run:
-            for method in ['baseline', 'progressive_structured_pruning', 'small_model_from_scratch']:
+            for method in ['baseline', 'progressive_structured_pruning', 'small_model_from_scratch', 'enhanced_progressive_pruning']:
                 model_filter = model_name if method != 'small_model_from_scratch' else f'{model_name}_small'
                 subset = all_results_df[(all_results_df['model'] == model_filter) &
                                         (all_results_df['method'] == method)]
@@ -2117,6 +2474,7 @@ def main():
     print(f"   1. Baseline: Full model ({FIXED_EPOCHS} epochs)")
     print(f"   2. Progressive Pruning: Prune during training -> convert to deploy -> continue training")
     print(f"   3. Small Model: Same size as pruned, trained from scratch")
+    print(f"   4. Enhanced Progressive: Progressive pruning + LR warmup/rewarm + RandAugment + Mixup")
     print(f"\nModels Tested:")
     for model_name in models_to_run:
         cfg = MODEL_CONFIGS.get(model_name, {})
