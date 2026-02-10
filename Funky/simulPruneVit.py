@@ -64,7 +64,7 @@ except ImportError:
 
 # Paths
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
-SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/multipleTrials/vit"
+SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/multipleTrials/vit/FourMethodMadness"
 
 # Hardware
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
