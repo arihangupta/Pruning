@@ -458,7 +458,10 @@ def train(dataset_name, model_name, train_loader, val_loader, test_loader, num_c
         metrics = evaluate_model(net, val_loader, DEVICE, multi_label=multi_label)
 
         print(f"Train Loss: {train_loss:.4f}")
-        print(f"Val AUC: {metrics['auc']:.4f}, Val Acc: {metrics['acc']:.4f}")
+        if multi_label:
+            print(f"Val AUC: {metrics['auc']:.4f}, Val Per-Label Acc: {metrics['acc']:.4f}, Val Exact-Match: {metrics['exact_match']:.4f}")
+        else:
+            print(f"Val AUC: {metrics['auc']:.4f}, Val Acc: {metrics['acc']:.4f}")
         print(f"Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}, F1: {metrics['f1']:.4f}")
 
         if metrics['auc'] > best_auc:

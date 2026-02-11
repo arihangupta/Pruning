@@ -160,6 +160,8 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
     for ep in range(epochs):
         model.train()
         running_loss, correct, total = 0.0, 0, 0
+        label_correct, label_total = 0, 0  # for multi-label per-label accuracy
+        all_probs, all_labels = [], []  # for running AUC
         for bidx, (images, labels) in enumerate(train_loader, 1):
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             opt.zero_grad()
@@ -171,14 +173,37 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
             total += labels.size(0)
 
             if multi_label:
-                preds = (torch.sigmoid(outputs) > 0.5).float()
+                probs = torch.sigmoid(outputs)
+                preds = (probs > 0.5).float()
+                # Per-label accuracy (mean across 14 labels)
+                label_correct += (preds == labels).sum().item()
+                label_total += labels.numel()
+                # Exact-match accuracy (all 14 labels correct)
                 correct += (preds == labels).all(dim=1).sum().item()
+                # Collect for running AUC
+                all_probs.append(probs.detach().cpu().numpy())
+                all_labels.append(labels.detach().cpu().numpy())
             else:
                 _, preds = outputs.max(1)
                 correct += preds.eq(labels).sum().item()
 
             if bidx % LOG_INTERVAL == 0 or bidx == len(train_loader):
-                print(f"  Epoch {ep+1} Batch {bidx}/{len(train_loader)} - loss {running_loss/total:.4f} acc {correct/total:.4f}")
+                if multi_label:
+                    per_label_acc = label_correct / max(1, label_total)
+                    exact_match = correct / max(1, total)
+                    # Compute running AUC
+                    running_auc = float('nan')
+                    if SKLEARN:
+                        try:
+                            _probs = np.concatenate(all_probs, axis=0)
+                            _labels = np.concatenate(all_labels, axis=0)
+                            running_auc = roc_auc_score(_labels, _probs, average='macro')
+                        except Exception:
+                            pass
+                    print(f"  Epoch {ep+1} Batch {bidx}/{len(train_loader)} - loss {running_loss/total:.4f} "
+                          f"per-label-acc {per_label_acc:.4f} exact-match {exact_match:.4f} AUC {running_auc:.4f}")
+                else:
+                    print(f"  Epoch {ep+1} Batch {bidx}/{len(train_loader)} - loss {running_loss/total:.4f} acc {correct/total:.4f}")
 
 @torch.no_grad()
 def evaluate_model(model: nn.Module, loader: DataLoader,
