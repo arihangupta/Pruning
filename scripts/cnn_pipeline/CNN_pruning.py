@@ -32,6 +32,8 @@ except Exception:
 # -------------------------
 SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/CNN_pruned_models"
 CNN_EXP1_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1"
+NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
+MULTI_LABEL_DATASETS = {'chestmnist'}
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
@@ -65,6 +67,7 @@ DATASET_BATCH_SIZES = {
     "dermamnist": 32,
     "pathmnist": 16,
     "bloodmnist": 32,
+    "chestmnist": 16,
 }
 
 DATASETS = {
@@ -79,6 +82,10 @@ DATASETS = {
     "bloodmnist": {
         "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/bloodmnist_224.npz",
         "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1/bloodmnist_224_baseline.pth"
+    },
+    "chestmnist": {
+        "path": "npy",  # special marker - loaded from NPY_DIR
+        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1/chestmnist_224_baseline.pth"
     },
 }
 
@@ -119,10 +126,11 @@ def cleanup_memory():
 # Data helpers
 # -------------------------
 class NumpyMemmapDataset(Dataset):
-    def __init__(self, imgs_np, labels_np, img_size=224):
+    def __init__(self, imgs_np, labels_np, img_size=224, multi_label=False):
         self.imgs = imgs_np
         self.labels = labels_np
         self.img_size = img_size
+        self.multi_label = multi_label
         self.base_tfms = T.Compose([
             T.ToPILImage(),
             T.Resize((img_size, img_size)),
@@ -135,30 +143,53 @@ class NumpyMemmapDataset(Dataset):
 
     def __getitem__(self, idx):
         img = self.imgs[idx]
-        label = int(self.labels[idx])
+        if self.multi_label:
+            label = torch.FloatTensor(np.array(self.labels[idx]))
+        else:
+            label = int(self.labels[idx])
         x = self.base_tfms(img)
         if x.shape[0] == 1:
             x = x.repeat(3, 1, 1)
         x = self.normalize(x)
         return x, label
 
-def make_loaders(npz_path, batch_size):
-    if not os.path.exists(npz_path):
-        raise FileNotFoundError(f"Dataset file not found: {npz_path}")
-    data = np.load(npz_path, mmap_mode="r")
-    X_train, y_train = data["train_images"], data["train_labels"].flatten()
-    X_val, y_val = data["val_images"], data["val_labels"].flatten()
-    X_test, y_test = data["test_images"], data["test_labels"].flatten()
+def make_loaders(dataset_name, batch_size):
+    multi_label = dataset_name in MULTI_LABEL_DATASETS
+
+    if multi_label:
+        npy_dir = os.path.join(NPY_DIR, f"{dataset_name}_{IMG_SIZE}")
+        if not os.path.exists(npy_dir):
+            raise FileNotFoundError(f"Dataset directory not found: {npy_dir}")
+        print(f"Loading {npy_dir} (multi-label) ...")
+        X_train = np.load(os.path.join(npy_dir, "train_images.npy"), mmap_mode="r")
+        y_train = np.load(os.path.join(npy_dir, "train_labels.npy"), mmap_mode="r")
+        X_val = np.load(os.path.join(npy_dir, "val_images.npy"), mmap_mode="r")
+        y_val = np.load(os.path.join(npy_dir, "val_labels.npy"), mmap_mode="r")
+        X_test = np.load(os.path.join(npy_dir, "test_images.npy"), mmap_mode="r")
+        y_test = np.load(os.path.join(npy_dir, "test_labels.npy"), mmap_mode="r")
+        num_classes = y_train.shape[1]
+    else:
+        npz_path = DATASETS[dataset_name]["path"]
+        if not os.path.exists(npz_path):
+            raise FileNotFoundError(f"Dataset file not found: {npz_path}")
+        data = np.load(npz_path, mmap_mode="r")
+        X_train, y_train = data["train_images"], data["train_labels"].flatten()
+        X_val, y_val = data["val_images"], data["val_labels"].flatten()
+        X_test, y_test = data["test_images"], data["test_labels"].flatten()
+        num_classes = int(len(np.unique(np.concatenate([y_train, y_val, y_test]))))
+
     n_train, n_val, n_test = len(y_train), len(y_val), len(y_test)
-    print(f"Dataset sizes: train={n_train}, val={n_val}, test={n_test}, total={n_train + n_val + n_test}")
-    train_ds = NumpyMemmapDataset(X_train, y_train, img_size=IMG_SIZE)
-    val_ds = NumpyMemmapDataset(X_val, y_val, img_size=IMG_SIZE)
-    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE)
+    print(f"Dataset sizes: train={n_train}, val={n_val}, test={n_test}, total={n_train+n_val+n_test}, Multi-label: {multi_label}")
+
+    train_ds = NumpyMemmapDataset(X_train, y_train, img_size=IMG_SIZE, multi_label=multi_label)
+    val_ds = NumpyMemmapDataset(X_val, y_val, img_size=IMG_SIZE, multi_label=multi_label)
+    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, multi_label=multi_label)
+
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    num_classes = int(len(np.unique(np.concatenate([y_train, y_val, y_test]))))
-    return train_loader, val_loader, test_loader, num_classes, train_ds
+
+    return train_loader, val_loader, test_loader, num_classes, train_ds, multi_label
 
 # -------------------------
 # Models / builder
@@ -382,9 +413,10 @@ def build_pruned_resnet_and_copy_weights_fixed(base_model: nn.Module, keep_indic
 # -------------------------
 # Metrics & eval
 # -------------------------
-criterion = nn.CrossEntropyLoss()
+criterion_ce = nn.CrossEntropyLoss()
+criterion_bce = nn.BCEWithLogitsLoss()
 
-def evaluate_model_basic(model, loader, dataset_name="", variant=""):
+def evaluate_model_basic(model, loader, dataset_name="", variant="", multi_label=False):
     model.eval()
     loss_total = 0.0; correct = 0; total = 0
     probs_list = []; labels_list = []
@@ -413,20 +445,28 @@ def evaluate_model_basic(model, loader, dataset_name="", variant=""):
             if outputs.device != labels.device:
                 outputs = outputs.to(labels.device)
             
-            loss = criterion(outputs, labels)
+            loss_fn = criterion_bce if multi_label else criterion_ce
+            loss = loss_fn(outputs, labels)
             loss_total += float(loss.item()) * images.size(0)
-            _, predicted = outputs.max(1)
-            total += labels.size(0); correct += int(predicted.eq(labels).sum().item())
-            
-            outputs = torch.clamp(outputs, min=-100, max=100)
-            probs = torch.softmax(outputs, dim=1)
-            
-            if torch.any(torch.isnan(probs)):
-                print(f"    Warning: NaN probabilities detected in {variant} for {dataset_name}")
-            
-            probs_list.append(probs.cpu().numpy())
-            labels_list.append(labels.cpu().numpy())
-            predicted_classes.append(predicted.cpu().numpy())
+
+            if multi_label:
+                outputs = torch.clamp(outputs, min=-100, max=100)
+                probs = torch.sigmoid(outputs)
+                preds = (probs > 0.5).float()
+                total += labels.size(0)
+                correct += int((preds == labels).all(dim=1).sum().item())
+                probs_list.append(probs.cpu().numpy())
+                labels_list.append(labels.cpu().numpy())
+            else:
+                _, predicted = outputs.max(1)
+                total += labels.size(0); correct += int(predicted.eq(labels).sum().item())
+                outputs = torch.clamp(outputs, min=-100, max=100)
+                probs = torch.softmax(outputs, dim=1)
+                if torch.any(torch.isnan(probs)):
+                    print(f"    Warning: NaN probabilities detected in {variant} for {dataset_name}")
+                probs_list.append(probs.cpu().numpy())
+                labels_list.append(labels.cpu().numpy())
+                predicted_classes.append(predicted.cpu().numpy())
     
     loss_avg = loss_total / max(1, total)
     acc = correct / max(1, total)
@@ -435,32 +475,42 @@ def evaluate_model_basic(model, loader, dataset_name="", variant=""):
         predicted_classes = np.concatenate(predicted_classes)
         unique_preds, pred_counts = np.unique(predicted_classes, return_counts=True)
         print(f"    {variant} predicted class distribution: {dict(zip(unique_preds, pred_counts))}")
-    
-    labels = np.concatenate(labels_list)
-    probs = np.concatenate(probs_list)
-    try:
-        auc_scores = []
-        unique_labels = np.unique(labels)
-        if len(unique_labels) < 2:
-            print(f"    Warning: Only {len(unique_labels)} class(es) found in {variant} for {dataset_name}, AUC set to NaN")
+
+    if multi_label:
+        labels = np.concatenate(labels_list)
+        probs = np.concatenate(probs_list)
+        try:
+            auc = roc_auc_score(labels, probs, average='macro')
+        except Exception as e:
+            print(f"    AUC calculation failed for {variant}: {e}")
             auc = float("nan")
-        else:
-            for class_idx in unique_labels:
-                binary_labels = (labels == class_idx).astype(int)
-                binary_probs = probs[:, class_idx]
-                if len(np.unique(binary_labels)) < 2:
-                    print(f"    Warning: Class {class_idx} has only one label type, skipping AUC")
-                    continue
-                auc = roc_auc_score(binary_labels, binary_probs)
-                auc_scores.append(auc)
-            auc = np.mean(auc_scores) if auc_scores else float("nan")
-            if variant and auc_scores:
-                print(f"    {variant} per-class AUCs: {[f'{a:.4f}' for a in auc_scores]}, mean: {auc:.4f}")
-    except Exception as e:
-        print(f"    AUC calculation failed for {variant}: {e}")
-        auc = float("nan")
-    
-    return loss_avg, acc, auc
+        return loss_avg, acc, auc
+    else:
+        labels = np.concatenate(labels_list)
+        probs = np.concatenate(probs_list)
+        try:
+            auc_scores = []
+            unique_labels = np.unique(labels)
+            if len(unique_labels) < 2:
+                print(f"    Warning: Only {len(unique_labels)} class(es) found in {variant} for {dataset_name}, AUC set to NaN")
+                auc = float("nan")
+            else:
+                for class_idx in unique_labels:
+                    binary_labels = (labels == class_idx).astype(int)
+                    binary_probs = probs[:, class_idx]
+                    if len(np.unique(binary_labels)) < 2:
+                        print(f"    Warning: Class {class_idx} has only one label type, skipping AUC")
+                        continue
+                    auc = roc_auc_score(binary_labels, binary_probs)
+                    auc_scores.append(auc)
+                auc = np.mean(auc_scores) if auc_scores else float("nan")
+                if variant and auc_scores:
+                    print(f"    {variant} per-class AUCs: {[f'{a:.4f}' for a in auc_scores]}, mean: {auc:.4f}")
+        except Exception as e:
+            print(f"    AUC calculation failed for {variant}: {e}")
+            auc = float("nan")
+
+        return loss_avg, acc, auc
 
 def count_zeros_and_total(model):
     total = 0; zeros = 0
@@ -585,8 +635,8 @@ def measure_prediction_energy(model, test_loader, save_dir, project_name, num_im
     print(f"  Prediction energy for {images_processed} images: total_kWh={energy_kwh}, per_image_kWh={energy_per_image_kwh}, emissions_kg={emissions_kg}")
     return energy_per_image_kwh, emissions_kg
 
-def collect_metrics_row(variant, stage, ratio, model, test_loader, path_hint, dataset_name=""):
-    loss, acc, auc = evaluate_model_basic(model, test_loader, dataset_name, variant)
+def collect_metrics_row(variant, stage, ratio, model, test_loader, path_hint, dataset_name="", multi_label=False):
+    loss, acc, auc = evaluate_model_basic(model, test_loader, dataset_name, variant, multi_label=multi_label)
     zeros, total = count_zeros_and_total(model) if "quantization" not in variant and "fp16" not in variant else (0, params_count(model))
     params = params_count(model)
     flops = compute_flops(model)
@@ -637,11 +687,16 @@ def calibrate_stage(model, stage_name, train_loader, epochs=CAL_EPOCHS, max_batc
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
             opt.zero_grad()
             out = model(imgs)
-            loss = criterion(out, labels)
+            loss_fn = criterion_bce if (labels.dim() > 1 and labels.shape[1] > 1) else criterion_ce
+            loss = loss_fn(out, labels)
             loss.backward(); opt.step()
             running_loss += float(loss.item()) * imgs.size(0)
-            _, preds = out.max(1)
-            total += labels.size(0); correct += int(preds.eq(labels).sum().item())
+            if labels.dim() > 1 and labels.shape[1] > 1:
+                preds = (torch.sigmoid(out) > 0.5).float()
+                total += labels.size(0); correct += int((preds == labels).all(dim=1).sum().item())
+            else:
+                _, preds = out.max(1)
+                total += labels.size(0); correct += int(preds.eq(labels).sum().item())
             steps += 1
             if bidx % LOG_INTERVAL == 0:
                 print(f"      Calib {stage_name} ep{ep+1} batch{bidx} - loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
@@ -680,13 +735,17 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
             student_imgs = imgs.half() if use_fp16 else imgs
             s_logits = student(student_imgs).float()
             
-            loss_ce = criterion(s_logits, labels)
-            s_log_soft = F.log_softmax(s_logits / T, dim=1)
-            with torch.no_grad():
-                t_soft = F.softmax(t_logits / T, dim=1)
-            s_log_soft = torch.clamp(s_log_soft, min=-100)
-            t_soft = torch.clamp(t_soft, min=1e-8)
-            loss_kd = kl_loss(s_log_soft, t_soft) * (T * T)
+            loss_ce_fn = criterion_bce if (labels.dim() > 1 and labels.shape[1] > 1) else criterion_ce
+            loss_ce = loss_ce_fn(s_logits, labels)
+            if labels.dim() > 1 and labels.shape[1] > 1:
+                loss_kd = F.mse_loss(s_logits, t_logits)
+            else:
+                s_log_soft = F.log_softmax(s_logits / T, dim=1)
+                with torch.no_grad():
+                    t_soft = F.softmax(t_logits / T, dim=1)
+                s_log_soft = torch.clamp(s_log_soft, min=-100)
+                t_soft = torch.clamp(t_soft, min=1e-8)
+                loss_kd = kl_loss(s_log_soft, t_soft) * (T * T)
             
             if torch.isnan(loss_ce) or torch.isnan(loss_kd):
                 print(f"      Warning: NaN detected in losses (CE: {loss_ce.item()}, KD: {loss_kd.item()}), skipping batch")
@@ -699,9 +758,13 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
                 torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
             opt.step()
             running_loss += float(loss.item()) * imgs.size(0)
-            _, preds = s_logits.max(1)
-            total = labels.size(0)
-            correct += int(preds.eq(labels).sum().item())
+            if labels.dim() > 1 and labels.shape[1] > 1:
+                preds = (torch.sigmoid(s_logits) > 0.5).float()
+                correct += int((preds == labels).all(dim=1).sum().item())
+            else:
+                _, preds = s_logits.max(1)
+                correct += int(preds.eq(labels).sum().item())
+            total += labels.size(0)
             if bidx % LOG_INTERVAL == 0:
                 avg_loss = running_loss/max(1,total)
                 avg_acc = correct/max(1,total)
@@ -713,7 +776,7 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
 # -------------------------
 # Global finetune with FP16 support
 # -------------------------
-def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR):
+def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR, multi_label=False):
     model.train()
     model_dtype = next(model.parameters()).dtype
     is_fp16 = (model_dtype == torch.half)
@@ -732,15 +795,20 @@ def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCH
             labels = labels.to(DEVICE)
             opt.zero_grad()
             out = model(imgs)
-            loss = criterion(out, labels)
+            loss_fn = criterion_bce if (labels.dim() > 1 and labels.shape[1] > 1) else criterion_ce
+            loss = loss_fn(out, labels)
             loss.backward()
             opt.step()
             running_loss += float(loss.item()) * imgs.size(0)
-            _, preds = out.max(1)
-            total += labels.size(0); correct += int(preds.eq(labels).sum().item())
+            if labels.dim() > 1 and labels.shape[1] > 1:
+                preds = (torch.sigmoid(out) > 0.5).float()
+                total += labels.size(0); correct += int((preds == labels).all(dim=1).sum().item())
+            else:
+                _, preds = out.max(1)
+                total += labels.size(0); correct += int(preds.eq(labels).sum().item())
             if bidx % LOG_INTERVAL == 0:
                 print(f"    Global FT ep{ep+1} batch{bidx} - loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
-        vloss, vacc, vauc = evaluate_model_basic(model, val_loader)
+        vloss, vacc, vauc = evaluate_model_basic(model, val_loader, multi_label=multi_label)
         print(f"    Global FT epoch {ep+1}: ValLoss {vloss:.4f}, ValAcc {vacc:.4f}, ValAUC {vauc:.4f}")
     
     if is_fp16:
@@ -1005,7 +1073,7 @@ def process_dataset_safely(dataset_name, cfg):
             return True
 
         batch_size = DATASET_BATCH_SIZES.get(dataset_name, BATCH_SIZE_DEFAULT)
-        train_loader, val_loader, test_loader, NUM_CLASSES, train_ds = make_loaders(cfg["path"], batch_size)
+        train_loader, val_loader, test_loader, NUM_CLASSES, train_ds, multi_label = make_loaders(dataset_name, batch_size)
         print(f"Data loaded for {dataset_name}. NUM_CLASSES={NUM_CLASSES}, device={DEVICE}, batch_size={batch_size}")
         log_memory_usage(f"After loading data for {dataset_name}: ")
 
@@ -1018,7 +1086,7 @@ def process_dataset_safely(dataset_name, cfg):
         print("=== EVALUATE BASELINE ===")
         base_ckpt = os.path.join(SAVE_DIR, "baseline.pth")
         torch.save(baseline.state_dict(), base_ckpt)
-        row = collect_metrics_row("baseline", "baseline", 1.0, baseline, test_loader, base_ckpt, dataset_name)
+        row = collect_metrics_row("baseline", "baseline", 1.0, baseline, test_loader, base_ckpt, dataset_name, multi_label=multi_label)
         rows.append(row)
         print("Baseline done:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
@@ -1054,7 +1122,7 @@ def process_dataset_safely(dataset_name, cfg):
                     
                     q_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_final.pth")
                     torch.save(quantized_model.state_dict(), q_ckpt)
-                    row = collect_metrics_row(method, "quantized", keep_ratio, quantized_model, test_loader, q_ckpt, dataset_name)
+                    row = collect_metrics_row(method, "quantized", keep_ratio, quantized_model, test_loader, q_ckpt, dataset_name, multi_label=multi_label)
                     rows.append(row)
                     print("  Quantized metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
@@ -1114,25 +1182,25 @@ def process_dataset_safely(dataset_name, cfg):
                         
                         stage_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_{s}_postprune.pth")
                         torch.save(pruned_model.state_dict(), stage_pruned_ckpt)
-                        row = collect_metrics_row(method, f"{s}_postprune", keep_ratio, pruned_model, test_loader, stage_pruned_ckpt, dataset_name)
+                        row = collect_metrics_row(method, f"{s}_postprune", keep_ratio, pruned_model, test_loader, stage_pruned_ckpt, dataset_name, multi_label=multi_label)
                         rows.append(row)
                         print("    Post-prune metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
-                        
+
                         print(f"    Calibrating {s} (local)...")
                         pruned_model = calibrate_stage(pruned_model, s, train_loader, epochs=CAL_EPOCHS, max_batches=CAL_MAX_BATCHES, lr=CAL_LR, allow_fc_bn1=False)
                         stage_calib_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_{s}_calibrated.pth")
                         torch.save(pruned_model.state_dict(), stage_calib_ckpt)
-                        row = collect_metrics_row(method, f"{s}_postcalib", keep_ratio, pruned_model, test_loader, stage_calib_ckpt, dataset_name)
+                        row = collect_metrics_row(method, f"{s}_postcalib", keep_ratio, pruned_model, test_loader, stage_calib_ckpt, dataset_name, multi_label=multi_label)
                         rows.append(row)
                         print("    Post-calib metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
-                        
+
                         current_model = pruned_model
                         log_memory_usage(f"After stage {s} for {method}, compress_ratio={compress_ratio}: ")
                         cleanup_memory()
 
                     all_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_allpruned_preKD.pth")
                     torch.save(current_model.state_dict(), all_pruned_ckpt)
-                    row = collect_metrics_row(method, "all_pruned_preKD", keep_ratio, current_model, test_loader, all_pruned_ckpt, dataset_name)
+                    row = collect_metrics_row(method, "all_pruned_preKD", keep_ratio, current_model, test_loader, all_pruned_ckpt, dataset_name, multi_label=multi_label)
                     rows.append(row)
                     print("  All-pruned (pre-KD) metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
@@ -1140,16 +1208,16 @@ def process_dataset_safely(dataset_name, cfg):
                     current_model = distill_student(current_model, baseline, train_loader, epochs=KD_EPOCHS, lr=KD_LR, alpha=KD_ALPHA, T=KD_TEMPERATURE, max_batches=KD_MAX_BATCHES)
                     kd_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_afterKD.pth")
                     torch.save(current_model.state_dict(), kd_ckpt)
-                    row = collect_metrics_row(method, "after_kd", keep_ratio, current_model, test_loader, kd_ckpt, dataset_name)
+                    row = collect_metrics_row(method, "after_kd", keep_ratio, current_model, test_loader, kd_ckpt, dataset_name, multi_label=multi_label)
                     rows.append(row)
                     print("  KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
                     print("  Final global finetune...")
-                    current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
-                    
+                    current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR, multi_label=multi_label)
+
                     final_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_final.pth")
                     torch.save(current_model.state_dict(), final_ckpt)
-                    row = collect_metrics_row(method, "after_global_finetune", keep_ratio, current_model, test_loader, final_ckpt, dataset_name)
+                    row = collect_metrics_row(method, "after_global_finetune", keep_ratio, current_model, test_loader, final_ckpt, dataset_name, multi_label=multi_label)
                     rows.append(row)
                     print("  Final metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
@@ -1191,7 +1259,7 @@ def process_dataset_safely(dataset_name, cfg):
                         
                         fp16_ckpt = os.path.join(SAVE_DIR, f"{fp16_method}_r{int(compress_ratio*100)}compressed_final.pth")
                         torch.save(fp16_model.state_dict(), fp16_ckpt)
-                        row = collect_metrics_row(fp16_method, "after_global_finetune_amp", keep_ratio, fp16_model, test_loader, fp16_ckpt, dataset_name)
+                        row = collect_metrics_row(fp16_method, "after_global_finetune_amp", keep_ratio, fp16_model, test_loader, fp16_ckpt, dataset_name, multi_label=multi_label)
                         rows.append(row)
                         print("  FP16 metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
@@ -1239,7 +1307,7 @@ def process_dataset_safely(dataset_name, cfg):
 
                     pre_kd_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_pre_kd.pth")
                     torch.save(current_model.state_dict(), pre_kd_ckpt)
-                    row = collect_metrics_row(method, "pre_kd", keep_ratio, current_model, test_loader, pre_kd_ckpt, dataset_name)
+                    row = collect_metrics_row(method, "pre_kd", keep_ratio, current_model, test_loader, pre_kd_ckpt, dataset_name, multi_label=multi_label)
                     rows.append(row)
                     print("  Pre-KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
@@ -1247,16 +1315,16 @@ def process_dataset_safely(dataset_name, cfg):
                     current_model = distill_student(current_model, baseline, train_loader, epochs=KD_EPOCHS, lr=KD_LR, alpha=KD_ALPHA, T=KD_TEMPERATURE, max_batches=KD_MAX_BATCHES)
                     kd_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_afterKD.pth")
                     torch.save(current_model.state_dict(), kd_ckpt)
-                    row = collect_metrics_row(method, "after_kd", keep_ratio, current_model, test_loader, kd_ckpt, dataset_name)
+                    row = collect_metrics_row(method, "after_kd", keep_ratio, current_model, test_loader, kd_ckpt, dataset_name, multi_label=multi_label)
                     rows.append(row)
                     print("  KD metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
                     print("  Final global finetune...")
-                    current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
-                    
+                    current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR, multi_label=multi_label)
+
                     final_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_final.pth")
                     torch.save(current_model.state_dict(), final_ckpt)
-                    row = collect_metrics_row(method, "after_global_finetune", keep_ratio, current_model, test_loader, final_ckpt, dataset_name)
+                    row = collect_metrics_row(method, "after_global_finetune", keep_ratio, current_model, test_loader, final_ckpt, dataset_name, multi_label=multi_label)
                     rows.append(row)
                     print("  Final metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
@@ -1298,7 +1366,7 @@ def process_dataset_safely(dataset_name, cfg):
                         
                         fp16_ckpt = os.path.join(SAVE_DIR, f"{fp16_method}_r{int(compress_ratio*100)}compressed_final.pth")
                         torch.save(fp16_model.state_dict(), fp16_ckpt)
-                        row = collect_metrics_row(fp16_method, "after_global_finetune_amp", keep_ratio, fp16_model, test_loader, fp16_ckpt, dataset_name)
+                        row = collect_metrics_row(fp16_method, "after_global_finetune_amp", keep_ratio, fp16_model, test_loader, fp16_ckpt, dataset_name, multi_label=multi_label)
                         rows.append(row)
                         print("  FP16 metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
@@ -1361,15 +1429,15 @@ def process_dataset_safely(dataset_name, cfg):
                         
                         stage_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_{s}_postprune.pth")
                         torch.save(pruned_model.state_dict(), stage_pruned_ckpt)
-                        row = collect_metrics_row(method, f"{s}_postprune", keep_ratio, pruned_model, test_loader, stage_pruned_ckpt, dataset_name)
+                        row = collect_metrics_row(method, f"{s}_postprune", keep_ratio, pruned_model, test_loader, stage_pruned_ckpt, dataset_name, multi_label=multi_label)
                         rows.append(row)
                         print("    Post-prune metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
-                        
+
                         print(f"    Calibrating {s} (local)...")
                         pruned_model = calibrate_stage(pruned_model, s, train_loader, epochs=CAL_EPOCHS, max_batches=CAL_MAX_BATCHES, lr=CAL_LR, allow_fc_bn1=False)
                         stage_calib_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_{s}_calibrated.pth")
                         torch.save(pruned_model.state_dict(), stage_calib_ckpt)
-                        row = collect_metrics_row(method, f"{s}_postcalib", keep_ratio, pruned_model, test_loader, stage_calib_ckpt, dataset_name)
+                        row = collect_metrics_row(method, f"{s}_postcalib", keep_ratio, pruned_model, test_loader, stage_calib_ckpt, dataset_name, multi_label=multi_label)
                         rows.append(row)
                         print("    Post-calib metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
                         
@@ -1379,16 +1447,16 @@ def process_dataset_safely(dataset_name, cfg):
 
                     all_pruned_ckpt = os.path.join(SAVE_DIR, f"pgto_{method}_r{int(compress_ratio*100)}compressed_allpruned.pth")
                     torch.save(current_model.state_dict(), all_pruned_ckpt)
-                    row = collect_metrics_row(method, "all_pruned", keep_ratio, current_model, test_loader, all_pruned_ckpt, dataset_name)
+                    row = collect_metrics_row(method, "all_pruned", keep_ratio, current_model, test_loader, all_pruned_ckpt, dataset_name, multi_label=multi_label)
                     rows.append(row)
                     print("  All-pruned metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
                     print("  Final global finetune...")
-                    current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR)
-                    
+                    current_model = global_finetune(current_model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCHS, lr=FINAL_LR, multi_label=multi_label)
+
                     final_ckpt = os.path.join(SAVE_DIR, f"{method}_r{int(compress_ratio*100)}compressed_final.pth")
                     torch.save(current_model.state_dict(), final_ckpt)
-                    row = collect_metrics_row(method, "after_global_finetune", keep_ratio, current_model, test_loader, final_ckpt, dataset_name)
+                    row = collect_metrics_row(method, "after_global_finetune", keep_ratio, current_model, test_loader, final_ckpt, dataset_name, multi_label=multi_label)
                     rows.append(row)
                     print("  Final metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 
@@ -1430,7 +1498,7 @@ def process_dataset_safely(dataset_name, cfg):
                         
                         fp16_ckpt = os.path.join(SAVE_DIR, f"{fp16_method}_r{int(compress_ratio*100)}compressed_final.pth")
                         torch.save(fp16_model.state_dict(), fp16_ckpt)
-                        row = collect_metrics_row(fp16_method, "after_global_finetune_amp", keep_ratio, fp16_model, test_loader, fp16_ckpt, dataset_name)
+                        row = collect_metrics_row(fp16_method, "after_global_finetune_amp", keep_ratio, fp16_model, test_loader, fp16_ckpt, dataset_name, multi_label=multi_label)
                         rows.append(row)
                         print("  FP16 metrics:", {k: row[k] for k in ["Acc", "AUC", "ModelSizeMB", "FLOPs_M_per_image"]})
 

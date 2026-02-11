@@ -40,6 +40,7 @@ except Exception:
 # Config
 # -------------------------
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
+NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
 BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/new_baseline"
 SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/rerun/pruned_models"
 EPOCHS_KD = 50  # Epochs for knowledge distillation
@@ -51,6 +52,7 @@ IMG_SIZE = 224
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 EARLY_STOP_PATIENCE = 10
+MULTI_LABEL_DATASETS = {'chestmnist'}
 
 # Knowledge Distillation Parameters
 TEMPERATURE = 4.0  # Temperature for softening probabilities
@@ -797,11 +799,12 @@ def cleanup_memory():
 # -------------------------
 class NumpyMemmapDataset(Dataset):
     """Wraps a numpy array (H,W[,C]) and a label array."""
-    def __init__(self, imgs_np, labels_np, img_size=224, is_train=False):
+    def __init__(self, imgs_np, labels_np, img_size=224, is_train=False, multi_label=False):
         self.imgs = imgs_np
         self.labels = labels_np
         self.img_size = img_size
         self.is_train = is_train
+        self.multi_label = multi_label
 
         if is_train:
             self.base_tfms = transforms.Compose([
@@ -827,7 +830,10 @@ class NumpyMemmapDataset(Dataset):
 
     def __getitem__(self, idx):
         img = self.imgs[idx]
-        label = int(self.labels[idx])
+        if self.multi_label:
+            label = torch.FloatTensor(np.array(self.labels[idx]))
+        else:
+            label = int(self.labels[idx])
         x = self.base_tfms(img)
         
         if x.shape[0] == 1:
@@ -837,22 +843,44 @@ class NumpyMemmapDataset(Dataset):
         return x, label
 
 
-def load_dataset(npz_path: str):
-    """Load dataset from NPZ file."""
-    data = np.load(npz_path, mmap_mode="r")
+def load_dataset(dataset_name_or_path: str):
+    """Load dataset from NPZ (datasets_balanced) or NPY dir (datasets_npy)."""
+    # Support both old-style path and new-style dataset name
+    if os.path.exists(dataset_name_or_path) and dataset_name_or_path.endswith('.npz'):
+        dataset_name = os.path.splitext(os.path.basename(dataset_name_or_path))[0].replace('_224', '')
+    else:
+        dataset_name = dataset_name_or_path
 
-    X_train = data["train_images"]
-    y_train = data["train_labels"].flatten()
-    X_val = data["val_images"]
-    y_val = data["val_labels"].flatten()
-    X_test = data["test_images"]
-    y_test = data["test_labels"].flatten()
+    multi_label = dataset_name in MULTI_LABEL_DATASETS
+
+    if multi_label:
+        npy_dir = os.path.join(NPY_DIR, f"{dataset_name}_{IMG_SIZE}")
+        print(f"Loading {npy_dir} (multi-label) ...")
+        X_train = np.load(os.path.join(npy_dir, "train_images.npy"), mmap_mode="r")
+        y_train = np.load(os.path.join(npy_dir, "train_labels.npy"), mmap_mode="r")
+        X_val = np.load(os.path.join(npy_dir, "val_images.npy"), mmap_mode="r")
+        y_val = np.load(os.path.join(npy_dir, "val_labels.npy"), mmap_mode="r")
+        X_test = np.load(os.path.join(npy_dir, "test_images.npy"), mmap_mode="r")
+        y_test = np.load(os.path.join(npy_dir, "test_labels.npy"), mmap_mode="r")
+        num_classes = y_train.shape[1]
+    else:
+        npz_path = dataset_name_or_path if dataset_name_or_path.endswith('.npz') else os.path.join(DATASET_DIR, f"{dataset_name}_224.npz")
+        print(f"Loading {npz_path} ...")
+        data = np.load(npz_path, mmap_mode="r")
+        X_train = data["train_images"]
+        y_train = data["train_labels"].flatten()
+        X_val = data["val_images"]
+        y_val = data["val_labels"].flatten()
+        X_test = data["test_images"]
+        y_test = data["test_labels"].flatten()
+        num_classes = int(len(np.unique(np.concatenate([y_train, y_val, y_test]))))
 
     n_train, n_val, n_test = len(y_train), len(y_val), len(y_test)
+    print(f"Dataset sizes: train={n_train}, val={n_val}, test={n_test}, Multi-label: {multi_label}")
 
-    train_ds = NumpyMemmapDataset(X_train, y_train, img_size=IMG_SIZE, is_train=True)
-    val_ds = NumpyMemmapDataset(X_val, y_val, img_size=IMG_SIZE, is_train=False)
-    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, is_train=False)
+    train_ds = NumpyMemmapDataset(X_train, y_train, img_size=IMG_SIZE, is_train=True, multi_label=multi_label)
+    val_ds = NumpyMemmapDataset(X_val, y_val, img_size=IMG_SIZE, is_train=False, multi_label=multi_label)
+    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, is_train=False, multi_label=multi_label)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=4, pin_memory=True)
@@ -861,9 +889,6 @@ def load_dataset(npz_path: str):
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
                              num_workers=4, pin_memory=True)
 
-    num_classes = int(len(np.unique(np.concatenate([y_train, y_val, y_test]))))
-    dataset_name = os.path.splitext(os.path.basename(npz_path))[0].replace('_224', '')
-    
     return train_loader, val_loader, test_loader, num_classes, dataset_name
 
 
@@ -880,48 +905,89 @@ def specificity_per_class(conf_matrix):
     return specificity
 
 
-def evaluate_model(net, test_loader, device, use_amp=False):
+def evaluate_model(net, test_loader, device, use_amp=False, multi_label=False):
     """Evaluate the model."""
     net.eval()
     all_preds = []
     all_labels = []
     all_probs = []
-    
+
     with torch.no_grad():
         val_bar = tqdm(test_loader, file=sys.stdout, desc="Evaluating", leave=False)
         for inputs, targets in val_bar:
             inputs = inputs.to(device)
-            
+
             if use_amp:
                 with autocast():
                     outputs = net(inputs)
             else:
                 outputs = net(inputs)
-            
-            probs = torch.softmax(outputs, dim=1)
-            predict_y = torch.max(probs, dim=1)[1]
-            
-            all_preds.extend(predict_y.cpu().numpy())
-            all_labels.extend(targets.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
-    
+
+            if multi_label:
+                probs = torch.sigmoid(outputs)
+                preds = (probs > 0.5).float()
+                all_preds.append(preds.cpu().numpy())
+                all_labels.append(targets.cpu().numpy())
+                all_probs.append(probs.cpu().numpy())
+            else:
+                probs = torch.softmax(outputs, dim=1)
+                predict_y = torch.max(probs, dim=1)[1]
+                all_preds.extend(predict_y.cpu().numpy())
+                all_labels.extend(targets.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
+
+    if multi_label:
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_labels = np.concatenate(all_labels, axis=0)
+        all_probs = np.concatenate(all_probs, axis=0)
+
+        per_label_acc = ((all_preds == all_labels).mean(axis=0)).mean()
+
+        try:
+            auc = roc_auc_score(all_labels, all_probs, average='macro')
+        except ValueError:
+            auc = float('nan')
+
+        # Per-label AUCs
+        per_label_aucs = {}
+        for i in range(all_labels.shape[1]):
+            try:
+                per_label_aucs[f'auc_label_{i}'] = float(roc_auc_score(all_labels[:, i], all_probs[:, i]))
+            except ValueError:
+                per_label_aucs[f'auc_label_{i}'] = float('nan')
+
+        precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
+        recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+
+        metrics = {
+            'acc': float(per_label_acc),
+            'auc': float(auc),
+            'precision': float(precision),
+            'recall': float(recall),
+            'specificity': 0.0,
+            'f1': float(f1),
+            **per_label_aucs
+        }
+        return metrics
+
     acc = sum([1 for i in range(len(all_preds)) if all_preds[i] == all_labels[i]]) / len(all_preds)
     precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
     recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
     f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
-    
+
     conf_matrix = confusion_matrix(all_labels, all_preds)
     specificity = specificity_per_class(conf_matrix)
     avg_specificity = sum(specificity) / len(specificity) if specificity else 0.0
-    
+
     n_classes = len(conf_matrix)
     all_labels_one_hot = label_binarize(all_labels, classes=list(range(n_classes)))
-    
+
     try:
         auc = roc_auc_score(all_labels_one_hot, all_probs, multi_class='ovr')
     except ValueError:
         auc = float('nan')
-    
+
     metrics = {
         'acc': acc,
         'auc': auc,
@@ -930,7 +996,7 @@ def evaluate_model(net, test_loader, device, use_amp=False):
         'specificity': avg_specificity,
         'f1': f1
     }
-    
+
     return metrics
 
 
@@ -1336,8 +1402,8 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, baseline_model, 
     conversion_energy_kwh = conversion_metrics["energy_kwh"]
     conversion_emissions_kg = conversion_metrics["emissions_kg"]
 
-    quantized_metrics = evaluate_model(quantized_model, test_loader, DEVICE, use_amp=True)
-    baseline_metrics = evaluate_model(baseline_model, test_loader, DEVICE, use_amp=False)
+    quantized_metrics = evaluate_model(quantized_model, test_loader, DEVICE, use_amp=True, multi_label=dataset_name in MULTI_LABEL_DATASETS)
+    baseline_metrics = evaluate_model(baseline_model, test_loader, DEVICE, use_amp=False, multi_label=dataset_name in MULTI_LABEL_DATASETS)
     
     # Measure baseline energy
     baseline_energy_kwh, baseline_emissions_kg, baseline_energy_per_pred_kwh, baseline_images, baseline_pred_energy_per_image_kwh = measure_baseline_energy_averaged(
@@ -1438,20 +1504,29 @@ def quantize_model_amp(dataset_name, model_name, baseline_path, baseline_model, 
 # -------------------------
 class DistillationLoss(nn.Module):
     """Distillation loss combines soft and hard targets."""
-    def __init__(self, temperature=4.0, alpha=0.7):
+    def __init__(self, temperature=4.0, alpha=0.7, multi_label=False):
         super().__init__()
         self.temperature = temperature
         self.alpha = alpha
-        self.ce_loss = nn.CrossEntropyLoss()
-        self.kl_loss = nn.KLDivLoss(reduction='batchmean')
-    
+        self.multi_label = multi_label
+        if multi_label:
+            self.task_loss = nn.BCEWithLogitsLoss()
+        else:
+            self.ce_loss = nn.CrossEntropyLoss()
+            self.kl_loss = nn.KLDivLoss(reduction='batchmean')
+
     def forward(self, student_logits, teacher_logits, labels):
-        soft_targets = torch.softmax(teacher_logits / self.temperature, dim=1)
-        soft_student = torch.log_softmax(student_logits / self.temperature, dim=1)
-        distillation_loss = self.kl_loss(soft_student, soft_targets) * (self.temperature ** 2)
-        student_loss = self.ce_loss(student_logits, labels)
-        total_loss = self.alpha * distillation_loss + (1 - self.alpha) * student_loss
-        return total_loss
+        if self.multi_label:
+            task_loss = self.task_loss(student_logits, labels.float())
+            distill_loss = nn.functional.mse_loss(student_logits, teacher_logits)
+            return self.alpha * distill_loss + (1 - self.alpha) * task_loss
+        else:
+            soft_targets = torch.softmax(teacher_logits / self.temperature, dim=1)
+            soft_student = torch.log_softmax(student_logits / self.temperature, dim=1)
+            distillation_loss = self.kl_loss(soft_student, soft_targets) * (self.temperature ** 2)
+            student_loss = self.ce_loss(student_logits, labels)
+            total_loss = self.alpha * distillation_loss + (1 - self.alpha) * student_loss
+            return total_loss
 
 
 def train_epoch_kd(student, teacher, train_loader, optimizer, scheduler, criterion, device):
@@ -1503,8 +1578,9 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
     teacher.load_state_dict(checkpoint['model'])
     teacher.eval()
 
-    teacher_metrics = evaluate_model(teacher, test_loader, DEVICE)
-    
+    multi_label = dataset_name in MULTI_LABEL_DATASETS
+    teacher_metrics = evaluate_model(teacher, test_loader, DEVICE, multi_label=multi_label)
+
     # Measure teacher energy
     teacher_energy_kwh, teacher_emissions_kg, teacher_energy_per_pred_kwh, teacher_images, teacher_pred_energy_per_image_kwh = measure_baseline_energy_averaged(
         teacher, test_loader, save_dir, teacher_model_name, dataset_name
@@ -1516,7 +1592,7 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
     student_params = params_count(student)
     
     # Setup training
-    criterion = DistillationLoss(temperature=TEMPERATURE, alpha=ALPHA)
+    criterion = DistillationLoss(temperature=TEMPERATURE, alpha=ALPHA, multi_label=multi_label)
     optimizer = optim.AdamW(student.parameters(), lr=LR_KD, weight_decay=WEIGHT_DECAY)
     
     total_steps = EPOCHS_KD * len(train_loader)
@@ -1535,7 +1611,7 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
 
     for epoch in range(EPOCHS_KD):
         train_loss = train_epoch_kd(student, teacher, train_loader, optimizer, scheduler, criterion, DEVICE)
-        metrics = evaluate_model(student, val_loader, DEVICE)
+        metrics = evaluate_model(student, val_loader, DEVICE, multi_label=multi_label)
 
         print(f"Epoch {epoch+1}/{EPOCHS_KD}: Loss={train_loss:.4f}, Val Acc={metrics['acc']:.4f}")
 
@@ -1569,8 +1645,8 @@ def knowledge_distillation(dataset_name, teacher_model_name, student_model_name,
     # Test evaluation
     checkpoint = torch.load(save_path, map_location=DEVICE, weights_only=False)
     student.load_state_dict(checkpoint['model'])
-    test_metrics = evaluate_model(student, test_loader, DEVICE)
-    
+    test_metrics = evaluate_model(student, test_loader, DEVICE, multi_label=multi_label)
+
     # Measure student inference energy
     student_inf_proj = f"{dataset_name}_kd_{teacher_model_name}_to_{student_model_name}_inference_{int(time.time())}"
     student_tracker = start_tracker(save_dir, student_inf_proj, measure_power_secs=10)
@@ -1656,7 +1732,8 @@ def collect_importance_scores(model, pruners, train_loader, max_batches=IMPORTAN
     Uses memory-efficient processing with smaller effective batch sizes.
     """
     model.eval()
-    criterion = nn.CrossEntropyLoss()
+    criterion_ce = nn.CrossEntropyLoss()
+    criterion_bce = nn.BCEWithLogitsLoss()
 
 
     # Clear memory before starting
@@ -1688,7 +1765,10 @@ def collect_importance_scores(model, pruners, train_loader, max_batches=IMPORTAN
 
             # Forward + backward
             outputs = model(chunk_images)
-            loss = criterion(outputs, chunk_labels)
+            if chunk_labels.dim() > 1 and chunk_labels.shape[1] > 1:
+                loss = criterion_bce(outputs, chunk_labels.float())
+            else:
+                loss = criterion_ce(outputs, chunk_labels)
             loss.backward()
 
             # Collect scores
@@ -1743,7 +1823,10 @@ def train_epoch_oneshot(model, train_loader, optimizer, scheduler, epoch):
 
         optimizer.zero_grad()
         outputs = model(images)
-        loss = nn.functional.cross_entropy(outputs, labels)
+        if labels.dim() > 1 and labels.shape[1] > 1:
+            loss = nn.functional.binary_cross_entropy_with_logits(outputs, labels.float())
+        else:
+            loss = nn.functional.cross_entropy(outputs, labels)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1751,9 +1834,13 @@ def train_epoch_oneshot(model, train_loader, optimizer, scheduler, epoch):
         scheduler.step()
 
         running_loss += loss.item()
-        _, predicted = outputs.max(1)
         total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        if labels.dim() > 1 and labels.shape[1] > 1:
+            predicted = (torch.sigmoid(outputs) > 0.5).float()
+            correct += (predicted == labels).all(dim=1).sum().item()
+        else:
+            _, predicted = outputs.max(1)
+            correct += predicted.eq(labels).sum().item()
 
         train_bar.set_postfix(loss=f"{loss.item():.3f}", acc=f"{correct/total:.4f}")
 
@@ -1823,7 +1910,7 @@ def oneshot_pruning(dataset_name, model_name, baseline_path, baseline_model,
 
     for epoch in range(1, ONESHOT_RECOVERY_EPOCHS + 1):
         train_loss, train_acc = train_epoch_oneshot(deploy_model, train_loader, optimizer, scheduler, epoch)
-        val_metrics = evaluate_model(deploy_model, val_loader, DEVICE)
+        val_metrics = evaluate_model(deploy_model, val_loader, DEVICE, multi_label=dataset_name in MULTI_LABEL_DATASETS)
 
         print(f"Recovery {epoch}/{ONESHOT_RECOVERY_EPOCHS}: Val Acc={val_metrics['acc']:.4f}")
 
@@ -1841,12 +1928,12 @@ def oneshot_pruning(dataset_name, model_name, baseline_path, baseline_model,
     pruning_energy_kwh = pruning_metrics["energy_kwh"]
     pruning_emissions_kg = pruning_metrics["emissions_kg"]
 
-    test_metrics = evaluate_model(deploy_model, test_loader, DEVICE)
+    test_metrics = evaluate_model(deploy_model, test_loader, DEVICE, multi_label=dataset_name in MULTI_LABEL_DATASETS)
 
     baseline_model.to(DEVICE)
 
     # Get baseline metrics for comparison
-    baseline_metrics = evaluate_model(baseline_model, test_loader, DEVICE)
+    baseline_metrics = evaluate_model(baseline_model, test_loader, DEVICE, multi_label=dataset_name in MULTI_LABEL_DATASETS)
 
     # Measure baseline energy
     baseline_energy_kwh, baseline_emissions_kg, baseline_energy_per_pred_kwh, baseline_images, baseline_pred_energy_per_image_kwh = measure_baseline_energy_averaged(
@@ -1964,8 +2051,8 @@ def evaluate_baseline_model(model_name, baseline_path, test_loader, num_classes,
     net.eval()
     
     # Evaluate
-    metrics = evaluate_model(net, test_loader, DEVICE, use_amp=False)
-    
+    metrics = evaluate_model(net, test_loader, DEVICE, use_amp=False, multi_label=dataset_name in MULTI_LABEL_DATASETS)
+
     # Measure energy
     baseline_energy_kwh, baseline_emissions_kg, baseline_energy_per_pred_kwh, baseline_images, baseline_pred_energy_per_image_kwh = measure_baseline_energy_averaged(
         net, test_loader, save_dir, model_name, dataset_name
@@ -2059,7 +2146,7 @@ def main():
         print(f"Error: Baseline directory not found: {BASELINE_DIR}")
         sys.exit(1)
 
-    datasets = ['bloodmnist', 'pathmnist', 'dermamnist']
+    datasets = ['bloodmnist', 'pathmnist', 'dermamnist', 'chestmnist']
     baseline_models = ['vit_tiny_patch16_224', 'vit_small_patch16_224', 'vit_base_patch16_224']
     kd_pairs = [
         ('vit_base_patch16_224', 'vit_small_patch16_224'),
@@ -2088,13 +2175,8 @@ def main():
                 pass
 
         # Load dataset
-        npz_path = os.path.join(DATASET_DIR, f"{dataset}_224.npz")
-        if not os.path.exists(npz_path):
-            print(f"Dataset not found: {npz_path}")
-            continue
-
         try:
-            train_loader, val_loader, test_loader, num_classes, dataset_name = load_dataset(npz_path)
+            train_loader, val_loader, test_loader, num_classes, dataset_name = load_dataset(dataset)
         except Exception as e:
             print(f"Error loading dataset: {e}")
             continue
