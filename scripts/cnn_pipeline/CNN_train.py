@@ -31,7 +31,7 @@ except Exception:
 # -------------------------
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 NPY_DIR     = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
-SAVE_DIR    = "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1"
+SAVE_DIR    = "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1"
 
 EPOCHS = 10
 BATCH_SIZE = 32
