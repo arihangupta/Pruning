@@ -34,6 +34,8 @@ NPY_DIR     = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
 SAVE_DIR    = "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1"
 
 EPOCHS = 10
+CHEST_EPOCHS = 30
+CHEST_EARLY_STOP_PATIENCE = 5
 BATCH_SIZE = 32
 LR = 1e-3
 IMG_SIZE = 224
@@ -153,9 +155,12 @@ def make_optimizer(model: nn.Module):
     return optim.Adam(model.parameters(), lr=LR)
 
 def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
-                epochs: int, multi_label: bool = False):
+                epochs: int, multi_label: bool = False, early_stop_patience: int = 0):
     opt = make_optimizer(model)
     loss_fn = nn.BCEWithLogitsLoss() if multi_label else nn.CrossEntropyLoss()
+
+    best_auc = -1.0
+    patience_counter = 0
 
     for ep in range(epochs):
         model.train()
@@ -204,6 +209,20 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
                           f"per-label-acc {per_label_acc:.4f} exact-match {exact_match:.4f} AUC {running_auc:.4f}")
                 else:
                     print(f"  Epoch {ep+1} Batch {bidx}/{len(train_loader)} - loss {running_loss/total:.4f} acc {correct/total:.4f}")
+
+        # End-of-epoch validation for early stopping (multi-label only)
+        if multi_label and early_stop_patience > 0:
+            val_loss, val_acc, val_auc = evaluate_model(model, val_loader, multi_label=multi_label)
+            print(f"  Epoch {ep+1} Val → loss {val_loss:.4f} acc {val_acc:.4f} AUC {val_auc:.4f}")
+            if val_auc > best_auc:
+                best_auc = val_auc
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                print(f"  Early stopping counter: {patience_counter}/{early_stop_patience}")
+                if patience_counter >= early_stop_patience:
+                    print(f"  Early stopping triggered at epoch {ep+1}")
+                    break
 
 @torch.no_grad()
 def evaluate_model(model: nn.Module, loader: DataLoader,
@@ -263,8 +282,16 @@ def run_dataset(dataset_name: str):
     model = build_model(num_classes)
 
     # Baseline Training
-    print("\n--- Baseline Training ---")
-    train_model(model, train_loader, val_loader, epochs=EPOCHS, multi_label=multi_label)
+    if multi_label:
+        epochs = CHEST_EPOCHS
+        patience = CHEST_EARLY_STOP_PATIENCE
+        print(f"\n--- Baseline Training (multi-label: {epochs} epochs, early stop patience {patience}) ---")
+    else:
+        epochs = EPOCHS
+        patience = 0
+        print("\n--- Baseline Training ---")
+    train_model(model, train_loader, val_loader, epochs=epochs, multi_label=multi_label,
+                early_stop_patience=patience)
     loss, acc, auc = evaluate_model(model, test_loader, multi_label=multi_label)
     params_m = count_params(model)
     print(f"Baseline Test → Loss {loss:.4f} Acc {acc:.4f} AUC {auc:.4f} Params {params_m:.2f}M")
