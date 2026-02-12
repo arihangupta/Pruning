@@ -32,7 +32,7 @@ except ImportError:
     EmissionsTracker = None
     CODECARBON_AVAILABLE = False
 
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/multipleTrials/CNN"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/simultaneousPruning/CNN"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
