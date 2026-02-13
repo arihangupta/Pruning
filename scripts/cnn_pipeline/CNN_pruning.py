@@ -30,7 +30,7 @@ except Exception:
 # -------------------------
 # Config
 # -------------------------
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/CNN_pruned_models"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_pruned_models"
 CNN_EXP1_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1"
 NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
 MULTI_LABEL_DATASETS = {'chestmnist'}
