@@ -73,19 +73,19 @@ DATASET_BATCH_SIZES = {
 DATASETS = {
     "pathmnist": {
         "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/pathmnist_224.npz",
-        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1/pathmnist_224_baseline.pth"
+        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1/pathmnist_224_baseline.pth"
     },
     "dermamnist": {
         "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/dermamnist_224.npz",
-        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1/dermamnist_224_baseline.pth"
+        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1/dermamnist_224_baseline.pth"
     },
     "bloodmnist": {
         "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/bloodmnist_224.npz",
-        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1/bloodmnist_224_baseline.pth"
+        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1/bloodmnist_224_baseline.pth"
     },
     "chestmnist": {
         "path": "npy",  # special marker - loaded from NPY_DIR
-        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN_exp1/chestmnist_224_baseline.pth"
+        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1/chestmnist_224_baseline.pth"
     },
 }
 
