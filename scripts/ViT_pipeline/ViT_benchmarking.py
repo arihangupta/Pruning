@@ -64,7 +64,9 @@ SEED = 42
 BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/new_baseline"
 PRUNED_MODELS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/rerun/pruned_models"
 DATASETS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
+NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
 OUTPUT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/rerun/benchmarking_results"
+MULTI_LABEL_DATASETS = {'chestmnist'}
 
 
 # -------------------------
@@ -240,17 +242,19 @@ DATASETS = {
     "bloodmnist": f"{DATASETS_DIR}/bloodmnist_224.npz",
     "dermamnist": f"{DATASETS_DIR}/dermamnist_224.npz",
     "pathmnist": f"{DATASETS_DIR}/pathmnist_224.npz",
+    "chestmnist": f"{NPY_DIR}/chestmnist_224",
 }
 
 DATASET_NUM_CLASSES = {
     "bloodmnist": 8,
     "dermamnist": 7,
     "pathmnist": 9,
+    "chestmnist": 14,
 }
 
 # Benchmarking configuration - matching ResNet script structure
 MATRIX_CONFIG = {
-    "datasets": ["bloodmnist", "dermamnist", "pathmnist"],
+    "datasets": ["bloodmnist", "dermamnist", "pathmnist", "chestmnist"],
     "batch_sizes": [8, 32],
     "precisions": ["fp32", "amp"],
     "num_passes": 3,  # Number of complete passes through test set
@@ -288,16 +292,17 @@ def set_env_threads(omp_threads=4, mkl_threads=4):
 
 class NumpyMemmapDataset(torch.utils.data.Dataset):
     """Dataset wrapper for numpy memmap arrays."""
-    def __init__(self, imgs_np, labels_np, img_size=224):
+    def __init__(self, imgs_np, labels_np, img_size=224, multi_label=False):
         self.imgs = imgs_np
         self.labels = labels_np
         self.img_size = img_size
+        self.multi_label = multi_label
         self.base_tfms = T.Compose([
             T.ToPILImage(),
             T.Resize((img_size, img_size)),
             T.ToTensor(),
         ])
-        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], 
+        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
     def __len__(self):
@@ -305,7 +310,10 @@ class NumpyMemmapDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         img = self.imgs[idx]
-        label = int(self.labels[idx])
+        if self.multi_label:
+            label = torch.FloatTensor(np.array(self.labels[idx]))
+        else:
+            label = int(self.labels[idx])
         x = self.base_tfms(img)
         if x.shape[0] == 1:
             x = x.repeat(3, 1, 1)
@@ -313,21 +321,28 @@ class NumpyMemmapDataset(torch.utils.data.Dataset):
         return x, label
 
 
-def make_test_loader(npz_path, batch_size):
-    """Load test dataset."""
-    data = np.load(npz_path, mmap_mode="r")
-    X_test = data["test_images"]
-    y_test = data["test_labels"].flatten()
-    
-    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE)
+def make_test_loader(dataset_name, dataset_path, batch_size):
+    """Load test dataset. Handles both NPZ and NPY (multi-label) formats."""
+    multi_label = dataset_name in MULTI_LABEL_DATASETS
+
+    if multi_label:
+        # Load from NPY directory
+        X_test = np.load(os.path.join(dataset_path, "test_images.npy"), mmap_mode="r")
+        y_test = np.load(os.path.join(dataset_path, "test_labels.npy"), mmap_mode="r")
+    else:
+        data = np.load(dataset_path, mmap_mode="r")
+        X_test = data["test_images"]
+        y_test = data["test_labels"].flatten()
+
+    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, multi_label=multi_label)
     test_loader = DataLoader(
-        test_ds, 
-        batch_size=batch_size, 
+        test_ds,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=MATRIX_CONFIG["num_workers"],
         pin_memory=MATRIX_CONFIG["pin_memory"]
     )
-    
+
     return test_loader, len(test_ds)
 
 
@@ -683,7 +698,8 @@ def bench_fixed_passes(config):
             logger.error(f"Error checking GPU memory: {e}")
     
     # Load dataset
-    test_loader, dataset_size = make_test_loader(dataset_path, batch_size)
+    multi_label = dataset_name in MULTI_LABEL_DATASETS
+    test_loader, dataset_size = make_test_loader(dataset_name, dataset_path, batch_size)
     num_classes = DATASET_NUM_CLASSES[dataset_name]
     
     # Load model
@@ -777,14 +793,17 @@ def bench_fixed_passes(config):
                 # Collect predictions for AUC
                 if outputs.dtype == torch.float16:
                     outputs = outputs.float()
-                
+
                 outputs = torch.clamp(outputs, min=-100, max=100)
-                probs = torch.softmax(outputs, dim=1)
-                probs_np = probs.cpu().numpy()
-                
-                # Normalize probabilities
-                probs_sum = probs_np.sum(axis=1, keepdims=True)
-                probs_np = probs_np / probs_sum
+                if multi_label:
+                    probs = torch.sigmoid(outputs)
+                    probs_np = probs.cpu().numpy()
+                else:
+                    probs = torch.softmax(outputs, dim=1)
+                    probs_np = probs.cpu().numpy()
+                    # Normalize probabilities
+                    probs_sum = probs_np.sum(axis=1, keepdims=True)
+                    probs_np = probs_np / probs_sum
                 
                 # Check for invalid values
                 if np.any(np.isnan(probs_np)) or np.any(np.isinf(probs_np)):
@@ -806,13 +825,16 @@ def bench_fixed_passes(config):
         all_probs = np.concatenate(probs_list)
         all_labels = np.concatenate(labels_list)
         try:
-            auc = roc_auc_score(
-                all_labels,
-                all_probs,
-                multi_class="ovr",
-                average='weighted',
-                labels=list(range(num_classes))
-            )
+            if multi_label:
+                auc = roc_auc_score(all_labels, all_probs, average='macro')
+            else:
+                auc = roc_auc_score(
+                    all_labels,
+                    all_probs,
+                    multi_class="ovr",
+                    average='weighted',
+                    labels=list(range(num_classes))
+                )
         except Exception as e:
             logger.error(f"AUC calculation failed: {e}")
     

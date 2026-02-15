@@ -72,12 +72,15 @@ from torchvision.models.resnet import Bottleneck
 # Constants
 IMG_SIZE = 224
 SEED = 42
+NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
+MULTI_LABEL_DATASETS = {'chestmnist'}
 DATASETS = {
     "bloodmnist": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/bloodmnist_224.npz",
     "dermamnist": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/dermamnist_224.npz",
     "octmnist": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/octmnist_224.npz",
     "pathmnist": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/pathmnist_224.npz",
     "tissuemnist": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/tissuemnist_224.npz",
+    "chestmnist": f"{NPY_DIR}/chestmnist_224",
 }
 SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_pruned_models"
 ORIGINAL_PLANES = [64, 128, 256, 512]
@@ -86,10 +89,11 @@ DATASET_NUM_CLASSES = {
     "dermamnist": 7,
     "octmnist": 4,
     "pathmnist": 9,
-    "tissuemnist": 8
+    "tissuemnist": 8,
+    "chestmnist": 14,
 }
 MATRIX_CONFIG = {
-    "datasets": ["bloodmnist", "dermamnist", "pathmnist"],
+    "datasets": ["bloodmnist", "dermamnist", "pathmnist", "chestmnist"],
     "log_dir": "/home/arihangupta/Pruning/dinov2/Pruning/CNN/timing_exps",
     "num_passes": 3,  # Number of full passes through the test dataset
     "warmup_batches": 50,
@@ -386,11 +390,12 @@ def set_env_threads(omp_threads=4, mkl_threads=4):
     os.environ['PYTHONHASHSEED'] = '0'
 
 class NumpyMemmapDataset(torch.utils.data.Dataset):
-    def __init__(self, imgs_np, labels_np, img_size=224, in_channels=3):
+    def __init__(self, imgs_np, labels_np, img_size=224, in_channels=3, multi_label=False):
         self.imgs = imgs_np
         self.labels = labels_np
         self.img_size = img_size
         self.in_channels = in_channels
+        self.multi_label = multi_label
         self.base_tfms = T.Compose([
             T.ToPILImage(),
             T.Resize((img_size, img_size)),
@@ -403,18 +408,27 @@ class NumpyMemmapDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         img = self.imgs[idx]
-        label = int(self.labels[idx])
+        if self.multi_label:
+            label = torch.FloatTensor(np.array(self.labels[idx]))
+        else:
+            label = int(self.labels[idx])
         x = self.base_tfms(img)
         if x.shape[0] == 1:
             x = x.repeat(3, 1, 1)
         x = self.normalize(x)
         return x, label
 
-def make_test_loader(npz_path, batch_size):
-    data = np.load(npz_path, mmap_mode="r")
-    X_test, y_test = data["test_images"], data["test_labels"].flatten()
-    in_channels = get_dataset_channels(npz_path)
-    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, in_channels=in_channels)
+def make_test_loader(dataset_name, dataset_path, batch_size):
+    multi_label = dataset_name in MULTI_LABEL_DATASETS
+    if multi_label:
+        X_test = np.load(os.path.join(dataset_path, "test_images.npy"), mmap_mode="r")
+        y_test = np.load(os.path.join(dataset_path, "test_labels.npy"), mmap_mode="r")
+        in_channels = X_test[0].shape[-1] if X_test[0].ndim == 3 else 1
+    else:
+        data = np.load(dataset_path, mmap_mode="r")
+        X_test, y_test = data["test_images"], data["test_labels"].flatten()
+        in_channels = get_dataset_channels(dataset_path)
+    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, in_channels=in_channels, multi_label=multi_label)
     return DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True), in_channels, len(test_ds)
 
 def load_model(config, num_classes, dataset_name):
@@ -551,7 +565,8 @@ def bench_fixed_passes(config):
         except Exception as e:
             print(f"Error checking GPU memory: {e}")
 
-    test_loader, in_channels, dataset_size = make_test_loader(dataset_path, batch_size)
+    multi_label = dataset_name in MULTI_LABEL_DATASETS
+    test_loader, in_channels, dataset_size = make_test_loader(dataset_name, dataset_path, batch_size)
 
     num_classes = get_num_classes(dataset_name, dataset_path)
     try:
@@ -613,10 +628,14 @@ def bench_fixed_passes(config):
                 if outputs.dtype == torch.half:
                     outputs = outputs.float()
                 outputs = torch.clamp(outputs, min=-100, max=100)
-                probs = torch.softmax(outputs, dim=1)
-                probs_np = probs.cpu().numpy()
-                prob_sums = np.sum(probs_np, axis=1, keepdims=True)
-                probs_np = probs_np / prob_sums
+                if multi_label:
+                    probs = torch.sigmoid(outputs)
+                    probs_np = probs.cpu().numpy()
+                else:
+                    probs = torch.softmax(outputs, dim=1)
+                    probs_np = probs.cpu().numpy()
+                    prob_sums = np.sum(probs_np, axis=1, keepdims=True)
+                    probs_np = probs_np / prob_sums
                 if np.any(np.isnan(probs_np)) or np.any(np.isinf(probs_np)):
                     continue
                 probs_list.append(probs_np)
@@ -642,12 +661,15 @@ def bench_fixed_passes(config):
         all_probs = np.concatenate(probs_list)
         all_labels = np.concatenate(labels_list)
         try:
-            auc = roc_auc_score(
-                all_labels,
-                all_probs,
-                multi_class="ovr",
-                labels=list(range(num_classes))
-            )
+            if multi_label:
+                auc = roc_auc_score(all_labels, all_probs, average='macro')
+            else:
+                auc = roc_auc_score(
+                    all_labels,
+                    all_probs,
+                    multi_class="ovr",
+                    labels=list(range(num_classes))
+                )
         except Exception as e:
             print(f"AUC calculation failed: {e}")
 
