@@ -741,6 +741,18 @@ def run_matrix(matrix_config):
         print(f"Starting dataset: {dataset}")
         print(f"Found {len(dataset_models)} models: {[m['model_name'] for m in dataset_models]}")
 
+        # Load existing results to check what has already been benchmarked
+        results_csv = log_base / f"{dataset}_results.csv"
+        existing_runs = set()
+        if os.path.exists(results_csv):
+            try:
+                existing_df = pd.read_csv(results_csv)
+                for _, row in existing_df.iterrows():
+                    key = (row['model_name'], row['batch_size'], row['runtime_precision'], row['rep'])
+                    existing_runs.add(key)
+            except Exception:
+                pass
+
         for rep in range(repeats):
             print(f"Starting repeat {rep+1}/{repeats} for {dataset}")
             random.seed(seed + rep)
@@ -753,13 +765,20 @@ def run_matrix(matrix_config):
                     model_precisions = ['amp']
                 else:
                     model_precisions = precisions
-                
+
                 for bs, prec in product(batch_sizes, model_precisions):
                     conditions.append((midx, bs, prec))
             random.shuffle(conditions)
 
             for midx, bs, prec in conditions:
                 model_cfg = dataset_models[midx]
+
+                # Check if this combination already has results
+                run_key = (model_cfg['model_name'], bs, prec, rep)
+                if run_key in existing_runs:
+                    print(f"Skipping (already exists): {model_cfg['model_name']}, bs={bs}, prec={prec}, rep={rep}")
+                    continue
+
                 exp_cfg = {
                     'model_name': model_cfg['model_name'],
                     'pruning_method': model_cfg['pruning_method'],
