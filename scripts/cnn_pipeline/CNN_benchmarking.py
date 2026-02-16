@@ -163,8 +163,11 @@ def build_model(num_classes: int, stage_planes=[64, 128, 256, 512]):
 
 def get_dataset_channels(npz_path):
     try:
-        data = np.load(npz_path, mmap_mode="r")
-        test_images = data["test_images"]
+        if os.path.isdir(npz_path):
+            test_images = np.load(os.path.join(npz_path, "test_images.npy"), mmap_mode="r")
+        else:
+            data = np.load(npz_path, mmap_mode="r")
+            test_images = data["test_images"]
         sample_img = test_images[0]
         if sample_img.ndim == 3:
             return sample_img.shape[-1]
