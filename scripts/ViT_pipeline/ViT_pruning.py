@@ -41,8 +41,8 @@ except Exception:
 # -------------------------
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
-BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/new_baseline"
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/rerun/pruned_models"
+BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/new_baseline"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/rerun/pruned_models"
 EPOCHS_KD = 50  # Epochs for knowledge distillation
 BATCH_SIZE = 64
 LR_KD = 0.0005  # Learning rate for student
@@ -941,6 +941,7 @@ def evaluate_model(net, test_loader, device, use_amp=False, multi_label=False):
         all_labels = np.concatenate(all_labels, axis=0)
         all_probs = np.concatenate(all_probs, axis=0)
 
+        num_labels = all_labels.shape[1]
         per_label_acc = ((all_preds == all_labels).mean(axis=0)).mean()
 
         try:
@@ -950,24 +951,36 @@ def evaluate_model(net, test_loader, device, use_amp=False, multi_label=False):
 
         # Per-label AUCs
         per_label_aucs = {}
-        for i in range(all_labels.shape[1]):
+        per_label_accs = {}
+        for i in range(num_labels):
             try:
                 per_label_aucs[f'auc_label_{i}'] = float(roc_auc_score(all_labels[:, i], all_probs[:, i]))
             except ValueError:
                 per_label_aucs[f'auc_label_{i}'] = float('nan')
+            per_label_accs[f'acc_label_{i}'] = float((all_preds[:, i] == all_labels[:, i]).mean())
 
         precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
         recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
         f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+
+        # Per-label specificity
+        per_label_specificity = []
+        for i in range(num_labels):
+            tn = ((all_preds[:, i] == 0) & (all_labels[:, i] == 0)).sum()
+            fp = ((all_preds[:, i] == 1) & (all_labels[:, i] == 0)).sum()
+            spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            per_label_specificity.append(spec)
+        avg_specificity = float(np.mean(per_label_specificity))
 
         metrics = {
             'acc': float(per_label_acc),
             'auc': float(auc),
             'precision': float(precision),
             'recall': float(recall),
-            'specificity': 0.0,
+            'specificity': avg_specificity,
             'f1': float(f1),
-            **per_label_aucs
+            **per_label_aucs,
+            **per_label_accs
         }
         return metrics
 
@@ -2124,6 +2137,27 @@ def save_results_to_csv(results_list, dataset_name, save_dir):
     df = pd.DataFrame(results_list)
     df.to_csv(csv_path, index=False)
     print(f"Results saved to {csv_path}")
+
+    # Save per-label metrics to separate CSV for multi-label datasets
+    auc_label_cols = [c for c in df.columns if c.startswith('auc_label_')]
+    acc_label_cols = [c for c in df.columns if c.startswith('acc_label_')]
+    if auc_label_cols:
+        per_label_rows = []
+        for _, row in df.iterrows():
+            for col in auc_label_cols:
+                label_idx = col.replace('auc_label_', '')
+                acc_col = f'acc_label_{label_idx}'
+                per_label_rows.append({
+                    'dataset': dataset_name,
+                    'variant': row.get('Variant', ''),
+                    'label_idx': int(label_idx),
+                    'auc': row[col],
+                    'acc': row.get(acc_col, float('nan')),
+                })
+        if per_label_rows:
+            per_label_csv = os.path.join(save_dir, f"{dataset_name}_per_label_metrics.csv")
+            pd.DataFrame(per_label_rows).to_csv(per_label_csv, index=False)
+            print(f"Per-label metrics saved to {per_label_csv}")
 
 
 def main():

@@ -31,7 +31,7 @@ except Exception:
 # -------------------------
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 NPY_DIR     = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
-SAVE_DIR    = "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1"
+SAVE_DIR    = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/CNN_exp1"
 
 EPOCHS = 10
 CHEST_EPOCHS = 30
@@ -212,7 +212,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
 
         # End-of-epoch validation for early stopping (multi-label only)
         if multi_label and early_stop_patience > 0:
-            val_loss, val_acc, val_auc = evaluate_model(model, val_loader, multi_label=multi_label)
+            val_loss, val_acc, val_auc, _ = evaluate_model(model, val_loader, multi_label=multi_label)
             print(f"  Epoch {ep+1} Val → loss {val_loss:.4f} acc {val_acc:.4f} AUC {val_auc:.4f}")
             if val_auc > best_auc:
                 best_auc = val_auc
@@ -260,13 +260,31 @@ def evaluate_model(model: nn.Module, loader: DataLoader,
             labels_all = np.concatenate(labels_list, axis=0)
             if multi_label:
                 auc = roc_auc_score(labels_all, probs_all, average="macro")
+                # Per-label metrics
+                num_labels = labels_all.shape[1]
+                per_label_auc = []
+                per_label_acc = []
+                preds_all = (probs_all > 0.5).astype(float)
+                for i in range(num_labels):
+                    try:
+                        per_label_auc.append(float(roc_auc_score(labels_all[:, i], probs_all[:, i])))
+                    except ValueError:
+                        per_label_auc.append(float('nan'))
+                    per_label_acc.append(float((preds_all[:, i] == labels_all[:, i]).mean()))
+                per_label_metrics = {
+                    'per_label_auc': per_label_auc,
+                    'per_label_acc': per_label_acc,
+                }
             else:
                 auc = roc_auc_score(labels_all, probs_all, multi_class="ovr", average="macro")
+                per_label_metrics = None
         except Exception:
             auc = float('nan')
+            per_label_metrics = None
     else:
         auc = float('nan')
-    return avg_loss, acc, auc
+        per_label_metrics = None
+    return avg_loss, acc, auc, per_label_metrics
 
 def count_params(model: nn.Module) -> float:
     """Returns number of parameters in millions."""
@@ -292,7 +310,7 @@ def run_dataset(dataset_name: str):
         print("\n--- Baseline Training ---")
     train_model(model, train_loader, val_loader, epochs=epochs, multi_label=multi_label,
                 early_stop_patience=patience)
-    loss, acc, auc = evaluate_model(model, test_loader, multi_label=multi_label)
+    loss, acc, auc, per_label_metrics = evaluate_model(model, test_loader, multi_label=multi_label)
     params_m = count_params(model)
     print(f"Baseline Test → Loss {loss:.4f} Acc {acc:.4f} AUC {auc:.4f} Params {params_m:.2f}M")
 
@@ -314,6 +332,23 @@ def run_dataset(dataset_name: str):
             "params_m": params_m,
             "multi_label": multi_label
         })
+
+    # Save per-label metrics for multi-label datasets
+    if multi_label and per_label_metrics is not None:
+        per_label_csv_path = os.path.join(SAVE_DIR, f"{ds_name}_per_label_metrics.csv")
+        with open(per_label_csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["dataset", "label_idx", "auc", "acc"])
+            writer.writeheader()
+            num_labels = len(per_label_metrics['per_label_auc'])
+            for i in range(num_labels):
+                writer.writerow({
+                    "dataset": ds_name,
+                    "label_idx": i,
+                    "auc": per_label_metrics['per_label_auc'][i],
+                    "acc": per_label_metrics['per_label_acc'][i],
+                })
+        print(f"Per-label metrics saved to {per_label_csv_path}")
+        print(f"Per-label AUC: {[f'{a:.4f}' for a in per_label_metrics['per_label_auc']]}")
 
 # -------------------------
 # Main

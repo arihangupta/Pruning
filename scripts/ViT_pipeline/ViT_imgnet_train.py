@@ -18,7 +18,7 @@ import csv
 # -------------------------
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
-SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/new_baseline"
+SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Visionnew_baseline"
 EPOCHS = 50
 BATCH_SIZE = 64
 LR = 0.001
@@ -317,10 +317,21 @@ def evaluate_model(net, test_loader, device, multi_label=False):
         all_labels = np.concatenate(all_labels, axis=0)
         all_probs = np.concatenate(all_probs, axis=0)
 
-        # Per-label accuracy, averaged
-        per_label_acc = ((all_preds == all_labels).mean(axis=0)).mean()
+        num_labels = all_labels.shape[1]
+
+        # Per-label accuracy
+        per_label_acc_array = (all_preds == all_labels).mean(axis=0)  # array of length num_labels
+        per_label_acc = float(per_label_acc_array.mean())  # scalar average
         # Exact match ratio (subset accuracy)
         exact_match = (all_preds == all_labels).all(axis=1).mean()
+
+        # Per-label AUC
+        per_label_auc = []
+        for i in range(num_labels):
+            try:
+                per_label_auc.append(roc_auc_score(all_labels[:, i], all_probs[:, i]))
+            except ValueError:
+                per_label_auc.append(float('nan'))
 
         try:
             auc = roc_auc_score(all_labels, all_probs, average='macro')
@@ -331,14 +342,41 @@ def evaluate_model(net, test_loader, device, multi_label=False):
         recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
         f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
 
+        # Per-label specificity: TN / (TN + FP) for each label
+        per_label_specificity = []
+        per_label_precision = []
+        per_label_recall = []
+        per_label_f1 = []
+        for i in range(num_labels):
+            tn = ((all_preds[:, i] == 0) & (all_labels[:, i] == 0)).sum()
+            fp = ((all_preds[:, i] == 1) & (all_labels[:, i] == 0)).sum()
+            tp = ((all_preds[:, i] == 1) & (all_labels[:, i] == 1)).sum()
+            fn = ((all_preds[:, i] == 0) & (all_labels[:, i] == 1)).sum()
+            spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1_i = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+            per_label_specificity.append(spec)
+            per_label_precision.append(prec)
+            per_label_recall.append(rec)
+            per_label_f1.append(f1_i)
+
+        avg_specificity = float(np.mean(per_label_specificity))
+
         metrics = {
             'acc': float(per_label_acc),
             'exact_match': float(exact_match),
             'auc': float(auc),
             'precision': float(precision),
             'recall': float(recall),
-            'specificity': 0.0,
-            'f1': float(f1)
+            'specificity': avg_specificity,
+            'f1': float(f1),
+            'per_label_auc': per_label_auc,
+            'per_label_acc': per_label_acc_array.tolist(),
+            'per_label_precision': per_label_precision,
+            'per_label_recall': per_label_recall,
+            'per_label_f1': per_label_f1,
+            'per_label_specificity': per_label_specificity,
         }
         return metrics
 
@@ -519,6 +557,35 @@ def train(dataset_name, model_name, train_loader, val_loader, test_loader, num_c
         writer.writerow(results)
 
     print(f"Test results saved to {csv_path}")
+
+    # Save per-label metrics for multi-label datasets
+    if multi_label and 'per_label_auc' in test_metrics:
+        per_label_csv_path = os.path.join(SAVE_DIR, "test_results_per_label.csv")
+        per_label_exists = os.path.isfile(per_label_csv_path)
+        num_labels = len(test_metrics['per_label_auc'])
+
+        with open(per_label_csv_path, mode='a', newline='') as csv_file:
+            fieldnames = ['dataset', 'model', 'strategy', 'label_idx',
+                          'auc', 'acc', 'precision', 'recall', 'f1', 'specificity']
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            if not per_label_exists:
+                writer.writeheader()
+            for i in range(num_labels):
+                writer.writerow({
+                    'dataset': dataset_name,
+                    'model': model_name,
+                    'strategy': strategy,
+                    'label_idx': i,
+                    'auc': test_metrics['per_label_auc'][i],
+                    'acc': test_metrics['per_label_acc'][i],
+                    'precision': test_metrics['per_label_precision'][i],
+                    'recall': test_metrics['per_label_recall'][i],
+                    'f1': test_metrics['per_label_f1'][i],
+                    'specificity': test_metrics['per_label_specificity'][i],
+                })
+
+        print(f"Per-label metrics saved to {per_label_csv_path}")
+        print(f"Per-label AUC: {[f'{a:.4f}' for a in test_metrics['per_label_auc']]}")
 
 
 

@@ -30,8 +30,8 @@ except Exception:
 # -------------------------
 # Config
 # -------------------------
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_pruned_models"
-CNN_EXP1_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/CNN_pruned_models"
+CNN_EXP1_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/CNN_exp1"
 NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
 MULTI_LABEL_DATASETS = {'chestmnist'}
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -73,19 +73,19 @@ DATASET_BATCH_SIZES = {
 DATASETS = {
     "pathmnist": {
         "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/pathmnist_224.npz",
-        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1/pathmnist_224_baseline.pth"
+        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/CNN_exp1/pathmnist_224_baseline.pth"
     },
     "dermamnist": {
         "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/dermamnist_224.npz",
-        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1/dermamnist_224_baseline.pth"
+        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/CNN_exp1/dermamnist_224_baseline.pth"
     },
     "bloodmnist": {
         "path": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/bloodmnist_224.npz",
-        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1/bloodmnist_224_baseline.pth"
+        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/CNN_exp1/bloodmnist_224_baseline.pth"
     },
     "chestmnist": {
         "path": "npy",  # special marker - loaded from NPY_DIR
-        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_exp1/chestmnist_224_baseline.pth"
+        "baseline": "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/CNN_exp1/chestmnist_224_baseline.pth"
     },
 }
 
@@ -484,7 +484,22 @@ def evaluate_model_basic(model, loader, dataset_name="", variant="", multi_label
         except Exception as e:
             print(f"    AUC calculation failed for {variant}: {e}")
             auc = float("nan")
-        return loss_avg, acc, auc
+        # Per-label metrics
+        num_labels = labels.shape[1]
+        preds_all = (probs > 0.5).astype(float)
+        per_label_auc_list = []
+        per_label_acc_list = []
+        for i in range(num_labels):
+            try:
+                per_label_auc_list.append(float(roc_auc_score(labels[:, i], probs[:, i])))
+            except Exception:
+                per_label_auc_list.append(float('nan'))
+            per_label_acc_list.append(float((preds_all[:, i] == labels[:, i]).mean()))
+        per_label_metrics = {
+            'per_label_auc': per_label_auc_list,
+            'per_label_acc': per_label_acc_list,
+        }
+        return loss_avg, acc, auc, per_label_metrics
     else:
         labels = np.concatenate(labels_list)
         probs = np.concatenate(probs_list)
@@ -510,7 +525,7 @@ def evaluate_model_basic(model, loader, dataset_name="", variant="", multi_label
             print(f"    AUC calculation failed for {variant}: {e}")
             auc = float("nan")
 
-        return loss_avg, acc, auc
+        return loss_avg, acc, auc, None
 
 def count_zeros_and_total(model):
     total = 0; zeros = 0
@@ -636,7 +651,7 @@ def measure_prediction_energy(model, test_loader, save_dir, project_name, num_im
     return energy_per_image_kwh, emissions_kg
 
 def collect_metrics_row(variant, stage, ratio, model, test_loader, path_hint, dataset_name="", multi_label=False):
-    loss, acc, auc = evaluate_model_basic(model, test_loader, dataset_name, variant, multi_label=multi_label)
+    loss, acc, auc, per_label_metrics = evaluate_model_basic(model, test_loader, dataset_name, variant, multi_label=multi_label)
     zeros, total = count_zeros_and_total(model) if "quantization" not in variant and "fp16" not in variant else (0, params_count(model))
     params = params_count(model)
     flops = compute_flops(model)
@@ -659,7 +674,8 @@ def collect_metrics_row(variant, stage, ratio, model, test_loader, path_hint, da
         "ModelSizeMB": size_mb, "FLOPs_per_image": flops, "FLOPs_M_per_image": flops_m,
         "InferenceTime_per_batch_s": avg_time, "PeakRAM_MB": peak_ram,
         "PowerProxy_MFLOPs": power_m, "ModelPath": path_hint,
-        "ImagesProcessedDuringTiming": images_processed
+        "ImagesProcessedDuringTiming": images_processed,
+        "per_label_metrics": per_label_metrics
     }
 
 # -------------------------
@@ -1532,6 +1548,28 @@ def process_dataset_safely(dataset_name, cfg):
                     cleanup_memory()
 
         df = pd.DataFrame(rows)
+        # Save per-label metrics for multi-label datasets
+        if multi_label:
+            per_label_rows = []
+            for row in rows:
+                plm = row.get("per_label_metrics")
+                if plm is not None:
+                    num_labels = len(plm['per_label_auc'])
+                    for i in range(num_labels):
+                        per_label_rows.append({
+                            "dataset": dataset_name,
+                            "variant": row.get("Variant", ""),
+                            "stage": row.get("Stage", ""),
+                            "label_idx": i,
+                            "auc": plm['per_label_auc'][i],
+                            "acc": plm['per_label_acc'][i],
+                        })
+            if per_label_rows:
+                per_label_csv = os.path.join(SAVE_DIR, f"{dataset_name}_per_label_metrics.csv")
+                pd.DataFrame(per_label_rows).to_csv(per_label_csv, index=False)
+                print(f"Per-label metrics saved to {per_label_csv}")
+        if 'per_label_metrics' in df.columns:
+            df = df.drop(columns=['per_label_metrics'])
         df.to_csv(csv_path, index=False)
         print(f"\nResults saved to {csv_path}")
         print(f"Dataset {dataset_name} completed successfully.")
