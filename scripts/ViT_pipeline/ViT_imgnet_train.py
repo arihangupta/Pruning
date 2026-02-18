@@ -18,7 +18,7 @@ import csv
 # -------------------------
 DATASET_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
-SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Visionnew_baseline"
+SAVE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/new_baseline"
 EPOCHS = 50
 BATCH_SIZE = 64
 LR = 0.001
