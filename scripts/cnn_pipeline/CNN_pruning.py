@@ -4,6 +4,7 @@ import math
 import random
 import tempfile
 import copy
+import logging
 import numpy as np
 import pandas as pd
 import torch
@@ -22,6 +23,7 @@ import gc
 try:
     from codecarbon import EmissionsTracker
     CODECARBON_AVAILABLE = True
+    logging.getLogger("codecarbon").setLevel(logging.ERROR)
 except Exception:
     EmissionsTracker = None
     CODECARBON_AVAILABLE = False
@@ -714,10 +716,10 @@ def calibrate_stage(model, stage_name, train_loader, epochs=CAL_EPOCHS, max_batc
                 _, preds = out.max(1)
                 total += labels.size(0); correct += int(preds.eq(labels).sum().item())
             steps += 1
-            if bidx % LOG_INTERVAL == 0:
-                print(f"      Calib {stage_name} ep{ep+1} batch{bidx} - loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
             if steps >= max_batches:
+                print(f"      Calib {stage_name} ep{ep+1}: loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
                 return model
+        print(f"      Calib {stage_name} ep{ep+1}: loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
     return model
 
 # -------------------------
@@ -781,11 +783,8 @@ def distill_student(student: nn.Module, teacher: nn.Module, train_loader: DataLo
                 _, preds = s_logits.max(1)
                 correct += int(preds.eq(labels).sum().item())
             total += labels.size(0)
-            if bidx % LOG_INTERVAL == 0:
-                avg_loss = running_loss/max(1,total)
-                avg_acc = correct/max(1,total)
-                print(f"      KD ep{ep+1} batch{bidx} - loss {avg_loss:.4f}, acc {avg_acc:.4f}")
-    
+        print(f"      KD ep{ep+1}/{epochs}: loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
+
     student.eval()
     return student
 
@@ -806,7 +805,7 @@ def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCH
     
     for ep in range(epochs):
         running_loss = 0.0; total = 0; correct = 0
-        for bidx, (imgs, labels) in enumerate(train_loader, 1):
+        for imgs, labels in train_loader:
             imgs = imgs.to(DEVICE)
             labels = labels.to(DEVICE)
             opt.zero_grad()
@@ -822,10 +821,8 @@ def global_finetune(model, train_loader, val_loader, epochs=FINAL_FINETUNE_EPOCH
             else:
                 _, preds = out.max(1)
                 total += labels.size(0); correct += int(preds.eq(labels).sum().item())
-            if bidx % LOG_INTERVAL == 0:
-                print(f"    Global FT ep{ep+1} batch{bidx} - loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f}")
-        vloss, vacc, vauc = evaluate_model_basic(model, val_loader, multi_label=multi_label)
-        print(f"    Global FT epoch {ep+1}: ValLoss {vloss:.4f}, ValAcc {vacc:.4f}, ValAUC {vauc:.4f}")
+        vloss, vacc, vauc, _ = evaluate_model_basic(model, val_loader, multi_label=multi_label)
+        print(f"    Global FT ep{ep+1}/{epochs}: loss {running_loss/max(1,total):.4f}, acc {correct/max(1,total):.4f} | Val loss {vloss:.4f}, acc {vacc:.4f}, AUC {vauc:.4f}")
     
     if is_fp16:
         print("    Converting model back to FP16 after finetuning...")
@@ -890,7 +887,8 @@ def start_tracker(save_dir: str, project_name: str, output_file: str="emissions.
         output_dir=save_dir,
         output_file=output_file,
         measure_power_secs=measure_power_secs,
-        save_to_file=True
+        save_to_file=True,
+        log_level="error",
     )
     tracker.start()
     return tracker
