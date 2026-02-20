@@ -82,7 +82,7 @@ DATASETS = {
     "tissuemnist": "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced/tissuemnist_224.npz",
     "chestmnist": f"{NPY_DIR}/chestmnist_224",
 }
-SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/CNN/CNN_pruned_models"
+SAVE_DIR_BASE = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/CNN_pruned_models"
 ORIGINAL_PLANES = [64, 128, 256, 512]
 DATASET_NUM_CLASSES = {
     "bloodmnist": 8,
@@ -94,7 +94,7 @@ DATASET_NUM_CLASSES = {
 }
 MATRIX_CONFIG = {
     "datasets": ["bloodmnist", "dermamnist", "pathmnist", "chestmnist"],
-    "log_dir": "/home/arihangupta/Pruning/dinov2/Pruning/CNN/timing_exps",
+    "log_dir": "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/timing_exps",
     "num_passes": 3,  # Number of full passes through the test dataset
     "warmup_batches": 50,
     "seed": 42,

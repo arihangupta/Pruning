@@ -38,7 +38,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/home/arihangupta/Pruning/dinov2/Pruning/Vision/vit_benchmark_debug.log'),
+        logging.FileHandler('/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/vit_benchmark_debug.log'),
     ]
 )
 logger = logging.getLogger(__name__)
@@ -61,11 +61,11 @@ if CODECARBON_AVAILABLE:
 # Constants
 IMG_SIZE = 224
 SEED = 42
-BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/new_baseline"
-PRUNED_MODELS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/rerun/pruned_models"
+BASELINE_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/new_baseline"
+PRUNED_MODELS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/rerun/pruned_models"
 DATASETS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
 NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
-OUTPUT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/Vision/rerun/benchmarking_results"
+OUTPUT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/rerun/benchmarking_results"
 MULTI_LABEL_DATASETS = {'chestmnist'}
 
 
