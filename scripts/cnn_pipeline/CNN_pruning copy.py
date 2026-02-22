@@ -501,7 +501,6 @@ def evaluate_model_basic(model, loader, dataset_name="", variant="", multi_label
             'per_label_auc': per_label_auc_list,
             'per_label_acc': per_label_acc_list,
         }
-        acc = float(np.mean(per_label_acc_list))  # mean per-label accuracy (not exact match)
         return loss_avg, acc, auc, per_label_metrics
     else:
         labels = np.concatenate(labels_list)
