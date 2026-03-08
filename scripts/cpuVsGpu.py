@@ -31,13 +31,12 @@ Usage:
 import argparse
 import csv
 import gc
-import hashlib
 import logging
 import os
 import random
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -67,7 +66,19 @@ VIT_BASELINE_ROOT = Path(
 VIT_PRUNED_ROOT = Path(
     "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/rerun/pruned_models"
 )
-MEDMNIST_ROOT = Path("/home/arihangupta/Pruning/dinov2/data")  # contains *.npz / *.npy
+
+# Per-dataset data paths — NPZ for most, NPY directory for chestmnist
+_DATASETS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
+_NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
+
+DATASET_PATHS = {
+    "bloodmnist": Path(f"{_DATASETS_DIR}/bloodmnist_224.npz"),
+    "dermamnist":  Path(f"{_DATASETS_DIR}/dermamnist_224.npz"),
+    "pathmnist":   Path(f"{_DATASETS_DIR}/pathmnist_224.npz"),
+    # chestmnist is stored as separate NPY files in a directory
+    "chestmnist":  Path(f"{_NPY_DIR}/chestmnist_224"),
+}
+MULTI_LABEL_DATASETS = {"chestmnist"}
 
 DATASETS = ["bloodmnist", "dermamnist", "pathmnist", "chestmnist"]
 
@@ -83,27 +94,46 @@ NUM_CLASSES = {
 # Dataset helpers
 # ---------------------------------------------------------------------------
 
-def load_test_images(dataset: str, n: int, seed: int) -> torch.Tensor:
+def load_test_images(dataset: str, n: int, seed: int) -> list:
     """
     Load `n` random test images from the MedMNIST dataset.
 
-    Tries NPZ first (MedMNIST v2 standard), falls back to NPY.
-    Returns a list of (original_idx, tensor) tuples where tensor shape is
-    (1, C, H, W), normalised to [0, 1] (float32), for one-at-a-time inference.
-    """
-    npz_path = MEDMNIST_ROOT / f"{dataset}.npz"
-    npy_path = MEDMNIST_ROOT / dataset / "test_images.npy"
+    - NPZ datasets (blood/derma/path): loaded from datasets_balanced/{dataset}_224.npz,
+      key "test_images". Images are already 224×224.
+    - chestmnist: loaded from datasets_npy/chestmnist_224/test_images.npy (NPY directory).
 
-    if npz_path.exists():
-        data = np.load(npz_path)
-        imgs = data["test_images"]  # shape: (N, H, W) or (N, H, W, C)
-    elif npy_path.exists():
-        imgs = np.load(npy_path)
+    Returns a list of (original_idx, tensor) tuples where tensor shape is
+    (1, C, 224, 224) float32 in [0, 1].
+    """
+    data_path = DATASET_PATHS.get(dataset)
+    if data_path is None:
+        raise FileNotFoundError(f"No data path configured for dataset: {dataset}")
+
+    if dataset in MULTI_LABEL_DATASETS:
+        # chestmnist: NPY directory with test_images.npy
+        npy_file = data_path / "test_images.npy"
+        if not npy_file.exists():
+            raise FileNotFoundError(
+                f"Cannot find chestmnist test images. Expected: {npy_file}"
+            )
+        imgs = np.load(npy_file)
     else:
-        raise FileNotFoundError(
-            f"Cannot find test data for {dataset}. "
-            f"Tried {npz_path} and {npy_path}."
-        )
+        # NPZ dataset
+        if not data_path.exists():
+            raise FileNotFoundError(
+                f"Cannot find test data for {dataset}. Expected: {data_path}"
+            )
+        data = np.load(data_path)
+        # Key is "test_images" in the balanced NPZ files
+        if "test_images" in data:
+            imgs = data["test_images"]
+        elif "test_img" in data:
+            imgs = data["test_img"]
+        else:
+            raise KeyError(
+                f"NPZ file {data_path} has no 'test_images' key. "
+                f"Available keys: {list(data.keys())}"
+            )
 
     rng = random.Random(seed)
     indices = rng.sample(range(len(imgs)), min(n, len(imgs)))
@@ -260,11 +290,7 @@ def load_cnn_model(model_path: Path, num_classes: int) -> nn.Module:
     stage_planes[0] = in_planes
 
     model = CustomResNet(block, [3, 4, 6, 3], stage_planes, num_classes=num_classes)
-    result = model.load_state_dict(sd, strict=False)
-    if result.missing_keys:
-        log.warning(f"CNN load_state_dict missing keys: {result.missing_keys}")
-    if result.unexpected_keys:
-        log.warning(f"CNN load_state_dict unexpected keys: {result.unexpected_keys}")
+    model.load_state_dict(sd, strict=False)
 
     # Cast to fp32 in case stored as fp16
     model = model.float()
@@ -276,100 +302,226 @@ def load_cnn_model(model_path: Path, num_classes: int) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 class DeployMlp(nn.Module):
-    def __init__(self, in_features, hidden_features, out_features, drop=0.0):
+    """MLP without gates — physically smaller post-pruning."""
+    def __init__(self, in_features, hidden_features, out_features=None,
+                 act_layer=nn.GELU, drop=0.):
         super().__init__()
+        out_features = out_features or in_features
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = nn.GELU()
+        self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        return self.drop(self.fc2(self.act(self.fc1(x))))
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
 
 
 class DeployAttention(nn.Module):
-    def __init__(self, dim, num_heads):
+    """Multi-head attention without gates — supports per-layer head/dim after pruning."""
+    def __init__(self, dim, num_heads, head_dim, qkv_bias=False, qk_scale=None,
+                 attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
+        self.head_dim = head_dim
+        self.scale = qk_scale or head_dim ** -0.5
+        self.inner_dim = head_dim * num_heads
+
+        self.qkv = nn.Linear(dim, self.inner_dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(self.inner_dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
+        qkv = (
+            self.qkv(x)
+            .reshape(B, N, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        return self.proj(x)
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, self.inner_dim)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
 
 
 class DeployBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4.0):
+    """Transformer block without gates — per-layer dims inferred from checkpoint."""
+    def __init__(self, dim, num_heads, head_dim, mlp_hidden_dim,
+                 qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = DeployAttention(dim, num_heads)
-        self.norm2 = nn.LayerNorm(dim)
-        mlp_hidden = int(dim * mlp_ratio)
-        self.mlp = DeployMlp(dim, mlp_hidden, dim)
+        try:
+            from timm.models.layers import DropPath
+            self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        except ImportError:
+            self.drop_path = nn.Identity()
+
+        self.norm1 = norm_layer(dim)
+        self.attn = DeployAttention(
+            dim, num_heads=num_heads, head_dim=head_dim, qkv_bias=qkv_bias,
+            qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
+        )
+        self.norm2 = norm_layer(dim)
+        self.mlp = DeployMlp(
+            in_features=dim, hidden_features=mlp_hidden_dim,
+            act_layer=act_layer, drop=drop,
+        )
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
 class DeployVisionTransformer(nn.Module):
-    """Physically smaller ViT (post oneshot pruning) that infers dims from checkpoint."""
-
-    def __init__(self, embed_dim, depth, num_heads, mlp_ratio, num_classes, img_size=224, patch_size=16):
+    """
+    Physically smaller ViT for oneshot-pruned checkpoints.
+    Per-layer num_heads and mlp_hidden_dim are inferred per-block from the
+    checkpoint so the architecture exactly matches the pruned weight tensors.
+    """
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000,
+                 embed_dim=192, depth=12, head_dim=64,
+                 per_layer_num_heads=None, per_layer_mlp_dim=None,
+                 qkv_bias=True, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.):
         super().__init__()
-        self.patch_embed = nn.Conv2d(3, embed_dim, patch_size, stride=patch_size)
-        num_patches = (img_size // patch_size) ** 2
+        from functools import partial as _partial
+        try:
+            from timm.models.layers import PatchEmbed, trunc_normal_
+        except ImportError:
+            raise ImportError("timm is required for DeployVisionTransformer: pip install timm")
+
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        self.depth = depth
+        self.head_dim = head_dim
+
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size,
+            in_chans=in_chans, embed_dim=embed_dim,
+        )
+        num_patches = self.patch_embed.num_patches
+
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+
+        if per_layer_num_heads is None:
+            per_layer_num_heads = [max(1, embed_dim // head_dim)] * depth
+        if per_layer_mlp_dim is None:
+            per_layer_mlp_dim = [embed_dim * 4] * depth
+
         self.blocks = nn.ModuleList([
-            DeployBlock(embed_dim, num_heads, mlp_ratio) for _ in range(depth)
+            DeployBlock(
+                dim=embed_dim,
+                num_heads=per_layer_num_heads[i],
+                head_dim=head_dim,
+                mlp_hidden_dim=per_layer_mlp_dim[i],
+                qkv_bias=qkv_bias,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[i],
+                norm_layer=_partial(nn.LayerNorm, eps=1e-6),
+            )
+            for i in range(depth)
         ])
+
         self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes)
+        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+        trunc_normal_(self.pos_embed, std=0.02)
+        trunc_normal_(self.cls_token, std=0.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        try:
+            from timm.models.layers import trunc_normal_
+        except ImportError:
+            return
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
         B = x.shape[0]
-        x = self.patch_embed(x).flatten(2).transpose(1, 2)
-        cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls, x], dim=1) + self.pos_embed
+        x = self.patch_embed(x)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
         return self.head(x[:, 0])
 
 
-def _infer_vit_deploy_dims(sd: dict) -> Dict[str, int]:
-    """Infer embed_dim, depth, num_heads, mlp_ratio from a oneshot checkpoint."""
-    embed_dim = sd["patch_embed.weight"].shape[0]
+def _infer_vit_deploy_dims(sd: dict) -> Dict:
+    """
+    Infer all per-layer dims from a oneshot pruned checkpoint.
+
+    The oneshot checkpoints use timm's PatchEmbed, so the patch embedding
+    weight key is 'patch_embed.proj.weight' (not 'patch_embed.weight').
+
+    Returns:
+        embed_dim, depth, head_dim, per_layer_num_heads (list), per_layer_mlp_dim (list)
+    """
+    # embed_dim: timm PatchEmbed stores weight as patch_embed.proj.weight
+    if "patch_embed.proj.weight" in sd:
+        embed_dim = sd["patch_embed.proj.weight"].shape[0]
+    elif "patch_embed.weight" in sd:
+        embed_dim = sd["patch_embed.weight"].shape[0]
+    else:
+        raise KeyError(
+            "Cannot find patch embedding weight in checkpoint. "
+            f"Available keys (first 10): {list(sd.keys())[:10]}"
+        )
+
+    # depth: count norm1 weight tensors across all blocks
     depth = sum(1 for k in sd if k.startswith("blocks.") and k.endswith(".norm1.weight"))
-    # num_heads: assume head_dim=64 (standard ViT convention), fall back to 6
-    qkv_key = "blocks.0.attn.qkv.weight"
-    if qkv_key in sd:
-        head_dim = 64
-        num_heads = max(1, embed_dim // head_dim)
-        if embed_dim % head_dim != 0:
-            log.warning(
-                f"embed_dim={embed_dim} not divisible by head_dim={head_dim}; "
-                f"num_heads={num_heads} may be incorrect for this pruned model."
-            )
-    else:
-        num_heads = 6  # fallback
-    mlp_hidden_key = "blocks.0.mlp.fc1.weight"
-    if mlp_hidden_key in sd:
-        mlp_hidden = sd[mlp_hidden_key].shape[0]
-        mlp_ratio = mlp_hidden / embed_dim
-    else:
-        mlp_ratio = 4.0
-    return dict(embed_dim=embed_dim, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio)
+
+    # Standard ViT uses head_dim=64
+    head_dim = 64
+
+    per_layer_num_heads = []
+    per_layer_mlp_dim = []
+
+    for i in range(depth):
+        # qkv weight shape: (inner_dim * 3, embed_dim); inner_dim = num_heads * head_dim
+        qkv_key = f"blocks.{i}.attn.qkv.weight"
+        if qkv_key in sd:
+            inner_dim = sd[qkv_key].shape[0] // 3
+            num_heads = max(1, inner_dim // head_dim)
+        else:
+            num_heads = max(1, embed_dim // head_dim)
+        per_layer_num_heads.append(num_heads)
+
+        mlp_key = f"blocks.{i}.mlp.fc1.weight"
+        if mlp_key in sd:
+            per_layer_mlp_dim.append(sd[mlp_key].shape[0])
+        else:
+            per_layer_mlp_dim.append(embed_dim * 4)
+
+    return dict(
+        embed_dim=embed_dim,
+        depth=depth,
+        head_dim=head_dim,
+        per_layer_num_heads=per_layer_num_heads,
+        per_layer_mlp_dim=per_layer_mlp_dim,
+    )
 
 
 def load_vit_model(model_path: Path, num_classes: int) -> nn.Module:
@@ -401,29 +553,26 @@ def load_vit_model(model_path: Path, num_classes: int) -> nn.Module:
                 return size
         raise ValueError(f"Cannot infer ViT arch from: {stem}")
 
-    def _load_and_warn(model: nn.Module, sd: dict, label: str) -> nn.Module:
-        result = model.load_state_dict(sd, strict=False)
-        if result.missing_keys:
-            log.warning(f"ViT [{label}] load_state_dict missing keys: {result.missing_keys}")
-        if result.unexpected_keys:
-            log.warning(f"ViT [{label}] load_state_dict unexpected keys: {result.unexpected_keys}")
-        return model
-
     if name.startswith("oneshot_"):
         dims = _infer_vit_deploy_dims(sd)
         model = DeployVisionTransformer(
+            num_classes=num_classes,
             embed_dim=dims["embed_dim"],
             depth=dims["depth"],
-            num_heads=dims["num_heads"],
-            mlp_ratio=dims["mlp_ratio"],
-            num_classes=num_classes,
+            head_dim=dims["head_dim"],
+            per_layer_num_heads=dims["per_layer_num_heads"],
+            per_layer_mlp_dim=dims["per_layer_mlp_dim"],
         )
-        _load_and_warn(model, sd, name)
+        result = model.load_state_dict(sd, strict=False)
+        if result.missing_keys:
+            log.warning(f"ViT oneshot [{name}] missing keys: {result.missing_keys}")
+        if result.unexpected_keys:
+            log.warning(f"ViT oneshot [{name}] unexpected keys: {result.unexpected_keys}")
 
     elif name.startswith("quantization_"):
         arch = _arch_from_name(name)
         model = timm.create_model(arch, pretrained=False, num_classes=num_classes)
-        _load_and_warn(model, sd, name)
+        model.load_state_dict(sd, strict=False)
         model = model.half()  # fp16, stays fp16 on both CPU and CUDA
 
     elif name.startswith("kd_"):
@@ -433,13 +582,13 @@ def load_vit_model(model_path: Path, num_classes: int) -> nn.Module:
         after_to = name.split("_to_", 1)[-1]  # "vit_small_patch16_224_bloodmnist_final.pth"
         arch = _arch_from_name(after_to)
         model = timm.create_model(arch, pretrained=False, num_classes=num_classes)
-        _load_and_warn(model, sd, name)
+        model.load_state_dict(sd, strict=False)
 
     else:
         # _pretrained.pth or any other standard checkpoint
         arch = _arch_from_name(name)
         model = timm.create_model(arch, pretrained=False, num_classes=num_classes)
-        _load_and_warn(model, sd, name)
+        model.load_state_dict(sd, strict=False)
 
     return model
 
@@ -811,8 +960,8 @@ def benchmark_model_type(
                         log.info(f"    SKIP (already done): {model_name} | {device} | rep={rep}")
                         continue
 
-                    seed = rep * 1000 + int(hashlib.md5(model_name.encode()).hexdigest(), 16) % 997
-                    seed = seed % (2 ** 31)
+                    seed = rep * 1000 + hash(model_name) % 997
+                    seed = abs(seed) % (2 ** 31)
 
                     log.info(f"    {model_name} | {device} | rep={rep} | seed={seed}")
 
@@ -854,7 +1003,7 @@ def benchmark_model_type(
                             torch.cuda.empty_cache()
                         continue
 
-                    ts = datetime.now(timezone.utc).isoformat()
+                    ts = datetime.utcnow().isoformat()
 
                     # Write per-image rows
                     for row in per_image_rows:
