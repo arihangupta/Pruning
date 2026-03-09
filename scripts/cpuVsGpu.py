@@ -61,7 +61,7 @@ CNN_MODEL_ROOT = Path(
     "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/CNN_pruned_models"
 )
 VIT_BASELINE_ROOT = Path(
-    "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/rerun/new_baseline"
+    "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/new_baseline"
 )
 VIT_PRUNED_ROOT = Path(
     "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/rerun/pruned_models"
