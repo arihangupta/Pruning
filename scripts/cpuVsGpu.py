@@ -598,14 +598,8 @@ def load_vit_model(model_path: Path, num_classes: int) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 def _cnn_model_filter(fname: str) -> bool:
-    """Accept baseline.pth and the 7 final compressed variants; reject intermediates."""
-    if fname == "baseline.pth":
-        return True
-    if fname.endswith("_final.pth"):
-        # Must not be an intermediate step file
-        bad = ["pgto_", "_afterKD", "_preKD", "_allpruned", "_calibrated", "_postprune", "_pre_kd"]
-        return not any(b in fname for b in bad)
-    return False
+    """Accept baseline.pth and all final compressed variants."""
+    return fname == "baseline.pth" or fname.endswith("_final.pth")
 
 
 def discover_cnn_models(dataset: str) -> List[Dict]:
