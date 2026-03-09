@@ -39,6 +39,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from torchvision.models.resnet import Bottleneck
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -130,62 +131,28 @@ def load_test_images(dataset: str, n: int, seed: int) -> list:
 # ---------------------------------------------------------------------------
 # CNN model definitions
 # ---------------------------------------------------------------------------
-
-class BasicBlock(nn.Module):
-    expansion = 1
-
-    def __init__(self, in_planes, planes, stride=1, downsample=None):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, 3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.downsample = downsample
-
-    def forward(self, x):
-        identity = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        if self.downsample is not None:
-            identity = self.downsample(x)
-        return self.relu(out + identity)
-
-
-class Bottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, in_planes, planes, stride=1, downsample=None):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, 3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-
-    def forward(self, x):
-        identity = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.relu(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
-        if self.downsample is not None:
-            identity = self.downsample(x)
-        return self.relu(out + identity)
-
+# Uses torchvision's Bottleneck (imported above) to exactly match the
+# architecture produced by the training scripts.
 
 class CustomResNet(nn.Module):
-    """Flexible ResNet that accepts variable stage_planes (supports pruned widths)."""
+    """
+    Flexible ResNet that accepts variable stage_planes (supports pruned widths).
 
-    def __init__(self, block, layers, stage_planes, num_classes=1000):
+    The stem (conv1/bn1) always outputs 64 channels — this is fixed in all
+    checkpoints. stage_planes[i] controls the *block* plane width for each
+    of the four residual stages (which may differ from standard 64/128/256/512
+    after structural pruning).
+    """
+
+    def __init__(self, block=Bottleneck, layers=[3, 4, 6, 3],
+                 stage_planes=[64, 128, 256, 512], num_classes=1000, in_channels=3):
         super().__init__()
-        self.in_planes = stage_planes[0]
-        self.conv1 = nn.Conv2d(3, stage_planes[0], 7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(stage_planes[0])
+        # Stem always outputs 64 channels (matches all checkpoints)
+        self.inplanes = 64
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         self.layer1 = self._make_layer(block, stage_planes[0], layers[0])
         self.layer2 = self._make_layer(block, stage_planes[1], layers[1], stride=2)
@@ -197,19 +164,22 @@ class CustomResNet(nn.Module):
 
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
-        if stride != 1 or self.in_planes != planes * block.expansion:
+        if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
-                nn.Conv2d(self.in_planes, planes * block.expansion, 1, stride=stride, bias=False),
+                nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(planes * block.expansion),
             )
-        layers = [block(self.in_planes, planes, stride, downsample)]
-        self.in_planes = planes * block.expansion
+        layers = [block(self.inplanes, planes, stride=stride, downsample=downsample)]
+        self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
-            layers.append(block(self.in_planes, planes))
+            layers.append(block(self.inplanes, planes))
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
@@ -220,45 +190,42 @@ class CustomResNet(nn.Module):
 
 
 def _infer_resnet_depth(sd: dict) -> List[int]:
-    """
-    Infer the number of blocks per layer from the checkpoint.
-    Handles ResNet-18 ([2,2,2,2]), ResNet-34 ([3,4,6,3]), ResNet-50 ([3,4,6,3]).
-    """
+    """Infer the number of blocks per stage from checkpoint keys."""
     layers = []
     for layer_idx in range(1, 5):
-        # Count the highest block index in layer{layer_idx}
         max_block = -1
         for k in sd:
             if k.startswith(f"layer{layer_idx}."):
                 parts = k.split(".")
                 if len(parts) >= 2:
                     try:
-                        block_num = int(parts[1])
-                        max_block = max(max_block, block_num)
+                        max_block = max(max_block, int(parts[1]))
                     except ValueError:
                         pass
-        layers.append(max_block + 1 if max_block >= 0 else 2)
+        layers.append(max_block + 1 if max_block >= 0 else 3)
     return layers
 
 
-def _infer_stage_planes_from_state_dict(sd: dict, block_expansion: int = 4) -> List[int]:
-    """Infer stage_planes from checkpoint keys."""
+def _infer_stage_planes(sd: dict) -> List[int]:
+    """
+    Infer per-stage block plane widths from checkpoint.
+
+    Uses layer{i}.0.conv1.weight.shape[0] which gives the *bottleneck inner
+    plane* (planes, not planes*expansion), matching CustomResNet._make_layer.
+    The stem (conv1.weight) is intentionally NOT used — stem channels are
+    always 64 regardless of pruning.
+    """
     planes = []
     for layer_idx in range(1, 5):
         key = f"layer{layer_idx}.0.conv1.weight"
         if key in sd:
             planes.append(sd[key].shape[0])
         else:
-            key2 = f"layer{layer_idx}.0.conv3.weight"
-            if key2 in sd:
-                planes.append(sd[key2].shape[0] // block_expansion)
-            else:
-                planes.append(64 * (2 ** (layer_idx - 1)))
+            raise ValueError(
+                f"Cannot find '{key}' in checkpoint to infer stage_planes. "
+                f"Available keys (first 5): {list(sd.keys())[:5]}"
+            )
     return planes
-
-
-def _is_bottleneck(sd: dict) -> bool:
-    return any("conv3" in k for k in sd.keys() if "layer" in k)
 
 
 def load_cnn_model(model_path: Path, num_classes: int) -> nn.Module:
@@ -272,22 +239,23 @@ def load_cnn_model(model_path: Path, num_classes: int) -> nn.Module:
     if any(k.startswith("module.") for k in sd):
         sd = {k[len("module."):]: v for k, v in sd.items()}
 
-    block = Bottleneck if _is_bottleneck(sd) else BasicBlock
-    stage_planes = _infer_stage_planes_from_state_dict(sd, block.expansion)
+    stage_planes = _infer_stage_planes(sd)
     layers = _infer_resnet_depth(sd)
 
-    in_planes = sd["conv1.weight"].shape[0] if "conv1.weight" in sd else stage_planes[0]
-    stage_planes[0] = in_planes
+    # Check dtype — convert fp16 checkpoints to fp32 for inference
+    sample = next(iter(sd.values()))
+    is_fp16 = sample.dtype == torch.float16
+    if is_fp16:
+        sd = {k: v.float() for k, v in sd.items()}
 
-    model = CustomResNet(block, layers, stage_planes, num_classes=num_classes)
-    result = model.load_state_dict(sd, strict=False)
-    if result.missing_keys:
-        log.debug(f"CNN [{model_path.name}] missing keys: {result.missing_keys}")
-    if result.unexpected_keys:
-        log.debug(f"CNN [{model_path.name}] unexpected keys: {result.unexpected_keys}")
-
-    model = model.float()
-    return model
+    model = CustomResNet(
+        block=Bottleneck,
+        layers=layers,
+        stage_planes=stage_planes,
+        num_classes=num_classes,
+    )
+    model.load_state_dict(sd)
+    return model.float()
 
 
 # ---------------------------------------------------------------------------

@@ -381,7 +381,8 @@ def load_vit_model(model_path: Path, num_classes: int) -> nn.Module:
         raise ImportError("timm is required for ViT loading: pip install timm")
 
     name = model_path.name
-    sd = torch.load(model_path, map_location="cpu", weights_only=False)
+    raw_ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+    sd = raw_ckpt
     if isinstance(sd, dict) and "model" in sd:
         sd = sd["model"]
     if isinstance(sd, dict) and "state_dict" in sd:
@@ -396,27 +397,33 @@ def load_vit_model(model_path: Path, num_classes: int) -> nn.Module:
         raise ValueError(f"Cannot infer ViT arch from: {stem}")
 
     if name.startswith("oneshot_"):
-        dims = _infer_vit_deploy_dims(sd)
-        pruned_blocks = [
-            i for i, h in enumerate(dims["per_layer_num_heads"]) if h == 0
-        ]
-        if pruned_blocks:
-            log.info(
-                f"  [{name}] blocks with all heads pruned (no-op attention): {pruned_blocks}"
+        # Prefer pruning_config stored in checkpoint (exact deploy dims)
+        pruning_config = raw_ckpt.get("pruning_config", {}) if isinstance(raw_ckpt, dict) else {}
+        if pruning_config:
+            log.info(f"  [{name}] using pruning_config from checkpoint")
+            model = DeployVisionTransformer(
+                num_classes=num_classes,
+                embed_dim=pruning_config["deploy_embed_dim"],
+                depth=12,
+                head_dim=pruning_config.get("head_dim", 64),
+                per_layer_num_heads=pruning_config["deploy_per_layer_num_heads"],
+                per_layer_mlp_dim=pruning_config["deploy_per_layer_mlp_dim"],
+                drop_path_rate=0.1,
             )
-        model = DeployVisionTransformer(
-            num_classes=num_classes,
-            embed_dim=dims["embed_dim"],
-            depth=dims["depth"],
-            head_dim=dims["head_dim"],
-            per_layer_num_heads=dims["per_layer_num_heads"],
-            per_layer_mlp_dim=dims["per_layer_mlp_dim"],
-        )
-        result = model.load_state_dict(sd, strict=False)
-        if result.missing_keys:
-            log.warning(f"ViT oneshot [{name}] missing keys: {result.missing_keys}")
-        if result.unexpected_keys:
-            log.warning(f"ViT oneshot [{name}] unexpected keys: {result.unexpected_keys}")
+        else:
+            dims = _infer_vit_deploy_dims(sd)
+            pruned_blocks = [i for i, h in enumerate(dims["per_layer_num_heads"]) if h == 0]
+            if pruned_blocks:
+                log.info(f"  [{name}] blocks with all heads pruned (no-op attention): {pruned_blocks}")
+            model = DeployVisionTransformer(
+                num_classes=num_classes,
+                embed_dim=dims["embed_dim"],
+                depth=dims["depth"],
+                head_dim=dims["head_dim"],
+                per_layer_num_heads=dims["per_layer_num_heads"],
+                per_layer_mlp_dim=dims["per_layer_mlp_dim"],
+            )
+        model.load_state_dict(sd)
 
     elif name.startswith("quantization_"):
         arch = _arch_from_name(name)
