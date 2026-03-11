@@ -271,6 +271,28 @@ def discover_cnn_models(dataset: str) -> List[Dict]:
 
 
 
+# ---------------------------------------------------------------------------
+# Power measurement — tiered fallback: RAPL → perf → CodeCarbon TDP
+# ---------------------------------------------------------------------------
+#
+# Tier 1 (best): Intel RAPL via /sys/class/powercap — direct energy counter.
+#   Available on bare-metal EC2 instances (c5.metal, p3.metal etc.) and
+#   local Linux machines. Requires read permission on energy_uj files.
+#
+# Tier 2: `perf stat -e power/energy-pkg/` — requires `perf` binary and
+#   CAP_PERFMON capability. Rare on EC2 but worth trying.
+#
+# Tier 3 (fallback): CodeCarbon CPU TDP estimation. Reads CPU model from
+#   /proc/cpuinfo and looks up TDP from a hardware table, then scales by
+#   CPU utilization fraction. Less accurate but consistent across all models
+#   (which is what matters for comparing compression methods).
+#
+# GPU: pynvml.nvmlDeviceGetPowerUsage() always attempted when device=cuda.
+# ---------------------------------------------------------------------------
+
+import subprocess as _subprocess
+import threading as _threading
+
 try:
     import pynvml as _pynvml
     _pynvml.nvmlInit()
@@ -279,6 +301,55 @@ except Exception:
     _HAS_NVML = False
 
 _RAPL_PATH = Path("/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj")
+_POWER_TIER: Optional[str] = None  # set on first call to _detect_power_tier()
+
+
+def _detect_power_tier() -> str:
+    """Detect which CPU power measurement method is available."""
+    global _POWER_TIER
+    if _POWER_TIER is not None:
+        return _POWER_TIER
+
+    # Tier 1: RAPL sysfs
+    if _RAPL_PATH.exists():
+        try:
+            float(_RAPL_PATH.read_text().strip())
+            _POWER_TIER = "rapl"
+            log.info("Power tier: RAPL (/sys/class/powercap)")
+            return _POWER_TIER
+        except Exception:
+            pass
+
+    # Tier 2: perf stat
+    try:
+        r = _subprocess.run(
+            ["perf", "stat", "-e", "power/energy-pkg/", "sleep", "0.01"],
+            capture_output=True, text=True, timeout=3
+        )
+        if "power/energy-pkg/" in (r.stdout + r.stderr):
+            _POWER_TIER = "perf"
+            log.info("Power tier: perf stat (energy-pkg)")
+            return _POWER_TIER
+    except Exception:
+        pass
+
+    # Tier 3: CodeCarbon TDP
+    try:
+        from codecarbon.external.hardware import CPU as _CC_CPU
+        _ = _CC_CPU.from_utils()
+        _POWER_TIER = "codecarbon"
+        log.info("Power tier: CodeCarbon TDP estimation")
+        return _POWER_TIER
+    except Exception:
+        pass
+
+    _POWER_TIER = "none"
+    log.warning(
+        "No CPU power measurement available (no RAPL, perf, or CodeCarbon). "
+        "Energy metrics will be NaN. Consider using a bare-metal EC2 instance "
+        "or installing codecarbon: pip install codecarbon"
+    )
+    return _POWER_TIER
 
 
 def _read_rapl_uj() -> Optional[float]:
@@ -306,28 +377,102 @@ def _get_gpu_handle(device: str):
         return None
 
 
+# --- Tier-specific power samplers ---
+
+def _cpu_power_rapl(duration_s: float) -> float:
+    """Mean CPU package power via RAPL over `duration_s` seconds."""
+    e0 = _read_rapl_uj()
+    time.sleep(duration_s)
+    e1 = _read_rapl_uj()
+    if e0 is None or e1 is None:
+        return float("nan")
+    return ((e1 - e0) / 1e6) / duration_s
+
+
+def _cpu_power_perf(duration_s: float) -> float:
+    """Mean CPU package power via perf stat over `duration_s` seconds."""
+    try:
+        r = _subprocess.run(
+            ["perf", "stat", "-e", "power/energy-pkg/", f"sleep {duration_s:.2f}"],
+            capture_output=True, text=True, timeout=duration_s + 5, shell=False
+        )
+        # Parse "X.XX Joules power/energy-pkg/" from stderr
+        for line in (r.stdout + r.stderr).splitlines():
+            if "power/energy-pkg/" in line:
+                joules = float(line.strip().split()[0].replace(",", ""))
+                return joules / duration_s
+    except Exception:
+        pass
+    return float("nan")
+
+
+def _cpu_power_codecarbon(duration_s: float) -> float:
+    """
+    CPU power via CodeCarbon TDP + utilization.
+    Starts a short EmissionsTracker measurement and reads cpu_power.
+    """
+    try:
+        from codecarbon import EmissionsTracker
+        tracker = EmissionsTracker(
+            project_name="_power_probe",
+            log_level="error",
+            save_to_file=False,
+            measure_power_secs=max(0.5, duration_s / 4),
+        )
+        tracker.start()
+        time.sleep(duration_s)
+        tracker.stop()
+        data = tracker.final_emissions_data
+        cpu_w = float(getattr(data, "cpu_power", float("nan")))
+        return cpu_w
+    except Exception:
+        return float("nan")
+
+
 def measure_power_w(duration_s: float, gpu_handle) -> Dict:
     """
-    Measure mean CPU package power (RAPL) and GPU power (pynvml) over
-    `duration_s` seconds.
-
-    CPU: two RAPL energy counter readings bracketing the interval.
-         delta_energy_J / delta_t = package power in Watts.
-    GPU: pynvml.nvmlDeviceGetPowerUsage() polled every 50 ms, then averaged.
+    Measure mean CPU and GPU power over `duration_s` seconds using the
+    best available tier (RAPL > perf > CodeCarbon TDP).
 
     Returns {"cpu_w": float, "gpu_w": float}.
     gpu_w is NaN when gpu_handle is None (CPU-only runs).
     """
-    e0 = _read_rapl_uj()
-    gpu_samples = []
-    t0 = time.perf_counter()
-    while time.perf_counter() - t0 < duration_s:
-        if gpu_handle is not None:
-            gpu_samples.append(_read_gpu_power_w(gpu_handle))
-        time.sleep(0.05)
-    e1 = _read_rapl_uj()
+    tier = _detect_power_tier()
 
-    cpu_w = ((e1 - e0) / 1e6) / duration_s if (e0 is not None and e1 is not None) else float("nan")
+    # CPU power — start in background thread so GPU polling runs concurrently
+    cpu_result: List[float] = [float("nan")]
+
+    def _measure_cpu():
+        if tier == "rapl":
+            cpu_result[0] = _cpu_power_rapl(duration_s)
+        elif tier == "perf":
+            cpu_result[0] = _cpu_power_perf(duration_s)
+        elif tier == "codecarbon":
+            cpu_result[0] = _cpu_power_codecarbon(duration_s)
+
+    cpu_thread = _threading.Thread(target=_measure_cpu)
+    cpu_thread.start()
+
+    # GPU power — poll concurrently
+    gpu_samples: List[float] = []
+    _stop_gpu = _threading.Event()
+
+    def _poll_gpu():
+        while not _stop_gpu.is_set():
+            gpu_samples.append(_read_gpu_power_w(gpu_handle))
+            time.sleep(0.05)
+
+    if gpu_handle is not None:
+        gpu_thread = _threading.Thread(target=_poll_gpu, daemon=True)
+        gpu_thread.start()
+
+    cpu_thread.join(timeout=duration_s + 10)
+
+    if gpu_handle is not None:
+        _stop_gpu.set()
+        gpu_thread.join(timeout=2.0)
+
+    cpu_w = cpu_result[0]
     gpu_w = float(np.nanmean(gpu_samples)) if gpu_samples else float("nan")
     return {"cpu_w": cpu_w, "gpu_w": gpu_w}
 
