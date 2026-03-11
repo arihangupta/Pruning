@@ -467,15 +467,33 @@ def _detect_power_tier() -> str:
     except Exception:
         pass
 
-    # Tier 3: CodeCarbon — probe with a short live measurement to confirm it
-    # actually returns a non-NaN cpu_power (some environments report 0/NaN)
+    # Tier 3: CodeCarbon — probe under CPU load to confirm it returns a
+    # non-zero cpu_power. Must run under load because CodeCarbon estimates
+    # TDP x utilization: at idle (e.g. before first model loads) utilization
+    # is near zero, so the probe returns 0 W and we incorrectly reject it.
     try:
+        import threading as _probe_thread
+        import time as _time
         from codecarbon import EmissionsTracker as _ET
+
+        # Spin a CPU load thread for the duration of the probe so CodeCarbon
+        # sees real utilization and returns a non-zero TDP estimate.
+        _probe_stop = _probe_thread.Event()
+        def _cpu_spin():
+            x = 0.0
+            while not _probe_stop.is_set():
+                x += 1.0  # tight arithmetic loop, no sleep
+        _spinner = _probe_thread.Thread(target=_cpu_spin, daemon=True)
+        _spinner.start()
+
         _t = _ET(project_name="_probe", log_level="error",
                  save_to_file=False, measure_power_secs=0.5)
         _t.start()
-        import time as _time; _time.sleep(1.5)
+        _time.sleep(2.0)   # give CodeCarbon's thread time to sample under load
         _t.stop()
+        _probe_stop.set()
+        _spinner.join(timeout=1.0)
+
         _d = _t.final_emissions_data
         _cpu_w = float(getattr(_d, "cpu_power", float("nan")))
         if not (_cpu_w != _cpu_w) and _cpu_w > 0:  # not NaN and positive
@@ -724,7 +742,7 @@ def run_single_image_bench(
                 project_name="single_img_bench",
                 log_level="error",
                 save_to_file=False,
-                measure_power_secs=max(1, n_total // 20),  # ~20 samples across burst
+                measure_power_secs=1,  # 1-second polling interval across burst
             )
             cc_tracker.start()
             cc_tracker.start_task("burst")
