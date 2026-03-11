@@ -629,36 +629,30 @@ def run_single_image_bench(
     individually (one chest X-ray at a time), not in batches. Energy and
     latency must reflect the cost of processing a single image in isolation.
 
-    Measurement challenge: RAPL CPU counters and NVML GPU power readings
-    have sensor resolution limits of ~20-100 ms. A 5 ms inference window
-    is too short to get a reliable energy reading from a single forward pass.
+    Rotating burst: cycle all N images x burst_rounds, measuring each image
+    one-at-a-time (no batching). Total energy / time / N*rounds gives the
+    per-image cost. Different images rotate through so cache pressure is
+    realistic — not inflated by running the same image repeatedly.
 
-    Rotating burst strategy:
-      - Cycle through all N test images for `burst_rounds` rounds, running
-        each image one-at-a-time (no batching, no image reuse within a round).
-      - Total energy and total time are measured over the full burst window
-        (N * burst_rounds inferences), then divided proportionally.
-      - Per-image latency is recorded individually each pass and averaged
-        across rounds to give per-image statistics with real variance.
-      - Each image still experiences realistic cache pressure from different
-        images preceding it, unlike a same-image burst.
+    Power measurement is tier-aware:
 
-    Energy methodology:
-      - Idle baseline measured for 2 s after warmup (model loaded, no inference).
-      - Burst window: RAPL counter brackets the entire N*burst_rounds loop;
-        NVML GPU power is polled every 50 ms in a background thread.
-      - Active power = (total_power - idle_power), floored at 0.
-      - Energy per image = active_power_W * (mean_latency_s / 3_600_000).
+      RAPL / perf (bare-metal EC2 or local Linux):
+        - Measure idle baseline for 2 s after warmup.
+        - Bracket entire burst with RAPL counter (or perf stat).
+        - Active power = burst_power - idle_power, floored at 0.
 
-    CPU-only runs: gpu_handle=None → gpu_power logged as NaN.
-    CUDA runs: both CPU and GPU active power measured and summed for energy.
+      CodeCarbon (virtualized EC2 — most common case):
+        - CodeCarbon reports TDP x utilization; it has no meaningful "idle"
+          reading (returns full TDP even at rest).
+        - Instead: start one EmissionsTracker task across the burst window,
+          read cpu_power directly — no idle subtraction needed or correct.
+
+      none: energy metrics are NaN.
     """
     use_cuda_sync = device.startswith("cuda") and torch.cuda.is_available()
 
-    # fp16 on CPU is software-emulated (~100-1000x slower) — convert to fp32
     if device == "cpu" and next(model.parameters()).dtype == torch.float16:
         model = model.float()
-
     is_fp16 = next(model.parameters()).dtype == torch.float16
 
     model = model.to(device)
@@ -683,36 +677,72 @@ def run_single_image_bench(
                 torch.cuda.synchronize()
     del dummy
 
-    # Measure idle baseline (model loaded, GPU warm if CUDA, no inference)
+    tier = _detect_power_tier()
     gpu_handle = _get_gpu_handle(device)
-    log.info(f"      Measuring idle power baseline (2 s)...")
-    idle = measure_power_w(duration_s=2.0, gpu_handle=gpu_handle)
-    idle_cpu_w = idle["cpu_w"]
-    idle_gpu_w = idle["gpu_w"]
-    log.info(f"      Idle: cpu={idle_cpu_w:.2f} W  gpu={idle_gpu_w:.2f} W")
+
+    # --- Idle baseline (RAPL / perf only) ---
+    idle_cpu_w = 0.0  # default: no subtraction
+    idle_gpu_w = 0.0
+    if tier in ("rapl", "perf"):
+        log.info(f"      Measuring idle power baseline (2 s)...")
+        idle = measure_power_w(duration_s=2.0, gpu_handle=gpu_handle)
+        idle_cpu_w = idle["cpu_w"] if not np.isnan(idle["cpu_w"]) else 0.0
+        idle_gpu_w = idle["gpu_w"] if not np.isnan(idle["gpu_w"]) else 0.0
+        log.info(f"      Idle: cpu={idle_cpu_w:.2f} W  gpu={idle_gpu_w:.2f} W")
+    elif tier == "codecarbon":
+        log.info(f"      Power tier: CodeCarbon (no idle subtraction — TDP x utilization)")
+    else:
+        log.info(f"      Power tier: none — energy metrics will be NaN")
 
     import threading as _threading
 
     n_images_local = len(device_images)
     n_total = n_images_local * burst_rounds
-
-    # Per-image latency accumulator: one list per image, across all rounds
     per_img_latencies: List[List[float]] = [[] for _ in range(n_images_local)]
 
-    # GPU power accumulator across the whole burst
+    # --- GPU power poller (runs across entire burst) ---
     gpu_samples_burst: List[float] = []
-    _stop_poll = _threading.Event()
+    _stop_gpu = _threading.Event()
 
-    def _gpu_poll(handle=gpu_handle, samples=gpu_samples_burst, stop=_stop_poll):
+    def _poll_gpu(handle=gpu_handle, samples=gpu_samples_burst, stop=_stop_gpu):
         while not stop.is_set():
             samples.append(_read_gpu_power_w(handle))
             time.sleep(0.05)
 
-    poller = _threading.Thread(target=_gpu_poll, daemon=True)
-    poller.start()
+    if gpu_handle is not None:
+        gpu_poller = _threading.Thread(target=_poll_gpu, daemon=True)
+        gpu_poller.start()
 
-    # Bracket the entire rotating burst with a single RAPL counter pair
-    e0 = _read_rapl_uj()
+    # --- CPU power measurement setup ---
+    # RAPL/perf: bracket burst with energy counter
+    # CodeCarbon: wrap burst in a single EmissionsTracker task
+    cc_tracker = None
+    if tier == "codecarbon":
+        try:
+            from codecarbon import EmissionsTracker
+            cc_tracker = EmissionsTracker(
+                project_name="single_img_bench",
+                log_level="error",
+                save_to_file=False,
+                measure_power_secs=max(1, n_total // 20),  # ~20 samples across burst
+            )
+            cc_tracker.start()
+            cc_tracker.start_task("burst")
+        except Exception as e:
+            log.debug(f"CodeCarbon tracker init failed: {e}")
+            cc_tracker = None
+
+    e0 = _read_rapl_uj() if tier == "rapl" else None
+    perf_proc = None
+    if tier == "perf":
+        try:
+            perf_proc = _subprocess.Popen(
+                ["perf", "stat", "-e", "power/energy-pkg/", "-p", str(os.getpid())],
+                stdout=_subprocess.DEVNULL, stderr=_subprocess.PIPE,
+            )
+        except Exception:
+            perf_proc = None
+
     burst_t0 = time.perf_counter()
 
     for _round in range(burst_rounds):
@@ -726,40 +756,60 @@ def run_single_image_bench(
             per_img_latencies[img_idx].append((t1 - t0) * 1000.0)
 
     burst_t1 = time.perf_counter()
-    e1 = _read_rapl_uj()
-
-    _stop_poll.set()
-    poller.join(timeout=2.0)
-
+    e1 = _read_rapl_uj() if tier == "rapl" else None
     total_burst_s = burst_t1 - burst_t0
 
-    # Compute total system power over the burst window
-    if e0 is not None and e1 is not None and total_burst_s > 0:
-        raw_cpu_w = ((e1 - e0) / 1e6) / total_burst_s
-    else:
-        raw_cpu_w = float("nan")
+    # Stop GPU poller
+    if gpu_handle is not None:
+        _stop_gpu.set()
+        gpu_poller.join(timeout=2.0)
 
+    # --- Read CPU power ---
+    raw_cpu_w = float("nan")
+
+    if tier == "rapl" and e0 is not None and e1 is not None and total_burst_s > 0:
+        raw_cpu_w = ((e1 - e0) / 1e6) / total_burst_s
+
+    elif tier == "perf" and perf_proc is not None:
+        try:
+            perf_proc.terminate()
+            _, stderr = perf_proc.communicate(timeout=5)
+            for line in stderr.decode().splitlines():
+                if "power/energy-pkg/" in line:
+                    joules = float(line.strip().split()[0].replace(",", ""))
+                    raw_cpu_w = joules / total_burst_s
+                    break
+        except Exception:
+            pass
+
+    elif tier == "codecarbon" and cc_tracker is not None:
+        try:
+            task = cc_tracker.stop_task("burst")
+            cc_tracker.stop()
+            raw_cpu_w = float(getattr(task, "cpu_power", float("nan")))
+        except Exception as e:
+            log.debug(f"CodeCarbon burst read failed: {e}")
+
+    # --- GPU power ---
     raw_gpu_w = float(np.nanmean(gpu_samples_burst)) if gpu_samples_burst else float("nan")
 
-    # Subtract idle baseline, floor at 0
-    cpu_power = (
-        max(0.0, raw_cpu_w - idle_cpu_w)
-        if not (np.isnan(raw_cpu_w) or np.isnan(idle_cpu_w))
-        else raw_cpu_w
-    )
-    gpu_power = (
-        max(0.0, raw_gpu_w - idle_gpu_w)
-        if not (np.isnan(raw_gpu_w) or np.isnan(idle_gpu_w))
-        else raw_gpu_w
-    )
+    # --- Active power (idle subtraction only for RAPL/perf) ---
+    if tier in ("rapl", "perf"):
+        cpu_power = max(0.0, raw_cpu_w - idle_cpu_w) if not np.isnan(raw_cpu_w) else float("nan")
+        gpu_power = max(0.0, raw_gpu_w - idle_gpu_w) if not np.isnan(raw_gpu_w) else float("nan")
+    else:
+        # CodeCarbon already gives active power (TDP x util); no subtraction
+        cpu_power = raw_cpu_w
+        gpu_power = max(0.0, raw_gpu_w - idle_gpu_w) if (
+            not np.isnan(raw_gpu_w) and not np.isnan(idle_gpu_w)
+        ) else raw_gpu_w
 
     log.info(
         f"      Burst power: cpu={cpu_power:.2f} W  gpu={gpu_power:.2f} W  "
         f"({n_total} inferences in {total_burst_s:.1f} s)"
     )
 
-    # Energy per image = active_power * mean_latency_s
-    active_w = cpu_power + (gpu_power if not np.isnan(gpu_power) else 0.0)
+    active_w = (cpu_power if not np.isnan(cpu_power) else 0.0) +                (gpu_power if not np.isnan(gpu_power) else 0.0)
 
     per_image_rows = []
     all_mean_latencies = []
