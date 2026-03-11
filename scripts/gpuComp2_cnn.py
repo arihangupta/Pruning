@@ -341,21 +341,39 @@ def run_single_image_bench(
     images: List[Tuple[int, torch.Tensor]],
     device: str,
     warmup: int = 5,
+    burst_rounds: int = 50,
 ) -> Tuple[List[Dict], Dict]:
     """
-    Benchmark single-image inference.
+    Benchmark single-image inference using a rotating burst strategy.
 
-    Power methodology:
-      - After warmup, measure idle system power for 2 s (model loaded, no
-        inference). This captures baseline OS + memory + GPU idle draw.
-      - Per image: RAPL counter bracketing + concurrent pynvml GPU polling
-        measure total system power during the inference window.
-      - Active power = total - idle, floored at 0 W.
-      - Energy (kWh) = active_power_W * latency_s / 3_600_000.
+    Clinical motivation: In a PACS-integrated AI tool, images arrive
+    individually (one chest X-ray at a time), not in batches. Energy and
+    latency must reflect the cost of processing a single image in isolation.
 
-    CPU-only runs: gpu_handle=None → gpu_power logged as NaN, not included
-    in energy calculation.
-    CUDA runs: both CPU and GPU active power measured and summed for energy.
+    Measurement challenge: RAPL CPU counters and NVML GPU power readings
+    have sensor resolution limits of ~20-100 ms. A 5 ms inference window
+    is too short to get a reliable energy reading from a single forward pass.
+
+    Rotating burst strategy:
+      - Cycle through all N test images for `burst_rounds` rounds, running
+        each image one-at-a-time (no batching, no image reuse within a round).
+      - Total energy and total time are measured over the full burst window
+        (N * burst_rounds inferences), then divided by (N * burst_rounds).
+      - Per-image latency is recorded individually each pass and averaged
+        across rounds to give per-image statistics with real variance.
+      - Each image still experiences realistic cache pressure from different
+        images preceding it, unlike a same-image burst.
+
+    Energy methodology:
+      - Idle baseline measured for 2 s after warmup (model loaded, no inference).
+      - Burst window: RAPL counter brackets the entire N*burst_rounds loop;
+        NVML GPU power is polled every 50 ms in a background thread.
+      - Active power = (total_power - idle_power), floored at 0.
+      - Energy per image = active_power_W * (total_time_s / N_total_inferences).
+      - This energy is then associated with each individual image's mean latency.
+
+    Outputs per_image_rows with one row per unique image (averaged across
+    burst_rounds), and an aggregated summary dict.
     """
     use_cuda_sync = device.startswith("cuda") and torch.cuda.is_available()
 
@@ -368,6 +386,15 @@ def run_single_image_bench(
     model = model.to(device)
     model.eval()
 
+    # Pre-move all images to device once
+    device_images = []
+    for orig_idx, img_tensor in images:
+        img = img_tensor.to(device)
+        if is_fp16:
+            img = img.half()
+        device_images.append((orig_idx, img))
+
+    # Warmup
     dummy = torch.randn(1, 3, 224, 224, device=device)
     if is_fp16:
         dummy = dummy.half()
@@ -386,86 +413,97 @@ def run_single_image_bench(
     idle_gpu_w = idle["gpu_w"]
     log.info(f"      Idle: cpu={idle_cpu_w:.2f} W  gpu={idle_gpu_w:.2f} W")
 
-    per_image_rows = []
-    latencies_ms = []
-    cpu_powers, gpu_powers = [], []
-
     import threading as _threading
 
-    for img_idx, (orig_idx, img_tensor) in enumerate(images):
-        img = img_tensor.to(device)
-        if is_fp16:
-            img = img.half()
+    n_images_local = len(device_images)
+    n_total = n_images_local * burst_rounds
 
-        # --- Start concurrent GPU power polling thread ---
-        gpu_samples_img: List[float] = []
-        _stop_poll = _threading.Event()
+    # Per-image latency accumulator: shape [n_images_local, burst_rounds]
+    per_img_latencies: List[List[float]] = [[] for _ in range(n_images_local)]
 
-        def _gpu_poll(handle=gpu_handle, samples=gpu_samples_img, stop=_stop_poll):
-            while not stop.is_set():
-                samples.append(_read_gpu_power_w(handle))
-                time.sleep(0.05)
+    # GPU power accumulator across the burst
+    gpu_samples_burst: List[float] = []
+    _stop_poll = _threading.Event()
 
-        poller = _threading.Thread(target=_gpu_poll, daemon=True)
-        poller.start()
+    def _gpu_poll(handle=gpu_handle, samples=gpu_samples_burst, stop=_stop_poll):
+        while not stop.is_set():
+            samples.append(_read_gpu_power_w(handle))
+            time.sleep(0.05)
 
-        # --- Read CPU energy counter, run inference, read counter again ---
-        e0 = _read_rapl_uj()
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            _ = model(img)
-        if use_cuda_sync:
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        e1 = _read_rapl_uj()
+    poller = _threading.Thread(target=_gpu_poll, daemon=True)
+    poller.start()
 
-        _stop_poll.set()
-        poller.join(timeout=1.0)
+    # Bracket the entire rotating burst with RAPL
+    e0 = _read_rapl_uj()
+    burst_t0 = time.perf_counter()
 
-        latency_s = t1 - t0
-        latency_ms = latency_s * 1000.0
+    for _round in range(burst_rounds):
+        for img_idx, (orig_idx, img) in enumerate(device_images):
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                _ = model(img)
+            if use_cuda_sync:
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            per_img_latencies[img_idx].append((t1 - t0) * 1000.0)
 
-        # CPU power from RAPL delta
-        if e0 is not None and e1 is not None and latency_s > 0:
-            raw_cpu_w = ((e1 - e0) / 1e6) / latency_s
-        else:
-            raw_cpu_w = float("nan")
+    burst_t1 = time.perf_counter()
+    e1 = _read_rapl_uj()
 
-        # GPU power from pynvml samples (NaN for CPU-only runs)
-        raw_gpu_w = float(np.nanmean(gpu_samples_img)) if gpu_samples_img else float("nan")
+    _stop_poll.set()
+    poller.join(timeout=2.0)
 
-        # Subtract idle baseline, floor at 0
-        cpu_power = (
-            max(0.0, raw_cpu_w - idle_cpu_w)
-            if not (np.isnan(raw_cpu_w) or np.isnan(idle_cpu_w))
-            else raw_cpu_w
-        )
-        gpu_power = (
-            max(0.0, raw_gpu_w - idle_gpu_w)
-            if not (np.isnan(raw_gpu_w) or np.isnan(idle_gpu_w))
-            else raw_gpu_w
-        )
+    total_burst_s = burst_t1 - burst_t0
 
-        # Energy = active power × time
-        # GPU term is 0 for CPU-only runs (NaN treated as 0 for energy sum only)
-        active_w = cpu_power + (gpu_power if not np.isnan(gpu_power) else 0.0)
-        energy_kwh = (latency_s * active_w) / 3_600_000.0
+    # Total system power over burst window
+    if e0 is not None and e1 is not None and total_burst_s > 0:
+        raw_cpu_w = ((e1 - e0) / 1e6) / total_burst_s
+    else:
+        raw_cpu_w = float("nan")
 
-        latencies_ms.append(latency_ms)
-        cpu_powers.append(cpu_power)
-        gpu_powers.append(gpu_power)
+    raw_gpu_w = float(np.nanmean(gpu_samples_burst)) if gpu_samples_burst else float("nan")
+
+    # Subtract idle baseline, floor at 0
+    cpu_power = (
+        max(0.0, raw_cpu_w - idle_cpu_w)
+        if not (np.isnan(raw_cpu_w) or np.isnan(idle_cpu_w))
+        else raw_cpu_w
+    )
+    gpu_power = (
+        max(0.0, raw_gpu_w - idle_gpu_w)
+        if not (np.isnan(raw_gpu_w) or np.isnan(idle_gpu_w))
+        else raw_gpu_w
+    )
+
+    log.info(
+        f"      Burst power: cpu={cpu_power:.2f} W  gpu={gpu_power:.2f} W  "
+        f"({n_total} inferences in {total_burst_s:.1f} s)"
+    )
+
+    # Per-image energy: active_power * (mean_latency / 3_600_000)
+    # This correctly attributes energy proportionally to each image's latency.
+    active_w = cpu_power + (gpu_power if not np.isnan(gpu_power) else 0.0)
+
+    per_image_rows = []
+    all_mean_latencies = []
+
+    for img_idx, (orig_idx, _img) in enumerate(device_images):
+        lats = np.array(per_img_latencies[img_idx])
+        mean_lat_ms = float(np.mean(lats))
+        all_mean_latencies.append(mean_lat_ms)
+        energy_kwh = (mean_lat_ms / 1000.0 * active_w) / 3_600_000.0
 
         per_image_rows.append({
             "image_idx": img_idx,
             "image_sample_idx": orig_idx,
-            "latency_ms": latency_ms,
+            "latency_ms": mean_lat_ms,
             "energy_kwh": energy_kwh,
             "cpu_power_w": cpu_power,
             "gpu_power_w": gpu_power,
-            "ram_power_w": float("nan"),  # not measured directly
+            "ram_power_w": float("nan"),
         })
 
-    arr = np.array(latencies_ms)
+    arr = np.array(all_mean_latencies)
     mean_latency = float(np.mean(arr))
     throughput = 1000.0 / mean_latency if mean_latency > 0 else float("nan")
     all_energies = [r["energy_kwh"] for r in per_image_rows]
@@ -481,8 +519,8 @@ def run_single_image_bench(
         "max_latency_ms":           float(np.max(arr)),
         "throughput_imgs_per_s":    throughput,
         "mean_energy_kwh_per_image":float(np.nanmean(all_energies)),
-        "mean_cpu_power_w":         float(np.nanmean(cpu_powers)),
-        "mean_gpu_power_w":         float(np.nanmean(gpu_powers)),
+        "mean_cpu_power_w":         cpu_power,
+        "mean_gpu_power_w":         gpu_power,
         "mean_ram_power_w":         float("nan"),
     }
 
@@ -544,6 +582,7 @@ def benchmark_cnn(
     n_reps: int,
     n_images: int,
     warmup: int,
+    burst_rounds: int,
     output_root: Path,
 ):
     out_dir = output_root / "CNN"
@@ -671,6 +710,7 @@ def parse_args():
     parser.add_argument("--devices", nargs="+", default=["cpu", "cuda"])
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--n-images", type=int, default=10)
+    parser.add_argument("--burst-rounds", type=int, default=50, help="Rotating burst rounds per image for energy measurement")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument(
         "--output-dir", type=Path,
@@ -685,7 +725,7 @@ def main():
     log.info(f"Datasets: {args.datasets} | Devices: {args.devices}")
     log.info(f"Reps: {args.reps} | Images/rep: {args.n_images} | Warmup: {args.warmup}")
     benchmark_cnn(datasets=args.datasets, devices=args.devices, n_reps=args.reps,
-                  n_images=args.n_images, warmup=args.warmup, output_root=args.output_dir)
+                  n_images=args.n_images, warmup=args.warmup, burst_rounds=args.burst_rounds, output_root=args.output_dir)
     log.info("Done.")
 
 
