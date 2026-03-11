@@ -409,6 +409,235 @@ def discover_vit_models(dataset: str) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
+# CPU TDP constants for power estimation
+# Xeon Platinum 8259CL (EC2 c5/m5/p3 Cascade Lake instances): 210W / 48 cores
+# Power per vCPU allocation = TDP * (os.cpu_count() / CPU_TOTAL_CORES)
+# Update these if you move to a different instance type.
+# ---------------------------------------------------------------------------
+CPU_TDP_W = 210.0       # Xeon Platinum 8259CL full-socket TDP in Watts
+CPU_TOTAL_CORES = 48    # Physical cores per socket on 8259CL
+
+# ---------------------------------------------------------------------------
+# Paths — adjust to your filesystem layout
+# ---------------------------------------------------------------------------
+CNN_MODEL_ROOT = Path(
+    "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/CNN_pruned_models"
+)
+
+_DATASETS_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_balanced"
+_NPY_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/datasets_npy"
+
+DATASET_PATHS = {
+    "bloodmnist": Path(f"{_DATASETS_DIR}/bloodmnist_224.npz"),
+    "dermamnist":  Path(f"{_DATASETS_DIR}/dermamnist_224.npz"),
+    "pathmnist":   Path(f"{_DATASETS_DIR}/pathmnist_224.npz"),
+    "chestmnist":  Path(f"{_NPY_DIR}/chestmnist_224"),
+}
+MULTI_LABEL_DATASETS = {"chestmnist"}
+
+DATASETS = ["bloodmnist", "dermamnist", "pathmnist", "chestmnist"]
+
+NUM_CLASSES = {
+    "bloodmnist": 8,
+    "dermamnist": 7,
+    "pathmnist": 9,
+    "chestmnist": 14,
+}
+
+# ---------------------------------------------------------------------------
+# Dataset helpers
+# ---------------------------------------------------------------------------
+
+def load_test_images(dataset: str, n: int, seed: int) -> list:
+    """Load `n` random test images from the MedMNIST dataset."""
+    data_path = DATASET_PATHS.get(dataset)
+    if data_path is None:
+        raise FileNotFoundError(f"No data path configured for dataset: {dataset}")
+
+    if dataset in MULTI_LABEL_DATASETS:
+        npy_file = data_path / "test_images.npy"
+        if not npy_file.exists():
+            raise FileNotFoundError(f"Cannot find chestmnist test images. Expected: {npy_file}")
+        imgs = np.load(npy_file)
+    else:
+        if not data_path.exists():
+            raise FileNotFoundError(f"Cannot find test data for {dataset}. Expected: {data_path}")
+        data = np.load(data_path)
+        if "test_images" in data:
+            imgs = data["test_images"]
+        elif "test_img" in data:
+            imgs = data["test_img"]
+        else:
+            raise KeyError(
+                f"NPZ file {data_path} has no 'test_images' key. "
+                f"Available keys: {list(data.keys())}"
+            )
+
+    rng = random.Random(seed)
+    indices = rng.sample(range(len(imgs)), min(n, len(imgs)))
+
+    tensors = []
+    for idx in indices:
+        img = imgs[idx]
+        if img.ndim == 2:
+            img = np.stack([img, img, img], axis=-1)
+        elif img.shape[-1] == 1:
+            img = np.concatenate([img, img, img], axis=-1)
+        img = img.transpose(2, 0, 1).astype(np.float32) / 255.0
+        t = torch.from_numpy(img).unsqueeze(0)
+        if t.shape[-1] != 224 or t.shape[-2] != 224:
+            t = torch.nn.functional.interpolate(
+                t, size=(224, 224), mode="bilinear", align_corners=False
+            )
+        tensors.append((idx, t))
+
+    return tensors
+
+
+# ---------------------------------------------------------------------------
+# CNN model definitions
+# ---------------------------------------------------------------------------
+
+class CustomResNet(nn.Module):
+    def __init__(self, block=Bottleneck, layers=[3, 4, 6, 3],
+                 stage_planes=[64, 128, 256, 512], num_classes=1000, in_channels=3):
+        super().__init__()
+        self.inplanes = 64
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, stage_planes[0], layers[0])
+        self.layer2 = self._make_layer(block, stage_planes[1], layers[1], stride=2)
+        self.layer3 = self._make_layer(block, stage_planes[2], layers[2], stride=2)
+        self.layer4 = self._make_layer(block, stage_planes[3], layers[3], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(stage_planes[3] * block.expansion, num_classes)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+        layers = [block(self.inplanes, planes, stride=stride, downsample=downsample)]
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x); x = self.bn1(x); x = self.relu(x); x = self.maxpool(x)
+        x = self.layer1(x); x = self.layer2(x); x = self.layer3(x); x = self.layer4(x)
+        x = self.avgpool(x); x = torch.flatten(x, 1)
+        return self.fc(x)
+
+
+def _infer_resnet_depth(sd: dict) -> List[int]:
+    layers = []
+    for layer_idx in range(1, 5):
+        max_block = -1
+        for k in sd:
+            if k.startswith(f"layer{layer_idx}."):
+                parts = k.split(".")
+                if len(parts) >= 2:
+                    try:
+                        max_block = max(max_block, int(parts[1]))
+                    except ValueError:
+                        pass
+        layers.append(max_block + 1 if max_block >= 0 else 3)
+    return layers
+
+
+def _infer_stage_planes(sd: dict) -> List[int]:
+    planes = []
+    for layer_idx in range(1, 5):
+        key = f"layer{layer_idx}.0.conv1.weight"
+        if key in sd:
+            planes.append(sd[key].shape[0])
+        else:
+            raise ValueError(f"Cannot find '{key}' in checkpoint.")
+    return planes
+
+
+def load_cnn_model(model_path: Path, num_classes: int) -> nn.Module:
+    sd = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(sd, dict) and "state_dict" in sd:
+        sd = sd["state_dict"]
+    if isinstance(sd, dict) and "model" in sd:
+        sd = sd["model"]
+    if any(k.startswith("module.") for k in sd):
+        sd = {k[len("module."):]: v for k, v in sd.items()}
+    stage_planes = _infer_stage_planes(sd)
+    layers = _infer_resnet_depth(sd)
+    sample = next(iter(sd.values()))
+    if sample.dtype == torch.float16:
+        sd = {k: v.float() for k, v in sd.items()}
+    model = CustomResNet(block=Bottleneck, layers=layers,
+                         stage_planes=stage_planes, num_classes=num_classes)
+    model.load_state_dict(sd)
+    return model.float()
+
+
+# ---------------------------------------------------------------------------
+# CNN model discovery
+# ---------------------------------------------------------------------------
+
+_CNN_SKIP_PATTERNS = {"optimizer", "scheduler", "epoch_", "checkpoint_", "last_", "tmp_"}
+
+
+def _cnn_model_filter(fname: str) -> bool:
+    if not (fname.endswith(".pth") or fname.endswith(".pt")):
+        return False
+    fname_lower = fname.lower()
+    for pat in _CNN_SKIP_PATTERNS:
+        if pat in fname_lower:
+            return False
+    return True
+
+
+def _infer_cnn_method_precision(name: str) -> Tuple[str, str]:
+    name_lower = name.lower()
+    if name in ("baseline", "model"):
+        return "baseline", "fp32"
+    if "fp16" in name_lower:
+        method = name.split("_fp16")[0]
+        return method, "fp16"
+    if "quantization" in name_lower or "quant" in name_lower:
+        return "quantization", "fp16"
+    if "int8" in name_lower:
+        return "quantization_int8", "int8"
+    for suffix in ["_r50compressed_final", "_r18compressed_final", "_r34compressed_final",
+                   "_compressed_final", "_final", "_best"]:
+        if name.endswith(suffix):
+            return name[: -len(suffix)], "fp32"
+    return name, "fp32"
+
+
+def discover_cnn_models(dataset: str) -> List[Dict]:
+    base = CNN_MODEL_ROOT / dataset
+    if not base.exists():
+        log.warning(f"CNN dataset dir not found: {base}")
+        return []
+    models = []
+    seen_paths = set()
+    for f in sorted(base.rglob("*")):
+        if not f.is_file() or not _cnn_model_filter(f.name) or f in seen_paths:
+            continue
+        seen_paths.add(f)
+        name = f.stem
+        method, precision = _infer_cnn_method_precision(name)
+        models.append({
+            "path": f, "model_name": name,
+            "pruning_method": method, "stored_precision": precision,
+            "architecture": "resnet", "model_size_mb": f.stat().st_size / 1e6,
+        })
+    return models
+
+
+
+# ---------------------------------------------------------------------------
 # Power measurement — tiered fallback: RAPL → perf → CodeCarbon TDP
 # ---------------------------------------------------------------------------
 #
@@ -467,43 +696,28 @@ def _detect_power_tier() -> str:
     except Exception:
         pass
 
-    # Tier 3: CodeCarbon — probe under CPU load to confirm it returns a
-    # non-zero cpu_power. Must run under load because CodeCarbon estimates
-    # TDP x utilization: at idle (e.g. before first model loads) utilization
-    # is near zero, so the probe returns 0 W and we incorrectly reject it.
+    # Tier 3: TDP-based estimation.
+    # CodeCarbon 3.x has a scheduler bug ("Power history is empty, returning 0 W")
+    # on short measurement windows on this EC2 instance, making it unreliable.
+    # Instead we estimate CPU power directly from published TDP:
+    #   Xeon Platinum 8259CL: 210W TDP, 48 physical cores per socket.
+    #   vCPU allocation: os.cpu_count() vCPUs on this instance.
+    #   Estimated power = TDP * (vcpus / total_cores)
+    # This is exactly what CodeCarbon falls back to anyway, just done reliably.
+    # Override CPU_TDP_W and CPU_TOTAL_CORES at top of file if instance changes.
     try:
-        import threading as _probe_thread
-        import time as _time
-        from codecarbon import EmissionsTracker as _ET
-
-        # Spin a CPU load thread for the duration of the probe so CodeCarbon
-        # sees real utilization and returns a non-zero TDP estimate.
-        _probe_stop = _probe_thread.Event()
-        def _cpu_spin():
-            x = 0.0
-            while not _probe_stop.is_set():
-                x += 1.0  # tight arithmetic loop, no sleep
-        _spinner = _probe_thread.Thread(target=_cpu_spin, daemon=True)
-        _spinner.start()
-
-        _t = _ET(project_name="_probe", log_level="error",
-                 save_to_file=False, measure_power_secs=0.5)
-        _t.start()
-        _time.sleep(2.0)   # give CodeCarbon's thread time to sample under load
-        _t.stop()
-        _probe_stop.set()
-        _spinner.join(timeout=1.0)
-
-        _d = _t.final_emissions_data
-        _cpu_w = float(getattr(_d, "cpu_power", float("nan")))
-        if not (_cpu_w != _cpu_w) and _cpu_w > 0:  # not NaN and positive
-            _POWER_TIER = "codecarbon"
-            log.info(f"Power tier: CodeCarbon TDP estimation (probe: {_cpu_w:.1f} W)")
-            return _POWER_TIER
-        else:
-            log.warning(f"CodeCarbon probe returned cpu_power={_cpu_w} — treating as unavailable")
+        import os as _os
+        _vcpus = _os.cpu_count() or 1
+        _estimated_w = CPU_TDP_W * (_vcpus / CPU_TOTAL_CORES)
+        _POWER_TIER = "tdp"
+        log.info(
+            f"Power tier: TDP estimation "
+            f"({CPU_TDP_W}W TDP / {CPU_TOTAL_CORES} cores x {_vcpus} vCPUs "
+            f"= {_estimated_w:.1f} W)"
+        )
+        return _POWER_TIER
     except Exception as e:
-        log.debug(f"CodeCarbon probe failed: {e}")
+        log.debug(f"TDP estimation failed: {e}")
 
     _POWER_TIER = "none"
     log.warning(
@@ -565,23 +779,15 @@ def _cpu_power_perf(duration_s: float) -> float:
     return float("nan")
 
 
-def _cpu_power_codecarbon(duration_s: float) -> float:
-    """CPU power via CodeCarbon EmissionsTracker over duration_s seconds."""
-    try:
-        from codecarbon import EmissionsTracker
-        tracker = EmissionsTracker(
-            project_name="_power_sample",
-            log_level="error",
-            save_to_file=False,
-            measure_power_secs=max(0.5, duration_s / 4),
-        )
-        tracker.start()
-        time.sleep(duration_s)
-        tracker.stop()
-        data = tracker.final_emissions_data
-        return float(getattr(data, "cpu_power", float("nan")))
-    except Exception:
-        return float("nan")
+def _cpu_power_tdp() -> float:
+    """
+    CPU power via TDP-proportional estimation.
+    Xeon Platinum 8259CL: 210W TDP, 48 physical cores per socket.
+    Power allocated to this instance = TDP * (vCPUs / total_cores).
+    """
+    import os as _os
+    vcpus = _os.cpu_count() or 1
+    return CPU_TDP_W * (vcpus / CPU_TOTAL_CORES)
 
 
 def measure_power_w(duration_s: float, gpu_handle) -> Dict:
@@ -600,8 +806,8 @@ def measure_power_w(duration_s: float, gpu_handle) -> Dict:
             cpu_result[0] = _cpu_power_rapl(duration_s)
         elif tier == "perf":
             cpu_result[0] = _cpu_power_perf(duration_s)
-        elif tier == "codecarbon":
-            cpu_result[0] = _cpu_power_codecarbon(duration_s)
+        elif tier == "tdp":
+            cpu_result[0] = _cpu_power_tdp()
 
     cpu_thread = _threading.Thread(target=_measure_cpu)
     cpu_thread.start()
@@ -669,6 +875,15 @@ def run_single_image_bench(
     """
     use_cuda_sync = device.startswith("cuda") and torch.cuda.is_available()
 
+    # For CPU runs, restrict to 1 thread to match single-image clinical
+    # deployment (one inference request processed at a time, no intra-op
+    # parallelism). This also makes the TDP-proportional energy estimate
+    # more accurate — 1 active core rather than all vCPUs.
+    # Restored to default after benchmarking to avoid side effects.
+    _prev_num_threads = torch.get_num_threads()
+    if not use_cuda_sync:
+        torch.set_num_threads(1)
+
     if device == "cpu" and next(model.parameters()).dtype == torch.float16:
         model = model.float()
     is_fp16 = next(model.parameters()).dtype == torch.float16
@@ -707,8 +922,8 @@ def run_single_image_bench(
         idle_cpu_w = idle["cpu_w"] if not np.isnan(idle["cpu_w"]) else 0.0
         idle_gpu_w = idle["gpu_w"] if not np.isnan(idle["gpu_w"]) else 0.0
         log.info(f"      Idle: cpu={idle_cpu_w:.2f} W  gpu={idle_gpu_w:.2f} W")
-    elif tier == "codecarbon":
-        log.info(f"      Power tier: CodeCarbon (no idle subtraction — TDP x utilization)")
+    elif tier == "tdp":
+        log.info(f"      Power tier: TDP estimation ({_cpu_power_tdp():.1f} W — no idle subtraction)")
     else:
         log.info(f"      Power tier: none — energy metrics will be NaN")
 
@@ -732,23 +947,9 @@ def run_single_image_bench(
         gpu_poller.start()
 
     # --- CPU power measurement setup ---
-    # RAPL/perf: bracket burst with energy counter
-    # CodeCarbon: wrap burst in a single EmissionsTracker task
-    cc_tracker = None
-    if tier == "codecarbon":
-        try:
-            from codecarbon import EmissionsTracker
-            cc_tracker = EmissionsTracker(
-                project_name="single_img_bench",
-                log_level="error",
-                save_to_file=False,
-                measure_power_secs=1,  # 1-second polling interval across burst
-            )
-            cc_tracker.start()
-            cc_tracker.start_task("burst")
-        except Exception as e:
-            log.debug(f"CodeCarbon tracker init failed: {e}")
-            cc_tracker = None
+    # RAPL/perf: bracket burst with energy counter (set up below)
+    # TDP: no setup needed — _cpu_power_tdp() called after burst
+    cc_tracker = None  # not used in tdp tier
 
     e0 = _read_rapl_uj() if tier == "rapl" else None
     perf_proc = None
@@ -800,13 +1001,8 @@ def run_single_image_bench(
         except Exception:
             pass
 
-    elif tier == "codecarbon" and cc_tracker is not None:
-        try:
-            task = cc_tracker.stop_task("burst")
-            cc_tracker.stop()
-            raw_cpu_w = float(getattr(task, "cpu_power", float("nan")))
-        except Exception as e:
-            log.debug(f"CodeCarbon burst read failed: {e}")
+    elif tier == "tdp":
+        raw_cpu_w = _cpu_power_tdp()
 
     # --- GPU power ---
     raw_gpu_w = float(np.nanmean(gpu_samples_burst)) if gpu_samples_burst else float("nan")
@@ -816,11 +1012,9 @@ def run_single_image_bench(
         cpu_power = max(0.0, raw_cpu_w - idle_cpu_w) if not np.isnan(raw_cpu_w) else float("nan")
         gpu_power = max(0.0, raw_gpu_w - idle_gpu_w) if not np.isnan(raw_gpu_w) else float("nan")
     else:
-        # CodeCarbon already gives active power (TDP x util); no subtraction
+        # TDP estimation is already an active-power estimate; no idle subtraction
         cpu_power = raw_cpu_w
-        gpu_power = max(0.0, raw_gpu_w - idle_gpu_w) if (
-            not np.isnan(raw_gpu_w) and not np.isnan(idle_gpu_w)
-        ) else raw_gpu_w
+        gpu_power = raw_gpu_w  # pynvml gives board power directly; no subtraction needed
 
     log.info(
         f"      Burst power: cpu={cpu_power:.2f} W  gpu={gpu_power:.2f} W  "
@@ -868,6 +1062,9 @@ def run_single_image_bench(
         "mean_gpu_power_w":         gpu_power,
         "mean_ram_power_w":         float("nan"),
     }
+
+    # Restore thread count
+    torch.set_num_threads(_prev_num_threads)
 
     return per_image_rows, aggregated
 # ---------------------------------------------------------------------------

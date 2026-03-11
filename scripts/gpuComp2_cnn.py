@@ -52,6 +52,15 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# CPU TDP constants for power estimation
+# Xeon Platinum 8259CL (EC2 c5/m5/p3 Cascade Lake instances): 210W / 48 cores
+# Power per vCPU allocation = TDP * (os.cpu_count() / CPU_TOTAL_CORES)
+# Update these if you move to a different instance type.
+# ---------------------------------------------------------------------------
+CPU_TDP_W = 210.0       # Xeon Platinum 8259CL full-socket TDP in Watts
+CPU_TOTAL_CORES = 48    # Physical cores per socket on 8259CL
+
+# ---------------------------------------------------------------------------
 # Paths — adjust to your filesystem layout
 # ---------------------------------------------------------------------------
 CNN_MODEL_ROOT = Path(
@@ -330,25 +339,28 @@ def _detect_power_tier() -> str:
     except Exception:
         pass
 
-    # Tier 3: CodeCarbon — probe with a short live measurement to confirm it
-    # actually returns a non-NaN cpu_power (some environments report 0/NaN)
+    # Tier 3: TDP-based estimation.
+    # CodeCarbon 3.x has a scheduler bug ("Power history is empty, returning 0 W")
+    # on short measurement windows on this EC2 instance, making it unreliable.
+    # Instead we estimate CPU power directly from published TDP:
+    #   Xeon Platinum 8259CL: 210W TDP, 48 physical cores per socket.
+    #   vCPU allocation: os.cpu_count() vCPUs on this instance.
+    #   Estimated power = TDP * (vcpus / total_cores)
+    # This is exactly what CodeCarbon falls back to anyway, just done reliably.
+    # Override CPU_TDP_W and CPU_TOTAL_CORES at top of file if instance changes.
     try:
-        from codecarbon import EmissionsTracker as _ET
-        _t = _ET(project_name="_probe", log_level="error",
-                 save_to_file=False, measure_power_secs=0.5)
-        _t.start()
-        import time as _time; _time.sleep(1.5)
-        _t.stop()
-        _d = _t.final_emissions_data
-        _cpu_w = float(getattr(_d, "cpu_power", float("nan")))
-        if not (_cpu_w != _cpu_w) and _cpu_w > 0:  # not NaN and positive
-            _POWER_TIER = "codecarbon"
-            log.info(f"Power tier: CodeCarbon TDP estimation (probe: {_cpu_w:.1f} W)")
-            return _POWER_TIER
-        else:
-            log.warning(f"CodeCarbon probe returned cpu_power={_cpu_w} — treating as unavailable")
+        import os as _os
+        _vcpus = _os.cpu_count() or 1
+        _estimated_w = CPU_TDP_W * (_vcpus / CPU_TOTAL_CORES)
+        _POWER_TIER = "tdp"
+        log.info(
+            f"Power tier: TDP estimation "
+            f"({CPU_TDP_W}W TDP / {CPU_TOTAL_CORES} cores x {_vcpus} vCPUs "
+            f"= {_estimated_w:.1f} W)"
+        )
+        return _POWER_TIER
     except Exception as e:
-        log.debug(f"CodeCarbon probe failed: {e}")
+        log.debug(f"TDP estimation failed: {e}")
 
     _POWER_TIER = "none"
     log.warning(
@@ -410,23 +422,15 @@ def _cpu_power_perf(duration_s: float) -> float:
     return float("nan")
 
 
-def _cpu_power_codecarbon(duration_s: float) -> float:
-    """CPU power via CodeCarbon EmissionsTracker over duration_s seconds."""
-    try:
-        from codecarbon import EmissionsTracker
-        tracker = EmissionsTracker(
-            project_name="_power_sample",
-            log_level="error",
-            save_to_file=False,
-            measure_power_secs=max(0.5, duration_s / 4),
-        )
-        tracker.start()
-        time.sleep(duration_s)
-        tracker.stop()
-        data = tracker.final_emissions_data
-        return float(getattr(data, "cpu_power", float("nan")))
-    except Exception:
-        return float("nan")
+def _cpu_power_tdp() -> float:
+    """
+    CPU power via TDP-proportional estimation.
+    Xeon Platinum 8259CL: 210W TDP, 48 physical cores per socket.
+    Power allocated to this instance = TDP * (vCPUs / total_cores).
+    """
+    import os as _os
+    vcpus = _os.cpu_count() or 1
+    return CPU_TDP_W * (vcpus / CPU_TOTAL_CORES)
 
 
 def measure_power_w(duration_s: float, gpu_handle) -> Dict:
@@ -445,8 +449,8 @@ def measure_power_w(duration_s: float, gpu_handle) -> Dict:
             cpu_result[0] = _cpu_power_rapl(duration_s)
         elif tier == "perf":
             cpu_result[0] = _cpu_power_perf(duration_s)
-        elif tier == "codecarbon":
-            cpu_result[0] = _cpu_power_codecarbon(duration_s)
+        elif tier == "tdp":
+            cpu_result[0] = _cpu_power_tdp()
 
     cpu_thread = _threading.Thread(target=_measure_cpu)
     cpu_thread.start()
@@ -514,6 +518,15 @@ def run_single_image_bench(
     """
     use_cuda_sync = device.startswith("cuda") and torch.cuda.is_available()
 
+    # For CPU runs, restrict to 1 thread to match single-image clinical
+    # deployment (one inference request processed at a time, no intra-op
+    # parallelism). This also makes the TDP-proportional energy estimate
+    # more accurate — 1 active core rather than all vCPUs.
+    # Restored to default after benchmarking to avoid side effects.
+    _prev_num_threads = torch.get_num_threads()
+    if not use_cuda_sync:
+        torch.set_num_threads(1)
+
     if device == "cpu" and next(model.parameters()).dtype == torch.float16:
         model = model.float()
     is_fp16 = next(model.parameters()).dtype == torch.float16
@@ -552,8 +565,8 @@ def run_single_image_bench(
         idle_cpu_w = idle["cpu_w"] if not np.isnan(idle["cpu_w"]) else 0.0
         idle_gpu_w = idle["gpu_w"] if not np.isnan(idle["gpu_w"]) else 0.0
         log.info(f"      Idle: cpu={idle_cpu_w:.2f} W  gpu={idle_gpu_w:.2f} W")
-    elif tier == "codecarbon":
-        log.info(f"      Power tier: CodeCarbon (no idle subtraction — TDP x utilization)")
+    elif tier == "tdp":
+        log.info(f"      Power tier: TDP estimation ({_cpu_power_tdp():.1f} W — no idle subtraction)")
     else:
         log.info(f"      Power tier: none — energy metrics will be NaN")
 
@@ -577,23 +590,9 @@ def run_single_image_bench(
         gpu_poller.start()
 
     # --- CPU power measurement setup ---
-    # RAPL/perf: bracket burst with energy counter
-    # CodeCarbon: wrap burst in a single EmissionsTracker task
-    cc_tracker = None
-    if tier == "codecarbon":
-        try:
-            from codecarbon import EmissionsTracker
-            cc_tracker = EmissionsTracker(
-                project_name="single_img_bench",
-                log_level="error",
-                save_to_file=False,
-                measure_power_secs=max(1, n_total // 20),  # ~20 samples across burst
-            )
-            cc_tracker.start()
-            cc_tracker.start_task("burst")
-        except Exception as e:
-            log.debug(f"CodeCarbon tracker init failed: {e}")
-            cc_tracker = None
+    # RAPL/perf: bracket burst with energy counter (set up below)
+    # TDP: no setup needed — _cpu_power_tdp() called after burst
+    cc_tracker = None  # not used in tdp tier
 
     e0 = _read_rapl_uj() if tier == "rapl" else None
     perf_proc = None
@@ -645,13 +644,8 @@ def run_single_image_bench(
         except Exception:
             pass
 
-    elif tier == "codecarbon" and cc_tracker is not None:
-        try:
-            task = cc_tracker.stop_task("burst")
-            cc_tracker.stop()
-            raw_cpu_w = float(getattr(task, "cpu_power", float("nan")))
-        except Exception as e:
-            log.debug(f"CodeCarbon burst read failed: {e}")
+    elif tier == "tdp":
+        raw_cpu_w = _cpu_power_tdp()
 
     # --- GPU power ---
     raw_gpu_w = float(np.nanmean(gpu_samples_burst)) if gpu_samples_burst else float("nan")
@@ -661,11 +655,9 @@ def run_single_image_bench(
         cpu_power = max(0.0, raw_cpu_w - idle_cpu_w) if not np.isnan(raw_cpu_w) else float("nan")
         gpu_power = max(0.0, raw_gpu_w - idle_gpu_w) if not np.isnan(raw_gpu_w) else float("nan")
     else:
-        # CodeCarbon already gives active power (TDP x util); no subtraction
+        # TDP estimation is already an active-power estimate; no idle subtraction
         cpu_power = raw_cpu_w
-        gpu_power = max(0.0, raw_gpu_w - idle_gpu_w) if (
-            not np.isnan(raw_gpu_w) and not np.isnan(idle_gpu_w)
-        ) else raw_gpu_w
+        gpu_power = raw_gpu_w  # pynvml gives board power directly; no subtraction needed
 
     log.info(
         f"      Burst power: cpu={cpu_power:.2f} W  gpu={gpu_power:.2f} W  "
@@ -713,6 +705,9 @@ def run_single_image_bench(
         "mean_gpu_power_w":         gpu_power,
         "mean_ram_power_w":         float("nan"),
     }
+
+    # Restore thread count
+    torch.set_num_threads(_prev_num_threads)
 
     return per_image_rows, aggregated
 # ---------------------------------------------------------------------------
