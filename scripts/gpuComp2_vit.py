@@ -8,6 +8,8 @@ Design:
   - Load each model once, run 5 warmup passes, then time N individual images
     one-at-a-time across 3 independent repetitions.
   - Energy is tracked per image (CodeCarbon start/stop per image).
+  - Energy and power are tracked via CodeCarbon start_task/stop_task,
+    with one tracker kept alive per rep so its monitoring thread is warm.
   - CPU and CUDA devices are both tested for every model.
   - Results are written to:
       single_image_benchmarking/
@@ -80,6 +82,8 @@ NUM_CLASSES = {
     "chestmnist": 14,
 }
 
+
+
 # ---------------------------------------------------------------------------
 # Dataset helpers
 # ---------------------------------------------------------------------------
@@ -135,7 +139,6 @@ def load_test_images(dataset: str, n: int, seed: int) -> list:
 # ---------------------------------------------------------------------------
 
 class DeployMlp(nn.Module):
-    """MLP without gates — physically smaller post-pruning."""
     def __init__(self, in_features, hidden_features, out_features=None,
                  act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -146,59 +149,38 @@ class DeployMlp(nn.Module):
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
+        x = self.fc1(x); x = self.act(x); x = self.drop(x)
+        x = self.fc2(x); x = self.drop(x)
         return x
 
 
 class DeployAttention(nn.Module):
-    """
-    Multi-head attention without gates — supports per-layer head/dim after pruning.
-
-    Handles the edge case where all heads have been pruned (inner_dim == 0):
-    in that case the attention is a no-op (returns zeros), matching the
-    zero-sized weight tensors stored in the checkpoint.
-    """
     def __init__(self, dim, num_heads, head_dim, qkv_bias=False, qk_scale=None,
                  attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.inner_dim = head_dim * num_heads  # may be 0 if all heads pruned
+        self.inner_dim = head_dim * num_heads
         self.scale = qk_scale or (head_dim ** -0.5 if head_dim > 0 else 1.0)
-
-        # nn.Linear supports 0-dim in/out — creates weight tensor with that shape
         self.qkv = nn.Linear(dim, self.inner_dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(self.inner_dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
-        # When all heads are pruned the projection from zero inner_dim produces zeros
         if self.inner_dim == 0:
             return torch.zeros_like(x)
-
         B, N, C = x.shape
-        qkv = (
-            self.qkv(x)
-            .reshape(B, N, 3, self.num_heads, self.head_dim)
-            .permute(2, 0, 3, 1, 4)
-        )
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        attn = attn.softmax(dim=-1); attn = self.attn_drop(attn)
         x = (attn @ v).transpose(1, 2).reshape(B, N, self.inner_dim)
-        x = self.proj(x)
-        x = self.proj_drop(x)
+        x = self.proj(x); x = self.proj_drop(x)
         return x
 
 
 class DeployBlock(nn.Module):
-    """Transformer block without gates — per-layer dims inferred from checkpoint."""
     def __init__(self, dim, num_heads, head_dim, mlp_hidden_dim,
                  qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
@@ -208,17 +190,13 @@ class DeployBlock(nn.Module):
             self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         except ImportError:
             self.drop_path = nn.Identity()
-
         self.norm1 = norm_layer(dim)
-        self.attn = DeployAttention(
-            dim, num_heads=num_heads, head_dim=head_dim, qkv_bias=qkv_bias,
-            qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
-        )
+        self.attn = DeployAttention(dim, num_heads=num_heads, head_dim=head_dim,
+                                    qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                    attn_drop=attn_drop, proj_drop=drop)
         self.norm2 = norm_layer(dim)
-        self.mlp = DeployMlp(
-            in_features=dim, hidden_features=mlp_hidden_dim,
-            act_layer=act_layer, drop=drop,
-        )
+        self.mlp = DeployMlp(in_features=dim, hidden_features=mlp_hidden_dim,
+                              act_layer=act_layer, drop=drop)
 
     def forward(self, x):
         x = x + self.drop_path(self.attn(self.norm1(x)))
@@ -227,15 +205,6 @@ class DeployBlock(nn.Module):
 
 
 class DeployVisionTransformer(nn.Module):
-    """
-    Physically smaller ViT for oneshot-pruned checkpoints.
-
-    Per-layer num_heads and mlp_hidden_dim are inferred per-block from the
-    checkpoint so the architecture exactly matches the pruned weight tensors.
-    Blocks with all heads removed (inner_dim == 0) are handled correctly:
-    the attention is treated as a no-op while the MLP and skip connection
-    remain active.
-    """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000,
                  embed_dim=192, depth=12, head_dim=64,
                  per_layer_num_heads=None, per_layer_mlp_dim=None,
@@ -245,45 +214,33 @@ class DeployVisionTransformer(nn.Module):
         try:
             from timm.models.layers import PatchEmbed, trunc_normal_
         except ImportError:
-            raise ImportError("timm is required for DeployVisionTransformer: pip install timm")
+            raise ImportError("timm is required: pip install timm")
 
         self.num_classes = num_classes
         self.embed_dim = embed_dim
         self.depth = depth
         self.head_dim = head_dim
 
-        self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size,
-            in_chans=in_chans, embed_dim=embed_dim,
-        )
+        self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size,
+                                      in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
-
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-
         if per_layer_num_heads is None:
             per_layer_num_heads = [max(1, embed_dim // head_dim)] * depth
         if per_layer_mlp_dim is None:
             per_layer_mlp_dim = [embed_dim * 4] * depth
 
         self.blocks = nn.ModuleList([
-            DeployBlock(
-                dim=embed_dim,
-                num_heads=per_layer_num_heads[i],
-                head_dim=head_dim,
-                mlp_hidden_dim=per_layer_mlp_dim[i],
-                qkv_bias=qkv_bias,
-                drop=drop_rate,
-                attn_drop=attn_drop_rate,
-                drop_path=dpr[i],
-                norm_layer=_partial(nn.LayerNorm, eps=1e-6),
-            )
+            DeployBlock(dim=embed_dim, num_heads=per_layer_num_heads[i],
+                        head_dim=head_dim, mlp_hidden_dim=per_layer_mlp_dim[i],
+                        qkv_bias=qkv_bias, drop=drop_rate, attn_drop=attn_drop_rate,
+                        drop_path=dpr[i], norm_layer=_partial(nn.LayerNorm, eps=1e-6))
             for i in range(depth)
         ])
-
         self.norm = nn.LayerNorm(embed_dim)
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
@@ -297,7 +254,6 @@ class DeployVisionTransformer(nn.Module):
         except ImportError:
             return
         if isinstance(m, nn.Linear):
-            # Skip zero-element tensors (fully-pruned layers)
             if m.weight.numel() > 0:
                 trunc_normal_(m.weight, std=0.02)
             if m.bias is not None and m.bias.numel() > 0:
@@ -320,67 +276,39 @@ class DeployVisionTransformer(nn.Module):
 
 
 def _infer_vit_deploy_dims(sd: dict) -> Dict:
-    """
-    Infer all per-layer dims from a oneshot pruned checkpoint.
-
-    Key fix: blocks with all attention heads pruned have qkv.weight of shape
-    [0, embed_dim], giving inner_dim=0 and num_heads=0. We preserve this
-    (no max(1, ...) clamping) so DeployAttention gets the correct zero size
-    and can load the checkpoint without shape mismatches.
-    """
     if "patch_embed.proj.weight" in sd:
         embed_dim = sd["patch_embed.proj.weight"].shape[0]
     elif "patch_embed.weight" in sd:
         embed_dim = sd["patch_embed.weight"].shape[0]
     else:
-        raise KeyError(
-            "Cannot find patch embedding weight in checkpoint. "
-            f"Available keys (first 10): {list(sd.keys())[:10]}"
-        )
+        raise KeyError(f"Cannot find patch embedding weight. Keys: {list(sd.keys())[:10]}")
 
     depth = sum(1 for k in sd if k.startswith("blocks.") and k.endswith(".norm1.weight"))
     head_dim = 64
-
-    per_layer_num_heads = []
-    per_layer_mlp_dim = []
+    per_layer_num_heads, per_layer_mlp_dim = [], []
 
     for i in range(depth):
         qkv_key = f"blocks.{i}.attn.qkv.weight"
         if qkv_key in sd:
             inner_dim = sd[qkv_key].shape[0] // 3
-            # Do NOT clamp to max(1, ...) — preserve zero for fully-pruned blocks
             num_heads = inner_dim // head_dim if head_dim > 0 else 0
         else:
             num_heads = embed_dim // head_dim
         per_layer_num_heads.append(num_heads)
 
         mlp_key = f"blocks.{i}.mlp.fc1.weight"
-        if mlp_key in sd:
-            per_layer_mlp_dim.append(sd[mlp_key].shape[0])
-        else:
-            per_layer_mlp_dim.append(embed_dim * 4)
+        per_layer_mlp_dim.append(sd[mlp_key].shape[0] if mlp_key in sd else embed_dim * 4)
 
-    return dict(
-        embed_dim=embed_dim,
-        depth=depth,
-        head_dim=head_dim,
-        per_layer_num_heads=per_layer_num_heads,
-        per_layer_mlp_dim=per_layer_mlp_dim,
-    )
+    return dict(embed_dim=embed_dim, depth=depth, head_dim=head_dim,
+                per_layer_num_heads=per_layer_num_heads,
+                per_layer_mlp_dim=per_layer_mlp_dim)
 
 
 def load_vit_model(model_path: Path, num_classes: int) -> nn.Module:
-    """
-    Load a ViT checkpoint. Branches based on filename prefix:
-      - _pretrained.pth   → timm standard ViT (fp32)
-      - kd_*_final.pth    → timm student ViT (fp32)
-      - quantization_*    → timm ViT cast to fp16
-      - oneshot_*         → DeployVisionTransformer (custom, pruned dims)
-    """
     try:
         import timm
     except ImportError:
-        raise ImportError("timm is required for ViT loading: pip install timm")
+        raise ImportError("timm is required: pip install timm")
 
     name = model_path.name
     raw_ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
@@ -392,17 +320,15 @@ def load_vit_model(model_path: Path, num_classes: int) -> nn.Module:
     if any(k.startswith("module.") for k in sd):
         sd = {k[len("module."):]: v for k, v in sd.items()}
 
-    def _arch_from_name(stem: str) -> str:
+    def _arch_from_name(stem):
         for size in ["vit_base_patch16_224", "vit_small_patch16_224", "vit_tiny_patch16_224"]:
             if size in stem:
                 return size
         raise ValueError(f"Cannot infer ViT arch from: {stem}")
 
     if name.startswith("oneshot_"):
-        # Prefer pruning_config stored in checkpoint (exact deploy dims)
         pruning_config = raw_ckpt.get("pruning_config", {}) if isinstance(raw_ckpt, dict) else {}
         if pruning_config:
-            log.info(f"  [{name}] using pruning_config from checkpoint")
             model = DeployVisionTransformer(
                 num_classes=num_classes,
                 embed_dim=pruning_config["deploy_embed_dim"],
@@ -416,15 +342,8 @@ def load_vit_model(model_path: Path, num_classes: int) -> nn.Module:
             dims = _infer_vit_deploy_dims(sd)
             pruned_blocks = [i for i, h in enumerate(dims["per_layer_num_heads"]) if h == 0]
             if pruned_blocks:
-                log.info(f"  [{name}] blocks with all heads pruned (no-op attention): {pruned_blocks}")
-            model = DeployVisionTransformer(
-                num_classes=num_classes,
-                embed_dim=dims["embed_dim"],
-                depth=dims["depth"],
-                head_dim=dims["head_dim"],
-                per_layer_num_heads=dims["per_layer_num_heads"],
-                per_layer_mlp_dim=dims["per_layer_mlp_dim"],
-            )
+                log.info(f"  [{name}] blocks with all heads pruned: {pruned_blocks}")
+            model = DeployVisionTransformer(num_classes=num_classes, **dims)
         model.load_state_dict(sd)
 
     elif name.startswith("quantization_"):
@@ -440,7 +359,6 @@ def load_vit_model(model_path: Path, num_classes: int) -> nn.Module:
         model.load_state_dict(sd, strict=False)
 
     else:
-        # _pretrained.pth or any other standard checkpoint
         arch = _arch_from_name(name)
         model = timm.create_model(arch, pretrained=False, num_classes=num_classes)
         model.load_state_dict(sd, strict=False)
@@ -453,88 +371,138 @@ def load_vit_model(model_path: Path, num_classes: int) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 def discover_vit_models(dataset: str) -> List[Dict]:
-    """Return list of dicts for all ViT models (baselines + compressed) for a dataset."""
     models = []
 
-    # Baselines
     if VIT_BASELINE_ROOT.exists():
         for f in sorted(VIT_BASELINE_ROOT.iterdir()):
             if dataset in f.name and f.name.endswith("_pretrained.pth"):
-                arch = None
-                for size in ["base", "small", "tiny"]:
-                    if f"vit_{size}" in f.name:
-                        arch = f"vit_{size}_patch16_224"
-                        break
+                arch = next((f"vit_{s}_patch16_224" for s in ["base", "small", "tiny"]
+                             if f"vit_{s}" in f.name), None)
                 models.append({
-                    "path": f,
-                    "model_name": f.stem,
-                    "pruning_method": "baseline",
-                    "stored_precision": "fp32",
-                    "architecture": arch,
-                    "model_size_mb": f.stat().st_size / 1e6,
+                    "path": f, "model_name": f.stem,
+                    "pruning_method": "baseline", "stored_precision": "fp32",
+                    "architecture": arch, "model_size_mb": f.stat().st_size / 1e6,
                 })
 
-    # Compressed models
     pruned_dir = VIT_PRUNED_ROOT / dataset
     if pruned_dir.exists():
         for f in sorted(pruned_dir.iterdir()):
             if not f.name.endswith("_final.pth"):
                 continue
-
             name = f.stem
-            arch = None
-            for size in ["base", "small", "tiny"]:
-                if f"vit_{size}" in name:
-                    arch = f"vit_{size}_patch16_224"
-                    break
-
+            arch = next((f"vit_{s}_patch16_224" for s in ["base", "small", "tiny"]
+                         if f"vit_{s}" in name), None)
             if name.startswith("kd_") and "_to_" in name:
                 after_to = name.split("_to_", 1)[-1]
-                for size in ["base", "small", "tiny"]:
-                    if f"vit_{size}" in after_to:
-                        arch = f"vit_{size}_patch16_224"
-                        break
-
+                arch = next((f"vit_{s}_patch16_224" for s in ["base", "small", "tiny"]
+                             if f"vit_{s}" in after_to), arch)
+            if name.startswith("quantization_"):
+                continue  # quantization excluded from ViT benchmarking
             method = name.split("_")[0] if "_" in name else name
-            precision = "fp16" if name.startswith("quantization") else "fp32"
-
             models.append({
-                "path": f,
-                "model_name": name,
-                "pruning_method": method,
-                "stored_precision": precision,
-                "architecture": arch,
-                "model_size_mb": f.stat().st_size / 1e6,
+                "path": f, "model_name": name,
+                "pruning_method": method, "stored_precision": "fp32",
+                "architecture": arch, "model_size_mb": f.stat().st_size / 1e6,
             })
 
     return models
 
 
 # ---------------------------------------------------------------------------
-# Benchmarking core
+# Power measurement — RAPL (CPU) + pynvml (GPU) with idle baseline subtraction
+# ---------------------------------------------------------------------------
+#
+# CodeCarbon's cpu_power/gpu_power labels are unreliable on this EC2 instance
+# (labels swap between model types; readings return 0 for some inference
+# windows). Instead we measure power directly:
+#
+#   CPU  — Intel RAPL energy counter (/sys/class/powercap), two readings
+#           50 ms apart → Δenergy / Δtime = package power in Watts.
+#   GPU  — pynvml.nvmlDeviceGetPowerUsage(), polled every 50 ms.
+#
+# Idle baseline subtraction:
+#   After warmup, measure idle system power for 2 s (model loaded, no
+#   inference). Subtract from per-image readings so only inference-
+#   attributable power is reported. Floored at 0 W.
+#
+# CPU-only runs: gpu_handle=None → gpu_power logged as NaN.
+# CUDA runs: both CPU and GPU measured; total = cpu + gpu (idle-subtracted).
 # ---------------------------------------------------------------------------
 
-def _safe_codecarbon():
+try:
+    import pynvml as _pynvml
+    _pynvml.nvmlInit()
+    _HAS_NVML = True
+except Exception:
+    _HAS_NVML = False
+
+_RAPL_PATH = Path("/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj")
+
+
+def _read_rapl_uj() -> Optional[float]:
     try:
-        from codecarbon import EmissionsTracker
-        return EmissionsTracker
-    except ImportError:
-        log.warning("codecarbon not installed — energy metrics will be NaN.")
+        return float(_RAPL_PATH.read_text().strip()) if _RAPL_PATH.exists() else None
+    except Exception:
         return None
 
+
+def _read_gpu_power_w(handle) -> float:
+    try:
+        return _pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
+    except Exception:
+        return float("nan")
+
+
+def _get_gpu_handle(device: str):
+    if not device.startswith("cuda") or not _HAS_NVML:
+        return None
+    try:
+        idx = int(device.split(":")[-1]) if ":" in device else 0
+        return _pynvml.nvmlDeviceGetHandleByIndex(idx)
+    except Exception:
+        return None
+
+
+def measure_power_w(duration_s: float, gpu_handle) -> Dict:
+    """
+    Measure mean CPU package power (RAPL) and GPU power (pynvml) over
+    `duration_s` seconds. Returns {"cpu_w": float, "gpu_w": float}.
+    """
+    e0 = _read_rapl_uj()
+    gpu_samples = []
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < duration_s:
+        if gpu_handle is not None:
+            gpu_samples.append(_read_gpu_power_w(gpu_handle))
+        time.sleep(0.05)
+    e1 = _read_rapl_uj()
+
+    cpu_w = ((e1 - e0) / 1e6) / duration_s if (e0 is not None and e1 is not None) else float("nan")
+    gpu_w = float(np.nanmean(gpu_samples)) if gpu_samples else float("nan")
+    return {"cpu_w": cpu_w, "gpu_w": gpu_w}
+
+
+# ---------------------------------------------------------------------------
+# Benchmarking core
+# ---------------------------------------------------------------------------
 
 def run_single_image_bench(
     model: nn.Module,
     images: List[Tuple[int, torch.Tensor]],
     device: str,
-    codecarbon_output_dir: Path,
     warmup: int = 5,
 ) -> Tuple[List[Dict], Dict]:
-    EmissionsTracker = _safe_codecarbon()
+    """
+    Benchmark single-image inference.
+
+    Power is measured via RAPL (CPU) and pynvml (GPU) with idle baseline
+    subtraction: after warmup, idle system power is sampled for 2 s, then
+    subtracted from each per-image reading so only inference-attributable
+    power is reported. Energy = (latency_s) × (active_power_W).
+    """
     use_cuda_sync = device.startswith("cuda") and torch.cuda.is_available()
 
-    # CPU has no native fp16 compute — running fp16 on CPU is emulated in
-    # software and ~100-1000x slower than fp32. Convert to fp32 for CPU runs.
+    # fp16 on CPU is software-emulated (~100-1000x slower) — convert to fp32
     if device == "cpu" and next(model.parameters()).dtype == torch.float16:
         model = model.float()
 
@@ -553,27 +521,38 @@ def run_single_image_bench(
                 torch.cuda.synchronize()
     del dummy
 
-    codecarbon_output_dir.mkdir(parents=True, exist_ok=True)
+    # Measure idle baseline (model loaded, no inference)
+    gpu_handle = _get_gpu_handle(device)
+    log.info(f"      Measuring idle power baseline (2 s)...")
+    idle = measure_power_w(duration_s=2.0, gpu_handle=gpu_handle)
+    idle_cpu_w = idle["cpu_w"]
+    idle_gpu_w = idle["gpu_w"]
+    log.info(f"      Idle: cpu={idle_cpu_w:.2f} W  gpu={idle_gpu_w:.2f} W")
 
     per_image_rows = []
     latencies_ms = []
-    energies_kwh = []
-    cpu_powers, gpu_powers, ram_powers = [], [], []
+    cpu_powers, gpu_powers = [], []
 
     for img_idx, (orig_idx, img_tensor) in enumerate(images):
         img = img_tensor.to(device)
         if is_fp16:
             img = img.half()
 
-        if EmissionsTracker is not None:
-            tracker = EmissionsTracker(
-                project_name="single_img_bench",
-                output_dir=str(codecarbon_output_dir),
-                log_level="error",
-                save_to_file=False,
-                measure_power_secs=0.1,
-            )
-            tracker.start()
+        # Measure power over the inference window using RAPL + pynvml
+        # We interleave timing with power sampling: start RAPL counter,
+        # run inference, stop RAPL counter, compute mean GPU power.
+        e0 = _read_rapl_uj()
+        gpu_samples_img = []
+
+        import threading as _threading
+        _stop = _threading.Event()
+        def _gpu_poll():
+            while not _stop.is_set():
+                if gpu_handle is not None:
+                    gpu_samples_img.append(_read_gpu_power_w(gpu_handle))
+                time.sleep(0.05)
+        poller = _threading.Thread(target=_gpu_poll, daemon=True)
+        poller.start()
 
         t0 = time.perf_counter()
         with torch.no_grad():
@@ -582,28 +561,33 @@ def run_single_image_bench(
             torch.cuda.synchronize()
         t1 = time.perf_counter()
 
-        energy_kwh = float("nan")
-        cpu_power = float("nan")
-        gpu_power = float("nan")
-        ram_power = float("nan")
+        _stop.set()
+        poller.join(timeout=1.0)
+        e1 = _read_rapl_uj()
 
-        if EmissionsTracker is not None:
-            try:
-                tracker.stop()
-                data = tracker.final_emissions_data
-                energy_kwh = float(getattr(data, "energy_consumed", float("nan")))
-                cpu_power = float(getattr(data, "cpu_power", float("nan")))
-                gpu_power = float(getattr(data, "gpu_power", float("nan")))
-                ram_power = float(getattr(data, "ram_power", float("nan")))
-            except Exception as e:
-                log.debug(f"CodeCarbon read error: {e}")
+        latency_s = t1 - t0
+        latency_ms = latency_s * 1000.0
 
-        latency_ms = (t1 - t0) * 1000.0
+        # CPU power from RAPL
+        if e0 is not None and e1 is not None and latency_s > 0:
+            raw_cpu_w = ((e1 - e0) / 1e6) / latency_s
+        else:
+            raw_cpu_w = float("nan")
+
+        # GPU power from pynvml samples
+        raw_gpu_w = float(np.nanmean(gpu_samples_img)) if gpu_samples_img else float("nan")
+
+        # Subtract idle baseline, floor at 0
+        cpu_power = max(0.0, raw_cpu_w - idle_cpu_w) if not np.isnan(raw_cpu_w) and not np.isnan(idle_cpu_w) else raw_cpu_w
+        gpu_power = max(0.0, raw_gpu_w - idle_gpu_w) if not np.isnan(raw_gpu_w) and not np.isnan(idle_gpu_w) else raw_gpu_w
+
+        # Energy from active power × time
+        active_w = cpu_power + (gpu_power if not np.isnan(gpu_power) else 0.0)
+        energy_kwh = (latency_s * active_w) / 3_600_000.0  # W·s → kWh
+
         latencies_ms.append(latency_ms)
-        energies_kwh.append(energy_kwh)
         cpu_powers.append(cpu_power)
         gpu_powers.append(gpu_power)
-        ram_powers.append(ram_power)
 
         per_image_rows.append({
             "image_idx": img_idx,
@@ -612,31 +596,33 @@ def run_single_image_bench(
             "energy_kwh": energy_kwh,
             "cpu_power_w": cpu_power,
             "gpu_power_w": gpu_power,
-            "ram_power_w": ram_power,
+            "ram_power_w": float("nan"),  # not measured directly
         })
 
     arr = np.array(latencies_ms)
     mean_latency = float(np.mean(arr))
     throughput = 1000.0 / mean_latency if mean_latency > 0 else float("nan")
 
+    # Recompute mean energy from stored per-image values for consistency
+    all_energies = [r["energy_kwh"] for r in per_image_rows]
+
     aggregated = {
-        "mean_latency_ms": mean_latency,
-        "std_latency_ms": float(np.std(arr)),
-        "median_latency_ms": float(np.median(arr)),
-        "p25_latency_ms": float(np.percentile(arr, 25)),
-        "p75_latency_ms": float(np.percentile(arr, 75)),
-        "p90_latency_ms": float(np.percentile(arr, 90)),
-        "min_latency_ms": float(np.min(arr)),
-        "max_latency_ms": float(np.max(arr)),
-        "throughput_imgs_per_s": throughput,
-        "mean_energy_kwh_per_image": float(np.nanmean(energies_kwh)),
-        "mean_cpu_power_w": float(np.nanmean(cpu_powers)),
-        "mean_gpu_power_w": float(np.nanmean(gpu_powers)),
-        "mean_ram_power_w": float(np.nanmean(ram_powers)),
+        "mean_latency_ms":          mean_latency,
+        "std_latency_ms":           float(np.std(arr)),
+        "median_latency_ms":        float(np.median(arr)),
+        "p25_latency_ms":           float(np.percentile(arr, 25)),
+        "p75_latency_ms":           float(np.percentile(arr, 75)),
+        "p90_latency_ms":           float(np.percentile(arr, 90)),
+        "min_latency_ms":           float(np.min(arr)),
+        "max_latency_ms":           float(np.max(arr)),
+        "throughput_imgs_per_s":    throughput,
+        "mean_energy_kwh_per_image":float(np.nanmean(all_energies)),
+        "mean_cpu_power_w":         float(np.nanmean(cpu_powers)),
+        "mean_gpu_power_w":         float(np.nanmean(gpu_powers)),
+        "mean_ram_power_w":         float("nan"),
     }
 
     return per_image_rows, aggregated
-
 
 # ---------------------------------------------------------------------------
 # CSV I/O helpers
@@ -669,8 +655,7 @@ def _ensure_csv(path: Path, cols: List[str]):
 
 def _append_row(path: Path, cols: List[str], row: Dict):
     with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
-        writer.writerow(row)
+        csv.DictWriter(f, fieldnames=cols, extrasaction="ignore").writerow(row)
 
 
 def _load_existing_keys(path: Path) -> set:
@@ -721,18 +706,16 @@ def benchmark_vit(
 
             for device in devices:
                 if device == "cuda" and not torch.cuda.is_available():
-                    log.warning("CUDA requested but not available, skipping cuda device.")
+                    log.warning("CUDA requested but not available, skipping.")
                     continue
 
                 for rep in range(n_reps):
                     key = (model_name, device, str(rep))
                     if key in existing_keys:
-                        log.info(f"    SKIP (already done): {model_name} | {device} | rep={rep}")
+                        log.info(f"    SKIP: {model_name} | {device} | rep={rep}")
                         continue
 
-                    seed = rep * 1000 + hash(model_name) % 997
-                    seed = abs(seed) % (2 ** 31)
-
+                    seed = abs(rep * 1000 + hash(model_name) % 997) % (2 ** 31)
                     log.info(f"    {model_name} | {device} | rep={rep} | seed={seed}")
 
                     try:
@@ -748,63 +731,47 @@ def benchmark_vit(
                         continue
 
                     num_params = sum(p.numel() for p in model.parameters())
-                    cc_dir = out_dir / "codecarbon_tmp" / dataset / model_name / device / f"rep{rep}"
-
                     try:
                         per_image_rows, agg = run_single_image_bench(
-                            model=model,
-                            images=images,
-                            device=device,
-                            codecarbon_output_dir=cc_dir,
+                            model=model, images=images, device=device,
                             warmup=warmup,
                         )
                     except Exception as e:
                         log.error(f"      Benchmark failed: {e}", exc_info=True)
-                        del model
-                        gc.collect()
+                        del model; gc.collect()
                         if device == "cuda":
                             torch.cuda.empty_cache()
                         continue
 
                     ts = datetime.utcnow().isoformat()
-
                     for row in per_image_rows:
-                        row.update({
-                            "model_type": "ViT",
-                            "dataset": dataset,
-                            "model_name": model_name,
-                            "device": device,
-                            "rep": rep,
-                        })
+                        row.update({"model_type": "ViT", "dataset": dataset,
+                                    "model_name": model_name, "device": device, "rep": rep})
                         _append_row(per_img_csv, PER_IMAGE_COLS, row)
 
                     result_row = {
-                        "model_type": "ViT",
-                        "dataset": dataset,
+                        "model_type": "ViT", "dataset": dataset,
                         "model_name": model_name,
                         "pruning_method": info["pruning_method"],
                         "stored_precision": info["stored_precision"],
                         "architecture": info.get("architecture"),
-                        "device": device,
-                        "rep": rep,
+                        "device": device, "rep": rep,
                         **agg,
                         "num_params": num_params,
                         "model_size_mb": round(info["model_size_mb"], 3),
                         "num_images": len(per_image_rows),
-                        "seed": seed,
-                        "timestamp": ts,
+                        "seed": seed, "timestamp": ts,
                     }
                     _append_row(results_csv, RESULTS_COLS, result_row)
                     existing_keys.add(key)
 
                     log.info(
-                        f"      → mean latency: {agg['mean_latency_ms']:.2f} ms | "
-                        f"throughput: {agg['throughput_imgs_per_s']:.1f} img/s | "
-                        f"energy: {agg['mean_energy_kwh_per_image']:.2e} kWh"
+                        f"      → latency: {agg['mean_latency_ms']:.2f} ms | "
+                        f"cpu_power: {agg['mean_cpu_power_w']:.1f} W | "
+                        f"gpu_power: {agg['mean_gpu_power_w']:.1f} W"
                     )
 
-                    del model
-                    gc.collect()
+                    del model; gc.collect()
                     if device == "cuda":
                         torch.cuda.empty_cache()
 
@@ -817,42 +784,23 @@ def benchmark_vit(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ViT single-image inference benchmarking")
-    parser.add_argument(
-        "--datasets", nargs="+", default=DATASETS,
-        help="MedMNIST datasets to benchmark"
-    )
-    parser.add_argument(
-        "--devices", nargs="+", default=["cpu", "cuda"],
-        help="Devices to benchmark on"
-    )
-    parser.add_argument("--reps", type=int, default=3, help="Number of independent repetitions")
-    parser.add_argument("--n-images", type=int, default=10, help="Images per repetition")
-    parser.add_argument("--warmup", type=int, default=5, help="Warmup forward passes")
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("/home/arihangupta/Pruning/dinov2/Pruning/single_image_benchmarking"),
-        help="Root output directory"
-    )
+    parser.add_argument("--datasets", nargs="+", default=DATASETS)
+    parser.add_argument("--devices", nargs="+", default=["cpu", "cuda"])
+    parser.add_argument("--reps", type=int, default=3)
+    parser.add_argument("--n-images", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--output-dir", type=Path,
+                        default=Path("/home/arihangupta/Pruning/dinov2/Pruning/single_image_benchmarking"))
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     log.info(f"Output root: {args.output_dir}")
-    log.info(f"Datasets: {args.datasets}")
-    log.info(f"Devices: {args.devices}")
+    log.info(f"Datasets: {args.datasets} | Devices: {args.devices}")
     log.info(f"Reps: {args.reps} | Images/rep: {args.n_images} | Warmup: {args.warmup}")
-
-    benchmark_vit(
-        datasets=args.datasets,
-        devices=args.devices,
-        n_reps=args.reps,
-        n_images=args.n_images,
-        warmup=args.warmup,
-        output_root=args.output_dir,
-    )
-
+    benchmark_vit(datasets=args.datasets, devices=args.devices, n_reps=args.reps,
+                  n_images=args.n_images, warmup=args.warmup, output_root=args.output_dir)
     log.info("Done.")
 
 
