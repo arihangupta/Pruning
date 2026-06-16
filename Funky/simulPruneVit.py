@@ -4,7 +4,7 @@ Vision Transformer Structured Pruning for MedMNIST with Physical Model Compressi
 This implementation follows the Hikvision paper methodology with complete deployment conversion:
 1. Train with gates to identify important components
 2. Convert to physically smaller models (actual compression)
-
+3. Measure energy on deployment models (real speedup)
 
 Four methods compared:
 - Baseline: Full ViT trained for 20 epochs
