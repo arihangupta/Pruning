@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Bootstrap confidence intervals for accuracy and AUC across all discovered ViT models.
+Bootstrap confidence intervals for accuracy and AUC across all discovered CNN models.
 
-Reuses model discovery/loading and dataset utilities from ViT_benchmarking.py.
+Reuses model discovery/loading and dataset utilities from CNN_benchmarking.py.
 Unlike the full factorial throughput/energy benchmark, this script runs a single
 inference pass per model to collect per-example predictions, then resamples those
 predictions with replacement (bootstrap) to estimate confidence intervals for
@@ -29,14 +29,13 @@ from pathlib import Path
 from sklearn.metrics import roc_auc_score, accuracy_score
 import matplotlib.pyplot as plt
 
-from ViT_benchmarking import (
-    SEED, IMG_SIZE, MULTI_LABEL_DATASETS, DATASETS, DATASET_NUM_CLASSES,
-    BASELINE_DIR, PRUNED_MODELS_DIR, DATASETS_DIR,
-    Config, NumpyMemmapDataset, discover_models, load_model,
-    set_seed, set_env_threads, get_git_commit,
+from CNN_benchmarking import (
+    SEED, IMG_SIZE, MULTI_LABEL_DATASETS, DATASETS, SAVE_DIR_BASE,
+    Config, NumpyMemmapDataset, discover_models, load_model, get_num_classes,
+    get_dataset_channels, set_seed, set_env_threads, get_git_commit,
 )
 
-OUTPUT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/Vision/rerun/bootstrap_ci_results"
+OUTPUT_DIR = "/home/arihangupta/Pruning/dinov2/Pruning/PruneAndTrain/CNN/bootstrap_ci_results"
 BATCH_SIZE = 32
 N_BOOTSTRAP = 2000
 CI_LEVEL = 0.95
@@ -49,53 +48,55 @@ def make_bootstrap_loader(dataset_name, dataset_path, batch_size=BATCH_SIZE):
     if multi_label:
         X_test = np.load(os.path.join(dataset_path, "test_images.npy"), mmap_mode="r")
         y_test = np.load(os.path.join(dataset_path, "test_labels.npy"), mmap_mode="r")
+        in_channels = X_test[0].shape[-1] if X_test[0].ndim == 3 else 1
     else:
         data = np.load(dataset_path, mmap_mode="r")
-        X_test = data["test_images"]
-        y_test = data["test_labels"].flatten()
-    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, multi_label=multi_label)
+        X_test, y_test = data["test_images"], data["test_labels"].flatten()
+        in_channels = get_dataset_channels(dataset_path)
+    test_ds = NumpyMemmapDataset(X_test, y_test, img_size=IMG_SIZE, in_channels=in_channels, multi_label=multi_label)
     loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
     return loader, len(test_ds)
 
 
 def collect_predictions(model_cfg, dataset, device):
     """Run one inference pass over the full test set, at the model's stored precision."""
-    num_classes = DATASET_NUM_CLASSES[dataset]
-    multi_label = dataset in MULTI_LABEL_DATASETS
     dataset_path = DATASETS[dataset]
+    multi_label = dataset in MULTI_LABEL_DATASETS
+    num_classes = get_num_classes(dataset, dataset_path)
 
     test_loader, _ = make_bootstrap_loader(dataset, dataset_path)
 
     precision = model_cfg.get('stored_precision', 'fp32')
     exp_cfg = {
         'model_name': model_cfg['model_name'],
-        'full_name': model_cfg['full_name'],
         'pruning_method': model_cfg['pruning_method'],
         'sparsity': model_cfg['sparsity'],
+        'pruning_ratio': model_cfg['pruning_ratio'],
         'stored_precision': precision,
         'model_path': model_cfg['model_path'],
         'precision': precision,
+        'device': device,
     }
     config = Config(experiment=exp_cfg, log_dir=str(OUTPUT_DIR))
 
-    model = load_model(config, num_classes)
-    model = model.to(device).eval()
+    model = load_model(config, num_classes, dataset)
+    model_device = next(model.parameters()).device
     model_dtype = next(model.parameters()).dtype
 
     probs_list, labels_list = [], []
     with torch.no_grad():
         for inputs, labels in test_loader:
-            inputs = inputs.to(device)
+            inputs = inputs.to(model_device)
             if inputs.dtype != model_dtype:
                 inputs = inputs.to(dtype=model_dtype)
 
-            if precision == 'amp' and device.type == 'cuda':
+            if precision == 'amp' and model_device.type == 'cuda':
                 with torch.amp.autocast('cuda'):
                     outputs = model(inputs)
             else:
                 outputs = model(inputs)
 
-            if outputs.dtype == torch.float16:
+            if outputs.dtype == torch.half:
                 outputs = outputs.float()
             outputs = torch.clamp(outputs, min=-100, max=100)
 
@@ -257,10 +258,10 @@ def run_bootstrap_analysis():
             print(f"Resuming: {len(completed)} model(s) already done for {dataset}, skipping them.")
 
         for model_cfg in models:
-            if model_cfg['full_name'] in completed:
+            if model_cfg['model_name'] in completed:
                 continue
 
-            print(f"\nRunning: {model_cfg['full_name']} on {dataset}")
+            print(f"\nRunning: {model_cfg['model_name']} on {dataset}")
             metrics, error = run_model_isolated(model_cfg, dataset, device_str)
             gc.collect()
 
@@ -270,12 +271,10 @@ def run_bootstrap_analysis():
 
             result = {
                 'dataset': dataset,
-                'model_name': model_cfg['full_name'],
+                'model_name': model_cfg['model_name'],
                 'pruning_method': model_cfg['pruning_method'],
                 'sparsity': model_cfg['sparsity'],
                 'stored_precision': model_cfg.get('stored_precision', 'unknown'),
-                'teacher_model': model_cfg.get('teacher_model'),
-                'student_model': model_cfg.get('student_model'),
                 **metrics,
                 'git_commit': get_git_commit(),
             }
@@ -301,16 +300,10 @@ def run_bootstrap_analysis():
 
 
 def main():
-    print("ViT Bootstrap CI Analysis (Accuracy & AUC)")
+    print("CNN Bootstrap CI Analysis (Accuracy & AUC)")
 
-    if not os.path.exists(BASELINE_DIR):
-        print(f"Error: Baseline directory not found: {BASELINE_DIR}")
-        return
-    if not os.path.exists(PRUNED_MODELS_DIR):
-        print(f"Error: Pruned models directory not found: {PRUNED_MODELS_DIR}")
-        return
-    if not os.path.exists(DATASETS_DIR):
-        print(f"Error: Datasets directory not found: {DATASETS_DIR}")
+    if not os.path.exists(SAVE_DIR_BASE):
+        print(f"Error: Pruned models directory not found: {SAVE_DIR_BASE}")
         return
 
     if not torch.cuda.is_available():
